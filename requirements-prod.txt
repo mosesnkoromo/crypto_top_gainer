@@ -1,0 +1,3 @@
+# ── Production only (Render uses Python 3.11) ───────────────
+-r requirements.txt
+psycopg2-binary==2.9.9
