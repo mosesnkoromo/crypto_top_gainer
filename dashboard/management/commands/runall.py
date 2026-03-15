@@ -81,9 +81,26 @@ class Command(BaseCommand):
         bot_thread = threading.Thread(target=run_bot, daemon=True, name="BotScanner")
         bot_thread.start()
 
-        # ── Step 4: Start Django dev server ───────────────────
-        self.stdout.write(f"  Starting server at http://{host}:{port} ...\n\n")
-        try:
-            call_command("runserver", f"{host}:{port}", use_reloader=False)
-        except KeyboardInterrupt:
-            self.stdout.write("\n  Shutting down...\n")
+        # ── Step 4: Start server ──────────────────────────────
+        import os, subprocess, sys
+        render_port = os.environ.get("PORT")  # Render injects $PORT
+        if render_port:
+            # On Render: start gunicorn bound to 0.0.0.0:$PORT
+            self.stdout.write(f"  Starting gunicorn on 0.0.0.0:{render_port} ...\n\n")
+            try:
+                subprocess.run([
+                    sys.executable, "-m", "gunicorn",
+                    "btc_project.wsgi:application",
+                    "--bind", f"0.0.0.0:{render_port}",
+                    "--workers", "2",
+                    "--timeout", "120",
+                ], check=True)
+            except KeyboardInterrupt:
+                pass
+        else:
+            # Local dev: use Django dev server
+            self.stdout.write(f"  Starting server at http://{host}:{port} ...\n\n")
+            try:
+                call_command("runserver", f"{host}:{port}", use_reloader=False)
+            except KeyboardInterrupt:
+                self.stdout.write("\n  Shutting down...\n")
