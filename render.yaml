@@ -4,7 +4,7 @@ services:
     name: btc-strength-dashboard
     runtime: python
     buildCommand: pip install -r requirements-prod.txt && python manage.py migrate --noinput && python manage.py collectstatic --noinput
-    startCommand: gunicorn btc_project.wsgi:application --bind 0.0.0.0:$PORT --workers 2
+    startCommand: gunicorn btc_project.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 120
     envVars:
       - key: DJANGO_SETTINGS_MODULE
         value: btc_project.settings
@@ -12,12 +12,14 @@ services:
         value: "False"
       - key: DJANGO_SECRET_KEY
         generateValue: true
+      - key: TIME_ZONE
+        value: Africa/Dar_es_Salaam
       - key: DATABASE_URL
         fromDatabase:
           name: btc-bot-db
           property: connectionString
 
-  # ── Bot worker (runs the scanner 24/7) ────────────────────
+  # ── Bot worker (24/7 scanner — no web server) ─────────────
   - type: worker
     name: btc-strength-bot
     runtime: python
@@ -28,6 +30,8 @@ services:
         value: btc_project.settings
       - key: DEBUG
         value: "False"
+      - key: TIME_ZONE
+        value: Africa/Dar_es_Salaam
       - key: WHATSAPP_NUMBER
         sync: false
       - key: WHAPI_TOKEN
