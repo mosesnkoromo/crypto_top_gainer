@@ -1,10 +1,9 @@
-# ── Core (works locally and on Render) ──────────────────────
 django==4.2.16
 gunicorn==22.0.0
 whitenoise==6.7.0
 dj-database-url==2.2.0
-requests==2.31.0
-pandas==2.2.2
+requests==2.32.3
+pandas==2.2.3
 numpy==1.26.4
 schedule==1.2.2
 python-dotenv==1.0.1

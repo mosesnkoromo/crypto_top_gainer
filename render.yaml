@@ -19,7 +19,7 @@ services:
           name: btc-bot-db
           property: connectionString
 
-  # ── Bot worker (24/7 scanner — no web server) ─────────────
+  # ── Bot worker (24/7 scanner) ─────────────────────────────
   - type: worker
     name: btc-strength-bot
     runtime: python
