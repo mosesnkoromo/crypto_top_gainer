@@ -1,5 +1,5 @@
 services:
-  # ── Web dashboard ─────────────────────────────────────────
+  # ── Web dashboard (gunicorn on $PORT bound to 0.0.0.0) ────
   - type: web
     name: btc-strength-dashboard
     runtime: python
@@ -19,7 +19,7 @@ services:
           name: btc-bot-db
           property: connectionString
 
-  # ── Bot worker (24/7 scanner) ─────────────────────────────
+  # ── Bot worker (scanner only — no web server) ─────────────
   - type: worker
     name: btc-strength-bot
     runtime: python
