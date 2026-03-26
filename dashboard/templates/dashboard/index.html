@@ -12,16 +12,16 @@
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:'Outfit',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;}
 body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(ellipse 60% 40% at 20% 10%,rgba(77,159,255,.04) 0%,transparent 60%),radial-gradient(ellipse 40% 30% at 80% 80%,rgba(160,120,255,.03) 0%,transparent 60%),linear-gradient(rgba(30,37,56,.3) 1px,transparent 1px) 0 0/40px 40px,linear-gradient(90deg,rgba(30,37,56,.3) 1px,transparent 1px) 0 0/40px 40px;}
-.topbar{position:sticky;top:0;z-index:200;background:rgba(6,8,15,.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;height:60px;gap:0;}
+.topbar{position:sticky;top:0;z-index:200;background:rgba(6,8,15,.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 16px;height:60px;gap:0;overflow:hidden;}
 .logo{display:flex;align-items:center;gap:10px;margin-right:28px;flex-shrink:0;}
 .logo-pulse{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green);animation:pulse 2s infinite;}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.8)}}
 .logo-name{font-size:15px;font-weight:700;}.logo-name em{color:var(--green);font-style:normal;}
-.nav-tabs{display:flex;gap:2px;flex:1;}
-.nav-tab{font-size:13px;font-weight:500;padding:0 16px;height:60px;display:flex;align-items:center;gap:7px;cursor:pointer;color:var(--dim);border:none;background:transparent;border-bottom:2px solid transparent;transition:all .15s;}
-.nav-tab:hover{color:var(--text);}.nav-tab.active{color:var(--blue);border-bottom-color:var(--blue);}
-.nav-tab svg{width:15px;height:15px;flex-shrink:0;}
-.topbar-right{display:flex;align-items:center;gap:10px;margin-left:auto;flex-shrink:0;}
+.nav-tabs{display:flex;gap:0;flex:1;overflow:hidden;}
+.nav-tab{font-size:12px;font-weight:500;padding:0 12px;height:60px;display:flex;align-items:center;gap:5px;cursor:pointer;color:var(--dim);border:none;background:transparent;border-bottom:2px solid transparent;transition:all .15s;white-space:nowrap;flex-shrink:0;}
+.nav-tab:hover{color:var(--text);background:rgba(255,255,255,.03);}.nav-tab.active{color:var(--blue);border-bottom-color:var(--blue);}
+.nav-tab svg{width:14px;height:14px;flex-shrink:0;}
+.topbar-right{display:flex;align-items:center;gap:10px;flex-shrink:0;}
 .live-badge{font-family:'JetBrains Mono',monospace;font-size:10px;padding:4px 10px;border-radius:20px;background:rgba(0,229,160,.1);color:var(--green);border:1px solid rgba(0,229,160,.3);display:flex;align-items:center;gap:5px;}
 .live-badge::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;}
 #btc-price{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--gold);background:var(--ggold);padding:4px 10px;border-radius:6px;}
@@ -111,11 +111,33 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.01
 .capital-input-row .form-input{flex:1;}
 .capital-save-btn{padding:10px 16px;border-radius:8px;background:var(--green);border:none;color:#000;font-weight:700;cursor:pointer;font-size:13px;white-space:nowrap;}
 .loading{color:var(--dim);font-size:13px;padding:24px;text-align:center;}
+.skel{display:inline-block;width:60px;height:10px;background:var(--border);border-radius:4px;animation:shimmer 1.2s infinite;}
+.skeleton-row td{padding:10px 8px;}
+@keyframes shimmer{0%,100%{opacity:.4}50%{opacity:.9}}
+.trade-tab{font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;padding:5px 14px;border-radius:20px;cursor:pointer;background:transparent;border:1px solid var(--border);color:var(--dim);transition:all .15s;letter-spacing:.03em;}
+.trade-tab.active{background:var(--blue);border-color:var(--blue);color:#fff;}
+.at-panel{display:flex;align-items:center;gap:12px;padding:10px 16px;background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);flex-wrap:wrap;}
+.at-toggle{position:relative;width:52px;height:28px;flex-shrink:0;}
+.at-toggle input{opacity:0;width:0;height:0;position:absolute;}
+.at-slider{position:absolute;inset:0;background:#444;border-radius:28px;cursor:pointer;transition:.3s;}
+.at-slider:before{content:'';position:absolute;height:20px;width:20px;left:4px;bottom:4px;background:#fff;border-radius:50%;transition:.3s;}
+.at-toggle input:checked+.at-slider{background:#00cc77;}
+.at-toggle input:checked+.at-slider:before{transform:translateX(24px);}
+.at-badge{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;letter-spacing:.04em;}
+.at-badge.on{background:rgba(0,204,119,.12);color:#00cc77;border:1px solid rgba(0,204,119,.3);}
+.at-badge.off{background:rgba(136,136,136,.12);color:#888;border:1px solid rgba(136,136,136,.3);}
+.at-stat{font-size:11px;color:var(--dim);}
+.at-stat b{color:var(--text);font-weight:600;}
+.at-stop{font-size:11px;font-weight:700;padding:5px 14px;border-radius:6px;background:rgba(220,50,50,.1);color:#e05555;border:1px solid rgba(220,50,50,.3);cursor:pointer;transition:.15s;}
+.at-stop:hover{background:rgba(220,50,50,.25);}
+#at-slider.on{background:var(--green);}
+#at-dot.on{transform:translateX(24px);}
+.trade-tab:hover:not(.active){border-color:var(--muted);color:var(--text);}
 ::-webkit-scrollbar{width:5px;height:5px;}
 ::-webkit-scrollbar-track{background:var(--bg);}
 ::-webkit-scrollbar-thumb{background:var(--muted);border-radius:3px;}
 @media(max-width:1100px){.charts-2,.charts-3{grid-template-columns:1fr;}}
-@media(max-width:768px){main{padding:14px;}.stats-row{grid-template-columns:1fr 1fr;}.calc-grid,.report-grid{grid-template-columns:1fr;}.topbar{padding:0 12px;}.nav-tab span{display:none;}}
+@media(max-width:900px){.nav-tab span{display:none;}.nav-tab{padding:0 10px;}}@media(max-width:768px){main{padding:14px;}.stats-row{grid-template-columns:1fr 1fr;}.calc-grid,.report-grid{grid-template-columns:1fr;}.topbar{padding:0 8px;}.logo-name{display:none;}}
 </style>
 </head>
 <body>
@@ -137,6 +159,12 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.01
     <button class="nav-tab" onclick="showPage('capital',this)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
       <span>Capital</span></button>
+    <button class="nav-tab" onclick="showPage('backtest',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>
+      <span>Backtest</span></button>
+    <button class="nav-tab" onclick="showPage('autotrade',this)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/></svg>
+      <span>Auto Trade</span></button>
   </div>
   <div class="topbar-right">
     <span id="btc-price">BTC $—</span>
@@ -177,7 +205,15 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.01
 <div id="page-signals" class="page"><main>
   <div class="tbl-wrap">
     <div class="tbl-head">
-      <h3>Signal History</h3>
+      <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+        <h3>Signal History</h3>
+        <div style="display:flex;gap:4px">
+          <button class="trade-tab active" id="tab-all" onclick="setTradeTab('all',this)">All</button>
+          <button class="trade-tab" id="tab-spot" onclick="setTradeTab('spot',this)">Spot</button>
+          <button class="trade-tab" id="tab-futures" onclick="setTradeTab('futures',this)">Futures</button>
+        </div>
+        <div id="trade-tab-info" style="font-size:11px;color:var(--dim)"></div>
+      </div>
       <div class="filter-row">
         <select class="fi" id="f-period" onchange="applyFilters()"><option value="today">Today</option><option value="week">This Week</option><option value="month">This Month</option><option value="">All Time</option></select>
         <select class="fi" id="f-direction" onchange="applyFilters()"><option value="">All</option><option value="BUY">Buy</option><option value="SELL">Sell</option></select>
@@ -188,7 +224,7 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.01
       </div>
     </div>
     <div style="overflow-x:auto">
-      <table><thead><tr><th>Time</th><th>Pair</th><th>Dir</th><th>Grade</th><th>Conf</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th>RSI</th><th>BTC</th><th>Outcome</th><th>P&L</th></tr></thead>
+      <table><thead><tr id="sig-thead"><th>Time</th><th>Pair</th><th>Dir</th><th>Grade</th><th>Conf</th><th>Entry</th><th>TP1</th><th>TP2</th><th>TP3</th><th>SL</th><th id="th-type" style="display:none">Type</th><th id="th-action" style="display:none">Action</th><th>Outcome</th><th>P&L</th></tr></thead>
       <tbody id="sig-tbody"><tr><td colspan="14" class="loading">Loading signals...</td></tr></tbody></table>
     </div>
     <div class="pagination" id="sig-pagination"></div>
@@ -262,7 +298,16 @@ function showPage(name,btn){
   document.querySelectorAll(".nav-tab").forEach(b=>b.classList.remove("active"));
   document.getElementById("page-"+name).classList.add("active");
   btn.classList.add("active");
-  if(name==="signals") loadSignals();
+  if(name==="autotrade"){
+    atLoad();
+  }
+  if(name==="signals"){
+    // Pre-render skeleton first for immediate feedback
+    document.getElementById('sig-tbody').innerHTML = Array(6).fill(0).map(()=>
+      `<tr class="skeleton-row">${Array(14).fill('<td><span class="skel"></span></td>').join('')}</tr>`
+    ).join('');
+    loadSignals();
+  }
   if(name==="reports") loadReport();
   if(name==="capital") loadCapital();
 }
@@ -309,8 +354,32 @@ function renderPairs(pairs){
 let sigPage=1;
 function applyFilters(){sigPage=1;loadSignals();}
 function resetFilters(){["f-direction","f-grade","f-outcome"].forEach(id=>{document.getElementById(id).value="";});document.getElementById("f-period").value="today";document.getElementById("f-symbol").value="";applyFilters();}
-function buildSigParams(){const p=new URLSearchParams();p.set("page",sigPage);p.set("per_page",20);const period=document.getElementById("f-period")?.value;if(period)p.set("period",period);const dir=document.getElementById("f-direction")?.value;if(dir)p.set("direction",dir);const grade=document.getElementById("f-grade")?.value;if(grade)p.set("grade",grade);const outcome=document.getElementById("f-outcome")?.value;if(outcome)p.set("outcome",outcome);const sym=document.getElementById("f-symbol")?.value;if(sym)p.set("symbol",sym);return p;}
-async function loadSignals(){const data=await get("/api/signals/?"+buildSigParams().toString());renderSigTable(data.signals);renderPagination(data.pagination);}
+function buildSigParams(){const p=new URLSearchParams();p.set("page",sigPage);p.set("per_page",50);const period=document.getElementById("f-period")?.value;if(period)p.set("period",period);const dir=document.getElementById("f-direction")?.value;if(dir)p.set("direction",dir);const grade=document.getElementById("f-grade")?.value;if(grade)p.set("grade",grade);const outcome=document.getElementById("f-outcome")?.value;if(outcome)p.set("outcome",outcome);const sym=document.getElementById("f-symbol")?.value;if(sym)p.set("symbol",sym);return p;}
+async function loadSignals(){
+  // Show skeleton rows immediately
+  const tbody = document.getElementById('sig-tbody');
+  tbody.innerHTML = Array(8).fill(0).map(()=>
+    `<tr class="skeleton-row">${Array(14).fill('<td><span class="skel"></span></td>').join('')}</tr>`
+  ).join('');
+
+  const data = await get("/api/signals/?"+buildSigParams().toString());
+
+  // Render rows progressively — paint first 5 immediately, rest on next frame
+  const signals = data.signals || [];
+  const first5  = signals.slice(0, 5);
+  const rest    = signals.slice(5);
+
+  renderSigTable(first5);
+  renderPagination(data.pagination);
+
+  if(rest.length > 0){
+    requestAnimationFrame(()=>{
+      const existingRows = tbody.innerHTML;
+      renderSigTable(signals);  // full render
+      renderPagination(data.pagination);
+    });
+  }
+}
 const OMAP={PENDING:["p-pend","Pending"],TP1:["p-tp1","TP1 ✓"],TP2:["p-tp2","TP2 ✓"],TP3:["p-tp3","TP3 ✓"],SL:["p-sl","SL ✗"],BE:["p-be","BE"],MANUAL:["p-pend","Manual"]};
 const GMAP={ULTRA:"p-ultra",STRONG:"p-strong",STANDARD:"p-std"};
 function renderSigTable(signals){
@@ -355,7 +424,11 @@ async function loadReport(){
     <div class="report-card"><div class="card-title" style="margin-bottom:10px">By Direction</div>${byDir}<div style="margin-top:14px"><div class="card-title" style="margin-bottom:10px">Top Pairs</div>${data.top_pairs.map(p=>`<div class="report-row"><span style="font-family:'JetBrains Mono',monospace">${p.symbol}</span><span style="font-family:'JetBrains Mono',monospace">${p.win_rate}% (${p.wins}/${p.total})</span></div>`).join("")||"No data"}</div></div>`;
 }
 function exportReport(){
-  get(`/api/signals/?per_page=1000`).then(data=>{
+  // Show export spinner immediately
+  const exportBtn = event?.target;
+  if(exportBtn){ exportBtn.textContent='Exporting...'; exportBtn.disabled=true; }
+  get(`/api/signals/?per_page=500&`+buildSigParams().toString()).then(data=>{
+  if(exportBtn){ exportBtn.textContent='Export CSV'; exportBtn.disabled=false; }
     if(!data.signals.length)return alert("No signals to export");
     const rows=[["Time","Symbol","Dir","Grade","Conf","Entry","TP1","TP2","TP3","SL","RSI","BTC","Outcome","PnL%"],...data.signals.map(s=>[s.created_at,s.symbol,s.signal,s.grade,s.confidence,s.entry,s.tp1,s.tp2,s.tp3,s.sl,s.rsi,s.btc_score,s.outcome,s.profit_pct||""])];
     const csv=rows.map(r=>r.join(",")).join("\n");
@@ -415,6 +488,702 @@ async function loadDashboard(){
 }
 loadDashboard();
 setInterval(loadDashboard,60000);
+// ── Auto-trade: unified JS ────────────────────────────────
+// Uses /api/auto/status/, /api/auto/toggle/, /api/auto/stop/
+// Updates both the top mini-indicator AND the full Auto Trade page
+
+async function atLoad(){
+  try{
+    const d = await get('/api/auto/status/');
+    if(!d) return;
+
+    // Top mini-badge (in nav area)
+    const navBadge = document.getElementById('at2-badge');
+    const navSwitch = document.getElementById('at2-switch');
+    if(navBadge){
+      navBadge.textContent = d.enabled ? 'ON' : 'OFF';
+      navBadge.style.background = d.enabled ? 'rgba(0,204,119,.15)' : 'rgba(136,136,136,.12)';
+      navBadge.style.color      = d.enabled ? '#00cc77' : '#888';
+      navBadge.style.borderColor= d.enabled ? 'rgba(0,204,119,.35)' : 'rgba(136,136,136,.3)';
+    }
+    if(navSwitch) navSwitch.checked = d.enabled;
+
+    // Full page status cards
+    const bal   = document.getElementById('at2-balance');
+    const env   = document.getElementById('at2-env');
+    const trd   = document.getElementById('at2-trades');
+    const tot   = document.getElementById('at2-total');
+    const ord   = document.getElementById('at2-orders');
+    const mod   = document.getElementById('at2-mode');
+    const stop  = document.getElementById('at2-stop-btn');
+    const mSel  = document.getElementById('at2-mode-sel');
+    const mNote = document.getElementById('at2-mode-note');
+    const risk  = document.getElementById('at2-risk');
+    const rLbl  = document.getElementById('at2-risk-lbl');
+    const maxT  = document.getElementById('at2-max');
+
+    if(bal)  bal.textContent  = d.has_keys ? '$'+(d.live_balance||0).toFixed(2) : '⚠️ No keys';
+    if(env)  env.textContent  = d.testnet ? 'TESTNET mode' : 'LIVE trading';
+    if(env)  env.style.color  = d.testnet ? 'var(--gold)' : 'var(--red)';
+    if(trd)  trd.textContent  = (d.trades_today||0)+'/'+(d.max_trades_day||10);
+    if(tot)  tot.textContent  = 'total: '+(d.total_auto_trades||0);
+    if(ord)  ord.textContent  = d.open_orders ?? 0;
+    if(mod)  mod.textContent  = (d.mode||'spot').toUpperCase();
+    if(stop) stop.style.display = d.enabled ? '' : 'none';
+    if(mSel) mSel.value = d.mode || 'spot';
+    if(mNote) mNote.textContent = d.mode==='futures'
+      ? 'Futures: LONG + SHORT, leverage 2-3x, higher risk'
+      : 'Spot: buy coins, no leverage, no liquidation risk';
+    if(risk && d.risk_per_trade){ risk.value = d.risk_per_trade; }
+    if(rLbl && d.risk_per_trade){ rLbl.textContent = d.risk_per_trade+'%'; }
+    if(maxT && d.max_trades_day){ maxT.value = d.max_trades_day; }
+
+    // Futures open positions
+    const posCard = document.getElementById('at2-positions-card');
+    const posList = document.getElementById('at2-positions-list');
+    if(posCard && posList){
+      const positions = d.open_positions || [];
+      if(positions.length > 0){
+        posCard.style.display = '';
+        posList.innerHTML = positions.map(p => {
+          const pnl = parseFloat(p.pnl||0);
+          const pColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+          return `<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:12px;align-items:center;padding:8px 0;border-bottom:0.5px solid var(--border);font-size:12px">
+            <span style="font-family:'JetBrains Mono',monospace;font-weight:600">${p.symbol} <span style="color:${p.side==='LONG'?'var(--green)':'var(--red)'};font-size:11px">${p.side}</span></span>
+            <span style="color:var(--dim)">qty ${p.qty}</span>
+            <span style="color:var(--dim)">entry ${parseFloat(p.entry||0).toFixed(4)}</span>
+            <span style="color:${pColor};font-weight:600">${pnl>=0?'+':''}${pnl.toFixed(4)} USDT (${p.pnl_pct||0}%)</span>
+          </div>`;
+        }).join('');
+      } else {
+        posCard.style.display = 'none';
+      }
+    }
+  } catch(e){ console.warn('atLoad error:', e); }
+}
+atLoad();
+setInterval(atLoad, 20000);
+
+async function atToggle(enabled){
+  const sw    = document.getElementById('at2-switch');
+  const badge = document.getElementById('at2-badge');
+  if(badge) badge.textContent = '...';
+
+  if(enabled){
+    const ok = confirm('⚠️ ENABLE AUTO TRADE?\n\nThis will place REAL orders on Binance.\n\nMake sure:\n• BINANCE_API_KEY is set in .env\n• BINANCE_API_SECRET is set in .env\n• You are comfortable with the risk settings\n\nContinue?');
+    if(!ok){
+      if(sw) sw.checked = false;
+      if(badge) badge.textContent = 'OFF';
+      return;
+    }
+  }
+
+  try{
+    const mSel = document.getElementById('at2-mode-sel');
+    const risk = document.getElementById('at2-risk');
+    const maxT = document.getElementById('at2-max');
+    const body = { enabled };
+    if(mSel) body.mode = mSel.value;
+    if(risk) body.risk_per_trade = parseFloat(risk.value);
+    if(maxT) body.max_trades_day = parseInt(maxT.value);
+
+    const d = await fetch('/api/auto/toggle/',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRFToken':getCookie('csrftoken')},
+      body: JSON.stringify(body)
+    }).then(r=>r.json());
+
+    if(d.error){ alert('Error: '+d.error); if(sw) sw.checked=!enabled; }
+    else { await atLoad(); }
+
+    if(enabled){
+      const st = await get('/api/auto/status/');
+      if(!st.has_keys){
+        alert('⚠️ Auto-trade is ON but no API keys found!\n\nAdd to .env:\n  BINANCE_API_KEY=...\n  BINANCE_API_SECRET=...\n\nThen restart the bot.');
+      } else if(st.testnet){
+        alert('✅ Auto-trade enabled (TESTNET)\n\nOrders go to testnet.binance.vision — not real money.\nTest at least 1 week before going live.');
+      }
+    }
+  } catch(e){
+    alert('Error: '+e);
+    if(sw) sw.checked = !enabled;
+  }
+}
+
+async function atSaveSettings(){
+  try{
+    const mSel = document.getElementById('at2-mode-sel');
+    const risk = document.getElementById('at2-risk');
+    const maxT = document.getElementById('at2-max');
+    const body = {};
+    if(mSel) body.mode = mSel.value;
+    if(risk) body.risk_per_trade = parseFloat(risk.value);
+    if(maxT) body.max_trades_day = parseInt(maxT.value);
+    await fetch('/api/auto/toggle/',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-CSRFToken':getCookie('csrftoken')},
+      body: JSON.stringify(body)
+    });
+    await atLoad();
+  } catch(e){ console.warn('atSaveSettings:', e); }
+}
+
+async function atEmergencyStop(){
+  if(!confirm('🛑 EMERGENCY STOP\n\nThis will:\n• Cancel ALL open orders on Binance immediately\n• Disable auto-trade\n\nYour open positions will NOT be closed automatically — you must close them manually.\n\nContinue?')) return;
+  const btn = document.getElementById('at2-stop-btn');
+  if(btn){ btn.textContent='Cancelling...'; btn.disabled=true; }
+  try{
+    const d = await fetch('/api/auto/stop/',{
+      method:'POST',
+      headers:{'X-CSRFToken':getCookie('csrftoken')}
+    }).then(r=>r.json());
+    const n = (d.cancelled||[]).length;
+    if(d.ok) alert(`✅ Emergency stop done. ${n} pair(s) cancelled.\nAuto-trade is now OFF.`);
+    else alert('⚠️ Partial stop: '+(d.errors||[]).join(', '));
+    await atLoad();
+  } catch(e){ alert('Error: '+e); }
+  finally{ if(btn){ btn.textContent='🛑 Emergency Stop — Cancel All Orders'; btn.disabled=false; } }
+}
+
+function getCookie(name){
+  const v = document.cookie.match('(^|;) ?'+name+'=([^;]*)(;|$)');
+  return v ? v[2] : null;
+}
+// old auto-trade code removed
+
+// ── Spot / Futures tab logic ──────────────────────────────
+// KEY RULE:
+//   SPOT tab   → BUY signals only (you buy the coin, hold, sell when price rises)
+//                SELL signals hidden — you cannot short on spot without owning the coin
+//   FUTURES tab → BOTH BUY and SELL signals (contracts, can long or short with leverage)
+//   ALL tab    → Everything unchanged (raw signals as-is)
+
+let currentTradeTab = 'all';
+
+function setTradeTab(tab, btn) {
+  currentTradeTab = tab;
+  document.querySelectorAll('.trade-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  const info = document.getElementById('trade-tab-info');
+  if (tab === 'spot') {
+    info.innerHTML = '<b style="color:var(--green)">SPOT:</b> BUY signals only — purchase coin, sell at TP. SELL signals hidden (cannot short on spot).';
+  } else if (tab === 'futures') {
+    info.innerHTML = '<b style="color:var(--gold)">FUTURES:</b> BUY (long) + SELL (short) signals. Use leverage + OCO orders. Higher risk.';
+  } else {
+    info.innerHTML = '';
+  }
+  // Show/hide extra columns for spot/futures
+  const showExtra = tab !== 'all';
+  document.getElementById('th-type').style.display   = showExtra ? '' : 'none';
+  document.getElementById('th-action').style.display = showExtra ? '' : 'none';
+  sigPage = 1;
+  loadSignals();
+}
+
+// Override renderSigTable for spot/futures views
+const _origRenderSigTable = renderSigTable;
+function renderSigTable(signals) {
+  if (currentTradeTab === 'all') {
+    _origRenderSigTable(signals);
+    return;
+  }
+
+  const isSpot = currentTradeTab === 'spot';
+
+  // SPOT: filter to BUY only — SELL signals cannot be traded on spot
+  const filtered = isSpot ? signals.filter(s => s.signal === 'BUY') : signals;
+
+  if (filtered.length === 0) {
+    const msg = isSpot
+      ? 'No BUY signals found. SELL signals are hidden on Spot — you cannot short without owning the coin.'
+      : 'No signals found for this period.';
+    document.getElementById('sig-tbody').innerHTML = `<tr><td colspan="15" class="loading">${msg}</td></tr>`;
+    return;
+  }
+
+  document.getElementById('sig-tbody').innerHTML = filtered.map(s => {
+    const[oc,ot]=OMAP[s.outcome]||['p-pend',s.outcome];
+    const pnl=s.profit_pct!=null?`<span style="color:${s.profit_pct>=0?'var(--green)':'var(--red)'};font-family:'JetBrains Mono',monospace">${s.profit_pct>=0?'+':''}${s.profit_pct}%</span>`:'—';
+
+    let tradeTypeCell, actionCell;
+
+    if (isSpot) {
+      // SPOT: BUY only — simple buy and hold
+      tradeTypeCell = `<td><span style="font-size:10px;font-weight:700;padding:3px 7px;border-radius:4px;background:rgba(0,229,160,.1);color:var(--green);border:1px solid rgba(0,229,160,.25)">SPOT</span></td>`;
+      actionCell = `<td style="font-size:11px;color:var(--green)">
+        Buy coin at market → Hold → Sell at TP1/TP2/TP3
+      </td>`;
+    } else {
+      // FUTURES: long or short with leverage + OCO
+      const isSell = s.signal === 'SELL';
+      const lev = s.btc_score >= 65 ? '3–5x' : s.btc_score >= 50 ? '2–3x' : '2x';
+      const tradeDir = isSell ? 'SHORT (Sell)' : 'LONG (Buy)';
+      const dirColor = isSell ? 'var(--red)' : 'var(--green)';
+      tradeTypeCell = `<td><span style="font-size:10px;font-weight:700;padding:3px 7px;border-radius:4px;background:rgba(255,186,8,.1);color:var(--gold);border:1px solid rgba(255,186,8,.25)">${lev}</span></td>`;
+      actionCell = `<td style="font-size:11px;color:${dirColor}">
+        ${tradeDir} · OCO: set SL + TP1 together
+      </td>`;
+    }
+
+    return `<tr>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim)">${s.created_at}</td>
+      <td style="font-family:'JetBrains Mono',monospace;font-weight:700">${s.symbol}</td>
+      <td><span class="pill ${s.signal==='SELL'?'p-sell':'p-buy'}">${s.signal}</span></td>
+      <td><span class="pill ${GMAP[s.grade]||'p-std'}">${s.grade}</span></td>
+      <td style="font-family:'JetBrains Mono',monospace">${s.confidence}%</td>
+      <td style="font-family:'JetBrains Mono',monospace">${s.entry}</td>
+      <td style="font-family:'JetBrains Mono',monospace;color:var(--green)">${s.tp1}</td>
+      <td style="font-family:'JetBrains Mono',monospace;color:var(--green)">${s.tp2}</td>
+      <td style="font-family:'JetBrains Mono',monospace;color:var(--green)">${s.tp3}</td>
+      <td style="font-family:'JetBrains Mono',monospace;color:var(--red)">${s.sl}</td>
+      ${tradeTypeCell}
+      ${actionCell}
+      <td><span class="pill ${oc}" ${s.outcome==='PENDING'?`onclick="updateOutcome(${s.id})" title="Click to update"`:''} >${ot}${s.auto_checked?' 🤖':''}</span></td>
+      <td>${pnl}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Backtest ────────────────────────────────────────────────
+let btAllTrades = [];
+let btEquityChart, btPnlChart, btOutcomeChart;
+
+async function initBacktestSymbols() {
+  const data = await get("/api/backtest/symbols/");
+  const sel = document.getElementById("bt-symbol");
+  sel.innerHTML = data.symbols.map(s => `<option value="${s}">${s}</option>`).join("");
+}
+
+async function runBacktest() {
+  const sym  = document.getElementById("bt-symbol").value;
+  const days = document.getElementById("bt-days").value;
+  const btn  = document.getElementById("bt-run-btn");
+  btn.textContent = "Running..."; btn.disabled = true;
+  document.getElementById("bt-progress").style.display = "block";
+  document.getElementById("bt-stats").style.display = "none";
+  document.getElementById("bt-placeholder").style.display = "flex";
+  document.getElementById("bt-charts-row").style.display = "none";
+  document.getElementById("bt-trades-wrap").style.display = "none";
+  setBar(10, "Fetching historical data...");
+
+  try {
+    const payload = {
+      symbol: sym,
+      days: parseInt(days),
+      tp1_pct: parseFloat(document.getElementById("bt-tp1").value),
+      tp2_pct: parseFloat(document.getElementById("bt-tp2").value),
+      tp3_pct: parseFloat(document.getElementById("bt-tp3").value),
+      sl_pct:  parseFloat(document.getElementById("bt-sl").value),
+      min_confluence: parseFloat(document.getElementById("bt-confluence").value),
+    };
+    setBar(30, "Running signal simulation...");
+    const res = await post("/api/backtest/run/", payload);
+    setBar(90, "Building charts...");
+
+    if (res.error) { alert("Error: " + res.error); return; }
+
+    btAllTrades = res.trades || [];
+    renderBtStats(res);
+    renderBtEquity(res.equity_curve || []);
+    renderBtPnl(btAllTrades);
+    renderBtOutcome(btAllTrades);
+    renderBtTrades(btAllTrades);
+
+    document.getElementById("bt-stats").style.display = "block";
+    document.getElementById("bt-placeholder").style.display = "none";
+    document.getElementById("bt-charts-row").style.display = "block";
+    document.getElementById("bt-trades-wrap").style.display = "block";
+    setBar(100, "Complete");
+  } catch(e) {
+    alert("Backtest failed: " + e.message);
+  } finally {
+    btn.textContent = "Run Backtest"; btn.disabled = false;
+    setTimeout(() => { document.getElementById("bt-progress").style.display = "none"; }, 2000);
+  }
+}
+
+function setBar(pct, msg) {
+  document.getElementById("bt-bar").style.width = pct + "%";
+  document.getElementById("bt-status").textContent = msg;
+}
+
+function renderBtStats(r) {
+  const wrColor = r.win_rate >= 60 ? "var(--green)" : r.win_rate >= 45 ? "var(--gold)" : "var(--red)";
+  const pnlColor = r.total_pnl_pct >= 0 ? "var(--green)" : "var(--red)";
+  document.getElementById("bt-wr").textContent = r.win_rate + "%";
+  document.getElementById("bt-wr").style.color = wrColor;
+  document.getElementById("bt-wr-sub").textContent = r.wins + " wins / " + r.losses + " losses";
+  document.getElementById("bt-total").textContent = r.total_trades;
+  document.getElementById("bt-period").textContent = r.period_days + " days lookback";
+  document.getElementById("bt-pf").textContent = r.profit_factor;
+  document.getElementById("bt-pf").style.color = r.profit_factor >= 1.5 ? "var(--green)" : r.profit_factor >= 1 ? "var(--gold)" : "var(--red)";
+  document.getElementById("bt-dd").textContent = "-" + r.max_drawdown + "%";
+  document.getElementById("bt-dd").style.color = "var(--red)";
+  document.getElementById("bt-pnl").textContent = (r.total_pnl_pct >= 0 ? "+" : "") + r.total_pnl_pct + "%";
+  document.getElementById("bt-pnl").style.color = pnlColor;
+  document.getElementById("bt-avgwin").textContent = "+" + r.avg_win_pct + "%";
+  document.getElementById("bt-avgwin").style.color = "var(--green)";
+  document.getElementById("bt-ultra-wr").textContent = "Ultra grade: " + r.ultra_wr + "% WR";
+  document.getElementById("bt-avgloss").textContent = r.avg_loss_pct + "%";
+  document.getElementById("bt-avgloss").style.color = "var(--red)";
+  document.getElementById("bt-strong-wr").textContent = "Strong grade: " + r.strong_wr + "% WR";
+  document.getElementById("bt-best").textContent = "+" + r.best_trade + "%";
+  document.getElementById("bt-best").style.color = "var(--green)";
+  document.getElementById("bt-worst").textContent = r.worst_trade + "%";
+  document.getElementById("bt-worst").style.color = "var(--red)";
+}
+
+const isDarkBt = matchMedia("(prefers-color-scheme: dark)").matches;
+const tcBt = isDarkBt ? "#9a9a9a" : "#666";
+const gcBt = isDarkBt ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.05)";
+const btOpts = { responsive:true, maintainAspectRatio:false, plugins:{ legend:{display:false}, tooltip:{backgroundColor:isDarkBt?"#222":"#fff",borderColor:isDarkBt?"#444":"#ddd",borderWidth:1} }, scales:{ x:{grid:{color:gcBt},ticks:{color:tcBt,font:{size:9}}}, y:{grid:{color:gcBt},ticks:{color:tcBt,font:{size:10}}} } };
+
+function renderBtEquity(curve) {
+  if (btEquityChart) btEquityChart.destroy();
+  const labels = curve.map((_, i) => i === 0 ? "Start" : "T" + i);
+  const finalVal = curve[curve.length - 1] || 100;
+  const equity1k = curve.map(v => Math.round(v / 100 * 1000));
+  btEquityChart = new Chart(document.getElementById("btEquityChart"), {
+    type:"line",
+    data:{ labels, datasets:[{
+      data: equity1k,
+      borderColor: finalVal >= 100 ? "#639922" : "#E24B4A",
+      backgroundColor: finalVal >= 100 ? "rgba(99,153,34,0.08)" : "rgba(226,75,74,0.08)",
+      borderWidth:2, pointRadius:0, fill:true, tension:0.3
+    }]},
+    options:{ ...btOpts, scales:{ x:{...btOpts.scales.x,ticks:{...btOpts.scales.x.ticks,maxTicksLimit:12}}, y:{...btOpts.scales.y,ticks:{...btOpts.scales.y.ticks,callback:v=>"$"+v}} } }
+  });
+}
+
+function renderBtPnl(trades) {
+  if (btPnlChart) btPnlChart.destroy();
+  const closed = trades.filter(t => t.outcome !== "PENDING");
+  const pnls = closed.map(t => parseFloat(t.pnl_pct) || 0);
+  const bins = [-12,-8,-4,-2,0,2,4,8,12,16];
+  const counts = Array(bins.length).fill(0);
+  pnls.forEach(p => {
+    for (let i = bins.length - 1; i >= 0; i--) {
+      if (p >= bins[i]) { counts[i]++; break; }
+    }
+  });
+  const labels = bins.map((b,i) => i < bins.length-1 ? `${b}% to ${bins[i+1]}%` : `${b}%+`);
+  btPnlChart = new Chart(document.getElementById("btPnlChart"), {
+    type:"bar",
+    data:{ labels, datasets:[{ data:counts, backgroundColor: bins.map(b => b >= 0 ? "rgba(99,153,34,0.7)" : "rgba(226,75,74,0.7)"), borderRadius:3 }]},
+    options:{ ...btOpts, scales:{ x:{...btOpts.scales.x,ticks:{...btOpts.scales.x.ticks,maxRotation:45}}, y:{...btOpts.scales.y,ticks:{...btOpts.scales.y.ticks,callback:v=>Math.round(v)}} } }
+  });
+}
+
+function renderBtOutcome(trades) {
+  if (btOutcomeChart) btOutcomeChart.destroy();
+  const counts = { TP1:0, TP2:0, TP3:0, SL:0, TIMEOUT:0 };
+  trades.forEach(t => { if (counts[t.outcome] !== undefined) counts[t.outcome]++; });
+  btOutcomeChart = new Chart(document.getElementById("btOutcomeChart"), {
+    type:"doughnut",
+    data:{ labels:Object.keys(counts), datasets:[{ data:Object.values(counts), backgroundColor:["#639922","#1D9E75","#185FA5","#E24B4A","#888780"], borderWidth:0 }]},
+    options:{ ...btOpts, cutout:"60%", plugins:{ legend:{display:true, position:"right", labels:{color:tcBt,font:{size:11},boxWidth:12}} } }
+  });
+}
+
+const BT_OMAP = { TP1:"p-tp1",TP2:"p-tp2",TP3:"p-tp3",SL:"p-sl",TIMEOUT:"p-pend" };
+function filterBtTrades() {
+  const dir = document.getElementById("bt-filter-dir").value;
+  const out = document.getElementById("bt-filter-outcome").value;
+  const filtered = btAllTrades.filter(t =>
+    (!dir || t.direction === dir) && (!out || t.outcome === out)
+  );
+  renderBtTrades(filtered);
+}
+
+function renderBtTrades(trades) {
+  document.getElementById("bt-tbody").innerHTML = trades.slice(0, 200).map(t => {
+    const cls = BT_OMAP[t.outcome] || "p-pend";
+    const pnlColor = t.pnl_pct >= 0 ? "var(--green)" : "var(--red)";
+    const btcColor = t.btc_score >= 58 ? "var(--green)" : t.btc_score >= 43 ? "var(--gold)" : "var(--red)";
+    return `<tr>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim)">${t.entry_time||"—"}</td>
+      <td style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--dim)">${t.exit_time||"—"}</td>
+      <td><span class="pill ${t.direction==="BUY"?"p-buy":"p-sell"}">${t.direction}</span></td>
+      <td><span class="pill ${t.grade==="ULTRA"?"p-ultra":t.grade==="STRONG"?"p-strong":"p-std"}">${t.grade}</span></td>
+      <td style="font-family:'JetBrains Mono',monospace">${t.confluence}</td>
+      <td style="font-family:'JetBrains Mono',monospace">${parseFloat(t.entry_price).toPrecision(5)}</td>
+      <td style="font-family:'JetBrains Mono',monospace">${t.exit_price ? parseFloat(t.exit_price).toPrecision(5) : "—"}</td>
+      <td style="font-family:'JetBrains Mono',monospace;color:var(--green)">${parseFloat(t.tp1).toPrecision(5)}</td>
+      <td style="font-family:'JetBrains Mono',monospace;color:var(--red)">${parseFloat(t.sl).toPrecision(5)}</td>
+      <td style="font-family:'JetBrains Mono',monospace">${t.rsi_entry}</td>
+      <td><span class="pill ${cls}">${t.outcome}</span></td>
+      <td style="font-family:'JetBrains Mono',monospace;color:${pnlColor};font-weight:500">${t.pnl_pct >= 0 ? "+" : ""}${t.pnl_pct}%</td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="12" class="loading">No trades found</td></tr>`;
+}
+
+function exportBtTrades() {
+  if (!btAllTrades.length) return;
+  const rows = [
+    ["Entry","Exit","Direction","Grade","Confluence","Entry Price","Exit Price","TP1","SL","RSI","Outcome","PnL%"],
+    ...btAllTrades.map(t => [t.entry_time,t.exit_time,t.direction,t.grade,t.confluence,t.entry_price,t.exit_price,t.tp1,t.sl,t.rsi_entry,t.outcome,t.pnl_pct])
+  ];
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([rows.map(r=>r.join(",")).join("\n")],{type:"text/csv"}));
+  a.download = `backtest_${document.getElementById("bt-symbol").value}.csv`;
+  a.click();
+}
+
+initBacktestSymbols();
 </script>
+
+<!-- BACKTEST -->
+<div id="page-backtest" class="page"><main>
+  <div class="sec-title">Strategy Backtester</div>
+
+  <!-- Settings row -->
+  <div style="display:grid;grid-template-columns:1fr 2fr;gap:16px;margin-bottom:24px;">
+
+    <!-- Controls -->
+    <div class="chart-card">
+      <div class="card-title" style="margin-bottom:14px;">
+        <span class="card-dot" style="background:var(--blue)"></span>
+        Configure Backtest
+      </div>
+      <div class="form-group">
+        <label class="form-label">Symbol</label>
+        <select class="form-input" id="bt-symbol"></select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Lookback Period</label>
+        <select class="form-input" id="bt-days">
+          <option value="30">30 days</option>
+          <option value="60">60 days</option>
+          <option value="90" selected>90 days</option>
+          <option value="180">180 days</option>
+          <option value="365">1 year</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">TP1 % / TP2 % / TP3 %</label>
+        <div style="display:flex;gap:6px;">
+          <input class="form-input" id="bt-tp1" type="number" value="3" step="0.5" style="width:33%">
+          <input class="form-input" id="bt-tp2" type="number" value="6" step="0.5" style="width:33%">
+          <input class="form-input" id="bt-tp3" type="number" value="10" step="0.5" style="width:33%">
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Stop Loss %</label>
+        <input class="form-input" id="bt-sl" type="number" value="3" step="0.5">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Min Confluence Score</label>
+        <input class="form-input" id="bt-confluence" type="number" value="5" step="0.5">
+      </div>
+      <button class="calc-btn" id="bt-run-btn" onclick="runBacktest()">Run Backtest</button>
+      <div id="bt-progress" style="margin-top:12px;font-size:12px;color:var(--dim);display:none;">
+        <div style="height:4px;background:var(--border);border-radius:2px;margin-bottom:6px;">
+          <div id="bt-bar" style="height:100%;background:var(--blue);border-radius:2px;width:0%;transition:width .3s;"></div>
+        </div>
+        <span id="bt-status">Starting...</span>
+      </div>
+    </div>
+
+    <!-- Summary stats -->
+    <div>
+      <div id="bt-stats" style="display:none;">
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:14px;">
+          <div class="stat" style="--accent:var(--green)"><div class="stat-label">Win Rate</div><div class="stat-val" id="bt-wr">—</div><div class="stat-sub" id="bt-wr-sub">—</div></div>
+          <div class="stat" style="--accent:var(--blue)"><div class="stat-label">Total Trades</div><div class="stat-val" id="bt-total">—</div><div class="stat-sub" id="bt-period">—</div></div>
+          <div class="stat" style="--accent:var(--gold)"><div class="stat-label">Profit Factor</div><div class="stat-val" id="bt-pf">—</div><div class="stat-sub">gross win / gross loss</div></div>
+          <div class="stat" style="--accent:var(--red)"><div class="stat-label">Max Drawdown</div><div class="stat-val" id="bt-dd">—</div><div class="stat-sub">peak to trough</div></div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;">
+          <div class="stat" style="--accent:var(--teal)"><div class="stat-label">Total P&L</div><div class="stat-val" id="bt-pnl">—</div><div class="stat-sub">sum of all trades</div></div>
+          <div class="stat" style="--accent:var(--green)"><div class="stat-label">Avg Win</div><div class="stat-val" id="bt-avgwin">—</div><div class="stat-sub" id="bt-ultra-wr">—</div></div>
+          <div class="stat" style="--accent:var(--red)"><div class="stat-label">Avg Loss</div><div class="stat-val" id="bt-avgloss">—</div><div class="stat-sub" id="bt-strong-wr">—</div></div>
+          <div class="stat" style="--accent:var(--purple)"><div class="stat-label">Best / Worst</div><div class="stat-val" id="bt-best">—</div><div class="stat-sub" id="bt-worst">—</div></div>
+        </div>
+      </div>
+      <div id="bt-placeholder" class="chart-card" style="height:180px;display:flex;align-items:center;justify-content:center;">
+        <div style="text-align:center;color:var(--dim);">
+          <div style="font-size:14px;margin-bottom:6px;">Select a symbol and click Run Backtest</div>
+          <div style="font-size:12px;">Tests the swing trading strategy on real historical data</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Equity curve -->
+  <div id="bt-charts-row" style="display:none;">
+    <div class="chart-card" style="margin-bottom:16px;">
+      <div class="card-title">
+        <span class="card-dot" style="background:var(--green)"></span>
+        Equity Curve — Starting $1,000 (1% risk per trade)
+      </div>
+      <div style="position:relative;height:220px;"><canvas id="btEquityChart"></canvas></div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+      <div class="chart-card">
+        <div class="card-title"><span class="card-dot" style="background:var(--gold)"></span>Trade P&L Distribution</div>
+        <div style="position:relative;height:180px;"><canvas id="btPnlChart"></canvas></div>
+      </div>
+      <div class="chart-card">
+        <div class="card-title"><span class="card-dot" style="background:var(--blue)"></span>Outcome Breakdown</div>
+        <div style="position:relative;height:180px;"><canvas id="btOutcomeChart"></canvas></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Trades table -->
+  <div id="bt-trades-wrap" class="tbl-wrap" style="display:none;">
+    <div class="tbl-head">
+      <h3>Trade History</h3>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <select class="fi" id="bt-filter-dir" onchange="filterBtTrades()">
+          <option value="">All directions</option>
+          <option value="BUY">Buy only</option>
+          <option value="SELL">Sell only</option>
+        </select>
+        <select class="fi" id="bt-filter-outcome" onchange="filterBtTrades()">
+          <option value="">All outcomes</option>
+          <option value="TP1">TP1</option>
+          <option value="TP2">TP2</option>
+          <option value="TP3">TP3</option>
+          <option value="SL">SL</option>
+          <option value="TIMEOUT">Timeout</option>
+        </select>
+        <button class="fi" onclick="exportBtTrades()">Export CSV</button>
+      </div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table><thead>
+        <tr><th>Entry</th><th>Exit</th><th>Dir</th><th>Grade</th><th>Confluence</th>
+            <th>Entry Price</th><th>Exit Price</th><th>TP1</th><th>SL</th>
+            <th>RSI</th><th>Outcome</th><th>P&L %</th></tr>
+      </thead>
+      <tbody id="bt-tbody"></tbody></table>
+    </div>
+  </div>
+
+</main></div>
+
+<!-- AUTO TRADE PAGE -->
+<div id="page-autotrade" class="page"><main>
+
+  <div style="max-width:820px;margin:0 auto">
+
+    <!-- Header -->
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px">
+      <div>
+        <h2 style="font-size:20px;font-weight:600;margin:0">Auto Trade</h2>
+        <p style="font-size:13px;color:var(--dim);margin:4px 0 0">Automated order execution on Binance when signals fire</p>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span id="at2-badge" style="font-size:12px;font-weight:700;padding:4px 14px;border-radius:20px;background:rgba(136,136,136,.12);color:#888;border:1px solid rgba(136,136,136,.3)">OFF</span>
+        <label class="at-toggle" title="Master switch">
+          <input type="checkbox" id="at2-switch" onchange="atToggle(this.checked)">
+          <span class="at-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Status cards -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">
+      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Balance</div>
+        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-balance">—</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px" id="at2-env">—</div>
+      </div>
+      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Trades Today</div>
+        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-trades">—</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px" id="at2-total">total: —</div>
+      </div>
+      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Open Orders</div>
+        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-orders">—</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px">across all pairs</div>
+      </div>
+      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
+        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Mode</div>
+        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-mode">—</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px">spot or futures</div>
+      </div>
+    </div>
+
+    <!-- Settings card -->
+    <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px">
+      <div style="font-size:14px;font-weight:600;margin-bottom:16px">Settings</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Trading Mode</label>
+          <select id="at2-mode-sel" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" onchange="atSaveSettings()">
+            <option value="spot">Spot — BUY signals only, no leverage</option>
+            <option value="futures">Futures — LONG + SHORT, with leverage</option>
+          </select>
+          <div style="font-size:11px;color:var(--dim);margin-top:4px" id="at2-mode-note">Spot: buy coins, no risk of liquidation</div>
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Risk per trade: <span id="at2-risk-lbl" style="color:var(--gold)">2%</span></label>
+          <input type="range" id="at2-risk" min="0.5" max="5" step="0.5" value="2" style="width:100%" oninput="document.getElementById('at2-risk-lbl').textContent=this.value+'%'" onchange="atSaveSettings()">
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim)"><span>0.5%</span><span>5%</span></div>
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Max trades per day</label>
+          <input type="number" id="at2-max" min="1" max="20" value="5" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" onchange="atSaveSettings()">
+        </div>
+        <div>
+          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Daily loss limit (auto-disable)</label>
+          <input type="number" id="at2-loss" min="2" max="20" value="6" step="1" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" placeholder="% e.g. 6">
+          <div style="font-size:11px;color:var(--dim);margin-top:4px">Auto-disables if daily loss exceeds this %</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Open futures positions -->
+    <div id="at2-positions-card" style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px;display:none">
+      <div style="font-size:14px;font-weight:600;margin-bottom:12px">Open Positions</div>
+      <div id="at2-positions-list"></div>
+    </div>
+
+    <!-- How it works -->
+    <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px">
+      <div style="font-size:14px;font-weight:600;margin-bottom:12px">How It Works</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;font-size:12px;color:var(--dim)">
+        <div>
+          <div style="font-weight:600;color:var(--green);margin-bottom:6px">Spot Mode</div>
+          <div style="line-height:1.7">• Signal fires → Market BUY immediately<br>• OCO order placed: TP1 limit + SL stop-limit<br>• TP2 limit order for 35% of position<br>• TP3 limit order for 25% of position<br>• SL triggers automatically — no monitoring needed<br>• SELL signals are skipped (no shorting on spot)</div>
+        </div>
+        <div>
+          <div style="font-weight:600;color:var(--gold);margin-bottom:6px">Futures Mode</div>
+          <div style="line-height:1.7">• Signal fires → Sets leverage (2–3x conservative)<br>• Market LONG (BUY) or SHORT (SELL)<br>• 3x TAKE_PROFIT_MARKET orders at TP1/TP2/TP3<br>• STOP_MARKET closes full position at SL<br>• Uses MARK_PRICE to avoid wick manipulation<br>• Hedge mode: can hold LONG and SHORT same time</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Setup guide -->
+    <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px">
+      <div style="font-size:14px;font-weight:600;margin-bottom:12px">Setup</div>
+      <div style="font-size:12px;color:var(--dim);line-height:1.9">
+        1. Get Binance API keys at <b style="color:var(--text)">Binance → Profile → API Management → Create API</b><br>
+        2. Enable <b style="color:var(--text)">"Spot & Margin Trading"</b> for spot mode. Enable <b style="color:var(--text)">"Futures Trading"</b> for futures. Never enable withdrawals.<br>
+        3. Add to your <b style="color:var(--text)">.env</b> file:<br>
+        <code style="display:block;background:var(--bg);padding:10px 12px;border-radius:6px;margin:8px 0;font-size:11px;line-height:1.8">BINANCE_API_KEY=your_key_here
+BINANCE_API_SECRET=your_secret_here
+AUTO_RISK_PCT=2.0
+AUTO_LOSS_LIMIT=6.0</code>
+        4. By default runs in <b style="color:var(--gold)">TESTNET mode</b> — orders go to testnet.binance.vision, not real money.<br>
+        5. Add <code style="font-size:11px;padding:1px 5px;background:var(--bg);border-radius:3px">BINANCE_TESTNET=false</code> to go live. <b style="color:var(--text)">Test for at least 1 week first.</b>
+      </div>
+    </div>
+
+    <!-- Emergency stop -->
+    <div style="text-align:center;padding:8px 0 24px">
+      <button id="at2-stop-btn" onclick="atEmergencyStop()" style="padding:12px 32px;font-size:13px;font-weight:700;border-radius:8px;background:rgba(220,50,50,.1);color:#e05555;border:1px solid rgba(220,50,50,.3);cursor:pointer;letter-spacing:.03em;display:none">
+        🛑 Emergency Stop — Cancel All Orders
+      </button>
+    </div>
+
+  </div>
+</main></div>
+<!-- END AUTO TRADE PAGE -->
+
 </body>
 </html>

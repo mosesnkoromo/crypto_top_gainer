@@ -1,0 +1,79 @@
+# koyeb.yaml — Deploy to Koyeb (free tier, Frankfurt/Singapore servers)
+# Koyeb: https://app.koyeb.com
+# Binance works from Frankfurt and Singapore — no geo-blocking.
+#
+# Setup:
+#   1. Sign up at koyeb.com (no credit card)
+#   2. Connect your GitHub repo
+#   3. Koyeb reads this file automatically on deploy
+#   4. Add secrets in Koyeb dashboard: Settings → Secrets
+#
+# Free tier limits: 2 services, 512MB RAM, 0.1 CPU each, 1 PostgreSQL (256MB)
+
+services:
+  # ── Web Dashboard ─────────────────────────────────────────
+  - name: btc-dashboard
+    type: web
+    git:
+      branch: main
+    build:
+      builder: buildpack
+      run_command: >
+        pip install -r requirements-prod.txt &&
+        python manage.py migrate --noinput &&
+        python manage.py collectstatic --noinput
+    run:
+      command: gunicorn btc_project.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120
+    instance_types:
+      - nano          # free tier
+    regions:
+      - fra           # Frankfurt, Germany — Binance accessible
+    ports:
+      - port: 8000
+        protocol: http
+    routes:
+      - path: /
+        port: 8000
+    env:
+      - key: DJANGO_SETTINGS_MODULE
+        value: btc_project.settings
+      - key: DEBUG
+        value: "False"
+      - key: DJANGO_SECRET_KEY
+        secret: DJANGO_SECRET_KEY
+      - key: DATABASE_URL
+        secret: DATABASE_URL
+      - key: TIME_ZONE
+        value: Africa/Dar_es_Salaam
+
+  # ── Bot Scanner Worker ────────────────────────────────────
+  - name: btc-bot
+    type: worker
+    git:
+      branch: main
+    build:
+      builder: buildpack
+      run_command: >
+        pip install -r requirements-prod.txt &&
+        python manage.py migrate --noinput
+    run:
+      command: python manage.py runbot
+    instance_types:
+      - nano          # free tier
+    regions:
+      - fra           # Frankfurt — same region as dashboard for shared DB
+    env:
+      - key: DJANGO_SETTINGS_MODULE
+        value: btc_project.settings
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        secret: DATABASE_URL
+      - key: WHATSAPP_NUMBER
+        secret: WHATSAPP_NUMBER
+      - key: WHAPI_TOKEN
+        secret: WHAPI_TOKEN
+      - key: CRYPTOPANIC_API_KEY
+        secret: CRYPTOPANIC_API_KEY
+      - key: TIME_ZONE
+        value: Africa/Dar_es_Salaam

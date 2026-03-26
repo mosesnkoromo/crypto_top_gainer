@@ -63,7 +63,9 @@ class Command(BaseCommand):
             log.info("Bot thread starting...")
             try:
                 scanner = Scanner(cfg)
-                sender  = WhatsAppSender(cfg.whatsapp)
+                from dashboard import views as dash_views
+                dash_views.api_scans(scanner)
+                sender = WhatsAppSender(cfg.whatsapp)
                 sender.send(fmt_startup(
                     cfg.version, cfg.scan.scan_interval_minutes,
                     cfg.scan.top_gainers_count, cfg.scan.min_gain_percent,
