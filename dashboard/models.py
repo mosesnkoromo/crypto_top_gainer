@@ -134,21 +134,34 @@ class NewsItem(models.Model):
 
 class AutoTradeState(models.Model):
     """
-    Singleton — one row stores the auto-trade on/off state.
-    Master switch for automated Binance order execution.
+    Singleton — independent on/off for Spot and Futures auto-trading.
+    Each has its own risk%, max trades, and daily counter.
     """
-    MODE_CHOICES = [("spot", "Spot"), ("futures", "Futures")]
+    # ── Spot ─────────────────────────────────────────────────
+    spot_enabled        = models.BooleanField(default=False)
+    spot_risk           = models.FloatField(default=2.0,
+                                            validators=[MinValueValidator(0.1), MaxValueValidator(5.0)])
+    spot_max_trades     = models.PositiveIntegerField(default=5, validators=[MinValueValidator(1)])
+    spot_trades_today   = models.PositiveIntegerField(default=0)
+    spot_total          = models.PositiveIntegerField(default=0)
 
+    # ── Futures ───────────────────────────────────────────────
+    futures_enabled     = models.BooleanField(default=False)
+    futures_risk        = models.FloatField(default=2.0,
+                                            validators=[MinValueValidator(0.1), MaxValueValidator(5.0)])
+    futures_max_trades  = models.PositiveIntegerField(default=5, validators=[MinValueValidator(1)])
+    futures_trades_today= models.PositiveIntegerField(default=0)
+    futures_total       = models.PositiveIntegerField(default=0)
+
+    # ── Legacy / shared ───────────────────────────────────────
+    # Kept for backward-compat; use spot_enabled / futures_enabled instead
     enabled         = models.BooleanField(default=False)
-    mode            = models.CharField(max_length=10, choices=MODE_CHOICES, default="spot")
-    capital_usdt    = models.FloatField(default=100.0,
-                                        validators=[MinValueValidator(0.0)])
-    risk_per_trade  = models.FloatField(default=2.0,
-                                        validators=[MinValueValidator(0.1), MaxValueValidator(5.0)])
-    max_trades_day  = models.PositiveIntegerField(default=5,
-                                                   validators=[MinValueValidator(1)])
-    trades_today        = models.PositiveIntegerField(default=0)
-    total_auto_trades   = models.PositiveIntegerField(default=0)
+    mode            = models.CharField(max_length=10, default="spot")
+    capital_usdt    = models.FloatField(default=100.0)
+    risk_per_trade  = models.FloatField(default=2.0)
+    max_trades_day  = models.PositiveIntegerField(default=5)
+    trades_today    = models.PositiveIntegerField(default=0)
+    total_auto_trades= models.PositiveIntegerField(default=0)
     updated_at      = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -156,18 +169,21 @@ class AutoTradeState(models.Model):
         verbose_name_plural = "Auto Trade State"
 
     def __str__(self):
-        return f"AutoTrade enabled={self.enabled} mode={self.mode} risk={self.risk_per_trade}%"
+        parts = []
+        if self.spot_enabled:    parts.append("Spot ON")
+        if self.futures_enabled: parts.append("Futures ON")
+        return "AutoTrade: " + (", ".join(parts) or "OFF")
 
     @classmethod
     def get(cls) -> "AutoTradeState":
-        """Always returns the single row (pk=1), creating it if needed."""
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
 
     def save(self, *args, **kwargs):
-        # Clamp risk and trade count within valid ranges
-        if self.risk_per_trade is not None:
-            self.risk_per_trade = max(0.1, min(float(self.risk_per_trade), 5.0))
-        if self.max_trades_day is not None and self.max_trades_day < 1:
-            self.max_trades_day = 1
+        for f in ("spot_risk","futures_risk","risk_per_trade"):
+            v = getattr(self, f, None)
+            if v is not None: setattr(self, f, max(0.1, min(float(v), 5.0)))
+        for f in ("spot_max_trades","futures_max_trades","max_trades_day"):
+            v = getattr(self, f, None)
+            if v is not None and v < 1: setattr(self, f, 1)
         super().save(*args, **kwargs)

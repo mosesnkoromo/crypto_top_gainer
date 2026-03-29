@@ -111,6 +111,40 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.01
 .capital-input-row .form-input{flex:1;}
 .capital-save-btn{padding:10px 16px;border-radius:8px;background:var(--green);border:none;color:#000;font-weight:700;cursor:pointer;font-size:13px;white-space:nowrap;}
 .loading{color:var(--dim);font-size:13px;padding:24px;text-align:center;}
+
+/* ── Toast notifications ── */
+#toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none;}
+.toast{display:flex;align-items:center;gap:10px;padding:12px 16px;border-radius:10px;backdrop-filter:blur(20px);font-size:13px;font-weight:500;min-width:260px;max-width:380px;pointer-events:all;transform:translateX(120%);transition:transform .3s cubic-bezier(.34,1.56,.64,1),opacity .3s;opacity:0;box-shadow:0 8px 32px rgba(0,0,0,.4);}
+.toast.show{transform:translateX(0);opacity:1;}
+.toast.success{background:rgba(0,229,160,.12);border:1px solid rgba(0,229,160,.3);color:var(--green);}
+.toast.error{background:rgba(255,69,96,.12);border:1px solid rgba(255,69,96,.3);color:#ff6b84;}
+.toast.info{background:rgba(77,159,255,.12);border:1px solid rgba(77,159,255,.3);color:var(--blue);}
+.toast.warning{background:rgba(255,186,8,.12);border:1px solid rgba(255,186,8,.3);color:var(--gold);}
+.toast-icon{font-size:16px;flex-shrink:0;}
+.toast-msg{flex:1;line-height:1.4;}
+.toast-close{font-size:16px;cursor:pointer;opacity:.6;flex-shrink:0;padding:0 2px;}
+.toast-close:hover{opacity:1;}
+/* ── Modal dialog ── */
+#modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);z-index:10000;display:none;align-items:center;justify-content:center;}
+#modal-overlay.show{display:flex;}
+#modal-box{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;max-width:420px;width:90%;box-shadow:0 24px 64px rgba(0,0,0,.6);animation:modalIn .2s ease;}
+@keyframes modalIn{from{opacity:0;transform:scale(.92) translateY(12px)}to{opacity:1;transform:none}}
+.modal-icon{font-size:32px;margin-bottom:12px;display:block;}
+.modal-title{font-size:17px;font-weight:700;margin-bottom:8px;color:var(--text);}
+.modal-body{font-size:13px;color:var(--dim);line-height:1.7;margin-bottom:20px;white-space:pre-line;}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end;}
+.modal-btn{padding:9px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:.15s;}
+.modal-btn.cancel{background:var(--surface);color:var(--dim);border:1px solid var(--border);}
+.modal-btn.cancel:hover{color:var(--text);}
+.modal-btn.confirm{background:var(--blue);color:#fff;}
+.modal-btn.confirm:hover{opacity:.9;}
+.modal-btn.danger{background:rgba(220,50,50,.15);color:#e05555;border:1px solid rgba(220,50,50,.3);}
+.modal-btn.danger:hover{background:rgba(220,50,50,.25);}
+/* ── Loading overlay for toggle ── */
+.at-panel-loading{position:relative;}
+.at-panel-loading::after{content:'';position:absolute;inset:0;background:rgba(6,8,15,.6);border-radius:var(--radius);backdrop-filter:blur(2px);display:flex;align-items:center;justify-content:center;z-index:5;}
+.at-spinner{width:20px;height:20px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .7s linear infinite;position:absolute;top:50%;left:50%;margin:-10px 0 0 -10px;z-index:6;}
+
 .skel{display:inline-block;width:60px;height:10px;background:var(--border);border-radius:4px;animation:shimmer 1.2s infinite;}
 .skeleton-row td{padding:10px 8px;}
 @keyframes shimmer{0%,100%{opacity:.4}50%{opacity:.9}}
@@ -141,6 +175,22 @@ tr:last-child td{border-bottom:none;}tr:hover td{background:rgba(255,255,255,.01
 </style>
 </head>
 <body>
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<!-- Modal dialog -->
+<div id="modal-overlay">
+  <div id="modal-box">
+    <span class="modal-icon" id="modal-icon">ℹ️</span>
+    <div class="modal-title" id="modal-title"></div>
+    <div class="modal-body"  id="modal-body"></div>
+    <div class="modal-actions">
+      <button class="modal-btn cancel" id="modal-cancel" onclick="modalClose()">Cancel</button>
+      <button class="modal-btn confirm" id="modal-confirm">OK</button>
+    </div>
+  </div>
+</div>
+
 <div class="topbar">
   <div class="logo"><div class="logo-pulse"></div><div class="logo-name">BTC<em>Bot</em></div></div>
   <div class="nav-tabs">
@@ -429,7 +479,7 @@ function exportReport(){
   if(exportBtn){ exportBtn.textContent='Exporting...'; exportBtn.disabled=true; }
   get(`/api/signals/?per_page=500&`+buildSigParams().toString()).then(data=>{
   if(exportBtn){ exportBtn.textContent='Export CSV'; exportBtn.disabled=false; }
-    if(!data.signals.length)return alert("No signals to export");
+    if(!data.signals.length){ toast("No signals to export","warning"); return; }
     const rows=[["Time","Symbol","Dir","Grade","Conf","Entry","TP1","TP2","TP3","SL","RSI","BTC","Outcome","PnL%"],...data.signals.map(s=>[s.created_at,s.symbol,s.signal,s.grade,s.confidence,s.entry,s.tp1,s.tp2,s.tp3,s.sl,s.rsi,s.btc_score,s.outcome,s.profit_pct||""])];
     const csv=rows.map(r=>r.join(",")).join("\n");
     const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"}));a.download=`signals_${reportPeriod}.csv`;a.click();
@@ -443,7 +493,7 @@ function calculate(){
   const entry=parseFloat(document.getElementById("c-entry").value)||0;
   const maxTrades=parseInt(document.getElementById("c-trades").value)||3;
   const type=document.getElementById("c-type").value;
-  if(!capital){alert("Enter capital");return;}
+  if(!capital){ toast("Please enter capital amount","warning"); return; }
   const riskAmt=capital*riskPct/100;
   const posSize=riskAmt/(slPct/100);
   const leverage=type==="futures"?Math.ceil(posSize/capital):1;
@@ -472,7 +522,7 @@ async function loadCapital(){
 }
 async function saveCapital(){
   const amt=document.getElementById("cap-amount").value;const dt=document.getElementById("cap-date").value;const notes=document.getElementById("cap-notes").value;
-  if(!amt)return alert("Enter amount");
+  if(!amt){ toast("Please enter an amount","warning"); return; }
   await post("/api/capital/add/",{capital:parseFloat(amt),date:dt||undefined,notes});
   document.getElementById("cap-amount").value="";document.getElementById("cap-notes").value="";
   loadCapital();
@@ -486,163 +536,440 @@ async function loadDashboard(){
     if(scans.scans.length){buildBtcChart(scans.scans);renderBtcPanel(scans.scans[0]);}
   }catch(e){console.error(e);}
 }
+
+/* ══════════════════════════════════════════
+   TOAST NOTIFICATION SYSTEM
+══════════════════════════════════════════ */
+function toast(msg, type='info', duration=3500){
+  const icons = {success:'✅', error:'❌', info:'ℹ️', warning:'⚠️'};
+  const c = document.getElementById('toast-container');
+  if(!c) return;
+  const t = document.createElement('div');
+  t.className = 'toast '+type;
+  t.innerHTML = `<span class="toast-icon">${icons[type]||'ℹ️'}</span>
+    <span class="toast-msg">${msg}</span>
+    <span class="toast-close" onclick="this.parentElement.remove()">✕</span>`;
+  c.appendChild(t);
+  requestAnimationFrame(()=>{ t.classList.add('show'); });
+  setTimeout(()=>{
+    t.classList.remove('show');
+    setTimeout(()=>t.remove(), 350);
+  }, duration);
+}
+
+/* ══════════════════════════════════════════
+   MODAL CONFIRM SYSTEM
+══════════════════════════════════════════ */
+let _modalResolve = null;
+function modal(opts){
+  // opts: {title, body, icon, confirmText, cancelText, danger}
+  // Returns a Promise<boolean>
+  return new Promise(resolve => {
+    _modalResolve = resolve;
+    const overlay = document.getElementById('modal-overlay');
+    document.getElementById('modal-icon').textContent    = opts.icon || 'ℹ️';
+    document.getElementById('modal-title').textContent   = opts.title || '';
+    document.getElementById('modal-body').textContent    = opts.body  || '';
+    const confirmBtn = document.getElementById('modal-confirm');
+    const cancelBtn  = document.getElementById('modal-cancel');
+    confirmBtn.textContent  = opts.confirmText  || 'OK';
+    cancelBtn.textContent   = opts.cancelText   || 'Cancel';
+    confirmBtn.className    = 'modal-btn ' + (opts.danger ? 'danger' : 'confirm');
+    cancelBtn.style.display = opts.hideCancel ? 'none' : '';
+    confirmBtn.onclick = ()=>{ modalClose(); resolve(true); };
+    cancelBtn.onclick  = ()=>{ modalClose(); resolve(false); };
+    overlay.classList.add('show');
+    // Close on backdrop click
+    overlay.onclick = (e)=>{ if(e.target===overlay){ modalClose(); resolve(false); } };
+  });
+}
+function modalClose(){
+  document.getElementById('modal-overlay').classList.remove('show');
+  _modalResolve = null;
+}
+
+/* ── Loading state helpers ── */
+function panelLoading(panelId, on){
+  const panel = document.getElementById(panelId);
+  if(!panel) return;
+  let spinner = panel.querySelector('.at-spinner');
+  if(on){
+    panel.classList.add('at-panel-loading');
+    if(!spinner){
+      spinner = document.createElement('div');
+      spinner.className = 'at-spinner';
+      panel.style.position = 'relative';
+      panel.appendChild(spinner);
+    }
+  } else {
+    panel.classList.remove('at-panel-loading');
+    if(spinner) spinner.remove();
+  }
+}
+
 loadDashboard();
 setInterval(loadDashboard,60000);
-// ── Auto-trade: unified JS ────────────────────────────────
-// Uses /api/auto/status/, /api/auto/toggle/, /api/auto/stop/
-// Updates both the top mini-indicator AND the full Auto Trade page
+// ── Auto-trade: independent Spot + Futures ───────────────
 
 async function atLoad(){
   try{
     const d = await get('/api/auto/status/');
     if(!d) return;
 
-    // Top mini-badge (in nav area)
-    const navBadge = document.getElementById('at2-badge');
-    const navSwitch = document.getElementById('at2-switch');
-    if(navBadge){
-      navBadge.textContent = d.enabled ? 'ON' : 'OFF';
-      navBadge.style.background = d.enabled ? 'rgba(0,204,119,.15)' : 'rgba(136,136,136,.12)';
-      navBadge.style.color      = d.enabled ? '#00cc77' : '#888';
-      navBadge.style.borderColor= d.enabled ? 'rgba(0,204,119,.35)' : 'rgba(136,136,136,.3)';
+    // ── Spot panel ────────────────────────────────────────
+    const sSw    = document.getElementById('spot-switch');
+    const sBadge = document.getElementById('spot-badge');
+    if(sSw)    sSw.checked = d.spot_enabled;
+    if(sBadge){
+      sBadge.textContent  = d.spot_enabled ? 'ON' : 'OFF';
+      sBadge.style.background   = d.spot_enabled ? 'rgba(0,229,160,.15)' : 'rgba(136,136,136,.12)';
+      sBadge.style.color        = d.spot_enabled ? '#00e5a0' : '#888';
+      sBadge.style.borderColor  = d.spot_enabled ? 'rgba(0,229,160,.35)' : 'rgba(136,136,136,.3)';
     }
-    if(navSwitch) navSwitch.checked = d.enabled;
+    const el = (id) => document.getElementById(id);
+    const fmt = (v) => {
+      if(v == null || v === '' || v === undefined) return '—';
+      const n = parseFloat(v);
+      return isNaN(n) ? '—' : '$'+n.toFixed(2);
+    };
+    if(el('spot-balance')){
+      if(d.spot_error) el('spot-balance').innerHTML = '<span style="font-size:11px;color:var(--red)">API Error</span>';
+      else el('spot-balance').textContent = fmt(d.spot_balance);
+    }
+    if(el('spot-trades'))  el('spot-trades').textContent  = (d.spot_trades_today||0)+'/'+(d.spot_max_trades||5);
+    if(el('spot-total'))   el('spot-total').textContent   = 'total: '+(d.spot_total||0);
+    if(el('spot-orders'))  el('spot-orders').textContent  = d.spot_open_orders ?? '—';
+    if(el('spot-status'))  el('spot-status').textContent  = d.spot_enabled ? (d.block_spot || '✅ Ready') : 'Off';
+    if(el('spot-risk'))    el('spot-risk').value           = d.spot_risk || 2;
+    if(el('spot-risk-lbl')) el('spot-risk-lbl').textContent = (d.spot_risk||2)+'%';
+    if(el('spot-max'))     el('spot-max').value            = d.spot_max_trades || 5;
+    const sb = el('spot-block');
+    if(sb){ sb.textContent = d.block_spot || ''; sb.style.display = (d.spot_enabled && d.block_spot) ? '' : 'none'; }
 
-    // Full page status cards
-    const bal   = document.getElementById('at2-balance');
-    const env   = document.getElementById('at2-env');
-    const trd   = document.getElementById('at2-trades');
-    const tot   = document.getElementById('at2-total');
-    const ord   = document.getElementById('at2-orders');
-    const mod   = document.getElementById('at2-mode');
-    const stop  = document.getElementById('at2-stop-btn');
-    const mSel  = document.getElementById('at2-mode-sel');
-    const mNote = document.getElementById('at2-mode-note');
-    const risk  = document.getElementById('at2-risk');
-    const rLbl  = document.getElementById('at2-risk-lbl');
-    const maxT  = document.getElementById('at2-max');
-
-    if(bal)  bal.textContent  = d.has_keys ? '$'+(d.live_balance||0).toFixed(2) : '⚠️ No keys';
-    if(env)  env.textContent  = d.testnet ? 'TESTNET mode' : 'LIVE trading';
-    if(env)  env.style.color  = d.testnet ? 'var(--gold)' : 'var(--red)';
-    if(trd)  trd.textContent  = (d.trades_today||0)+'/'+(d.max_trades_day||10);
-    if(tot)  tot.textContent  = 'total: '+(d.total_auto_trades||0);
-    if(ord)  ord.textContent  = d.open_orders ?? 0;
-    if(mod)  mod.textContent  = (d.mode||'spot').toUpperCase();
-    if(stop) stop.style.display = d.enabled ? '' : 'none';
-    if(mSel) mSel.value = d.mode || 'spot';
-    if(mNote) mNote.textContent = d.mode==='futures'
-      ? 'Futures: LONG + SHORT, leverage 2-3x, higher risk'
-      : 'Spot: buy coins, no leverage, no liquidation risk';
-    if(risk && d.risk_per_trade){ risk.value = d.risk_per_trade; }
-    if(rLbl && d.risk_per_trade){ rLbl.textContent = d.risk_per_trade+'%'; }
-    if(maxT && d.max_trades_day){ maxT.value = d.max_trades_day; }
+    // ── Futures panel ─────────────────────────────────────
+    const fSw    = document.getElementById('fut-switch');
+    const fBadge = document.getElementById('fut-badge');
+    if(fSw)    fSw.checked = d.futures_enabled;
+    if(fBadge){
+      fBadge.textContent  = d.futures_enabled ? 'ON' : 'OFF';
+      fBadge.style.background   = d.futures_enabled ? 'rgba(255,186,8,.15)' : 'rgba(136,136,136,.12)';
+      fBadge.style.color        = d.futures_enabled ? '#ffba08' : '#888';
+      fBadge.style.borderColor  = d.futures_enabled ? 'rgba(255,186,8,.35)' : 'rgba(136,136,136,.3)';
+    }
+    if(el('fut-balance')){
+      if(d.futures_error){
+        el('fut-balance').innerHTML = '<span style="font-size:11px;color:var(--red)">API Error</span>';
+      } else {
+        const avail = fmt(d.futures_balance);
+        const wallet = d.futures_wallet != null ? fmt(d.futures_wallet) : null;
+        const pnl = d.futures_pnl != null ? parseFloat(d.futures_pnl) : null;
+        let html = avail;
+        if(wallet && wallet !== avail) html += `<span style="font-size:10px;color:var(--dim);display:block">wallet ${wallet}</span>`;
+        if(pnl != null && !isNaN(pnl)){
+          const pColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+          html += `<span style="font-size:10px;color:${pColor};display:block">pnl ${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>`;
+        }
+        el('fut-balance').innerHTML = html;
+      }
+    }
+    if(el('fut-trades'))  el('fut-trades').textContent  = (d.futures_trades_today||0)+'/'+(d.futures_max_trades||5);
+    if(el('fut-total'))   el('fut-total').textContent   = 'total: '+(d.futures_total||0);
+    if(el('fut-orders'))  el('fut-orders').textContent  = d.futures_open_orders ?? '—';
+    if(el('fut-status'))  el('fut-status').textContent  = d.futures_enabled ? (d.block_futures || '✅ Ready') : 'Off';
+    if(el('fut-risk'))    el('fut-risk').value           = d.futures_risk || 2;
+    if(el('fut-risk-lbl')) el('fut-risk-lbl').textContent = (d.futures_risk||2)+'%';
+    if(el('fut-max'))     el('fut-max').value            = d.futures_max_trades || 5;
+    const fb = el('fut-block');
+    if(fb){ fb.textContent = d.block_futures || ''; fb.style.display = (d.futures_enabled && d.block_futures) ? '' : 'none'; }
 
     // Futures open positions
-    const posCard = document.getElementById('at2-positions-card');
-    const posList = document.getElementById('at2-positions-list');
+    // ── Futures positions ─────────────────────────────────────
+    // ── Futures positions ─────────────────────────────────────
+    const posCard = el('fut-positions-card');
+    const posList = el('fut-positions-list');
     if(posCard && posList){
-      const positions = d.open_positions || [];
-      if(positions.length > 0){
+      const pos = d.futures_positions || [];
+      if(pos.length > 0){
         posCard.style.display = '';
-        posList.innerHTML = positions.map(p => {
-          const pnl = parseFloat(p.pnl||0);
-          const pColor = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-          return `<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:12px;align-items:center;padding:8px 0;border-bottom:0.5px solid var(--border);font-size:12px">
-            <span style="font-family:'JetBrains Mono',monospace;font-weight:600">${p.symbol} <span style="color:${p.side==='LONG'?'var(--green)':'var(--red)'};font-size:11px">${p.side}</span></span>
-            <span style="color:var(--dim)">qty ${p.qty}</span>
-            <span style="color:var(--dim)">entry ${parseFloat(p.entry||0).toFixed(4)}</span>
-            <span style="color:${pColor};font-weight:600">${pnl>=0?'+':''}${pnl.toFixed(4)} USDT (${p.pnl_pct||0}%)</span>
-          </div>`;
-        }).join('');
+        let posHtml = '';
+        pos.forEach(function(p, i){
+          const pnl     = parseFloat(p.pnl || 0);
+          const pnlPct  = parseFloat(p.pnl_pct || 0);
+          const isLong  = p.side === 'LONG';
+          const pColor  = pnl >= 0 ? '#00e5a0' : '#ff4560';
+          const sColor  = isLong ? '#00e5a0' : '#ffba08';
+          const sIcon   = isLong ? '▲' : '▼';
+          const liq     = parseFloat(p.liq   || 0);
+          const mark    = parseFloat(p.mark  || 0);
+          const notion  = parseFloat(p.notional || 0);
+          const pnlSign = pnl >= 0 ? '+' : '';
+          const pctSign = pnlPct >= 0 ? '+' : '';
+
+          function orderLabel(t){
+            if(t === 'TAKE_PROFIT_MARKET') return 'TP';
+            if(t === 'STOP_MARKET') return 'SL';
+            if(t === 'TRAILING_STOP_MARKET') return 'TSL';
+            if(t === 'LIMIT') return 'LMT';
+            return t;
+          }
+
+          let ordersHtml = '';
+          const orders = p.orders || [];
+          if(orders.length > 0){
+            orders.forEach(function(o){
+              const isTP   = o.type === 'TAKE_PROFIT_MARKET';
+              const isSL   = o.type === 'STOP_MARKET';
+              const isTSL  = o.type === 'TRAILING_STOP_MARKET';
+              const oc     = isTP ? '#00e5a0' : isSL ? '#ff4560' : isTSL ? '#ffba08' : '#4d9fff';
+              const trigP  = parseFloat(o.stop_price || o.price || 0);
+              const stColor= o.status === 'NEW' ? '#4d9fff' : 'var(--dim)';
+              ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
+                + '<span style="color:' + oc + ';font-weight:700;min-width:36px">' + orderLabel(o.type) + '</span>'
+                + '<span style="color:var(--dim);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
+                + '<span style="color:var(--dim)">qty ' + parseFloat(o.qty||0).toFixed(2) + '</span>'
+                + '<span style="color:' + stColor + ';font-size:10px">' + (o.status||'') + '</span>'
+                + '</div>';
+            });
+          } else {
+            ordersHtml = '<div style="font-size:11px;color:var(--red);padding:6px 10px">⚠️ No TP/SL orders — position unprotected</div>';
+          }
+
+          posHtml += '<div style="border:1px solid var(--border);border-radius:8px;margin-bottom:10px;overflow:hidden">'
+            // Header
+            + '<div onclick="togglePos(\'' + 'pos' + i + '\')" style="display:grid;grid-template-columns:1fr auto auto auto auto;gap:10px;align-items:center;padding:12px 14px;cursor:pointer;background:var(--bg2);user-select:none">'
+              + '<div>'
+                + '<span style="font-size:14px;font-weight:700;font-family:JetBrains Mono,monospace">' + p.symbol + '</span>'
+                + '<span style="font-size:11px;font-weight:700;color:' + sColor + ';margin-left:8px">' + sIcon + ' ' + p.side + '</span>'
+              + '</div>'
+              + '<span style="font-size:11px;color:var(--dim)">qty <b style="color:var(--text)">' + parseFloat(p.qty).toFixed(4) + '</b></span>'
+              + '<span style="font-size:11px;color:var(--dim)">entry <b style="color:var(--text);font-family:monospace">' + parseFloat(p.entry).toFixed(6) + '</b></span>'
+              + '<div style="text-align:right">'
+                + '<div style="font-size:13px;font-weight:700;color:' + pColor + '">' + pnlSign + pnl.toFixed(3) + ' USDT</div>'
+                + '<div style="font-size:10px;color:' + pColor + '">' + pctSign + pnlPct.toFixed(2) + '%</div>'
+              + '</div>'
+              + '<span style="font-size:11px;color:var(--dim)">▾</span>'
+            + '</div>'
+            // Expanded
+            + '<div id="pos' + i + '" style="display:none;padding:12px 14px;border-top:1px solid var(--border)">'
+              + '<div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:12px;font-size:11px">'
+                + '<div><span style="color:var(--dim)">Mark</span><br><b style="font-family:monospace">' + (mark > 0 ? mark.toFixed(6) : '—') + '</b></div>'
+                + '<div><span style="color:var(--dim)">Notional</span><br><b>$' + notion.toFixed(2) + '</b></div>'
+                + '<div><span style="color:var(--dim)">Leverage</span><br><b>' + (p.leverage || '—') + 'x</b></div>'
+                + '<div><span style="color:var(--dim)">Liq. price</span><br><b style="color:#ff4560;font-family:monospace">' + (liq > 0 ? liq.toFixed(6) : '—') + '</b></div>'
+              + '</div>'
+              + '<div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Open Orders</div>'
+              + ordersHtml
+            + '</div>'
+          + '</div>';
+        });
+        posList.innerHTML = posHtml;
       } else {
         posCard.style.display = 'none';
       }
     }
-  } catch(e){ console.warn('atLoad error:', e); }
+
+    // ── Spot open orders ──────────────────────────────────────
+    const spotPosCard = el('spot-positions-card');
+    const spotPosList = el('spot-positions-list');
+    if(spotPosCard && spotPosList){
+      const spotPos = d.spot_positions || [];
+      if(spotPos.length > 0){
+        spotPosCard.style.display = '';
+        let sHtml = '';
+        spotPos.forEach(function(pos, i){
+          const id = 'spos' + i;
+          let ordHtml = '';
+          (pos.orders||[]).forEach(function(o){
+            const isTP  = o.type === 'LIMIT'           && o.side === 'SELL';
+            const isSL  = o.type === 'STOP_LOSS_LIMIT' || o.type === 'STOP_LOSS';
+            const isOCO = o.type === 'STOP_LOSS_LIMIT';
+            const oc    = isTP ? '#00e5a0' : isSL ? '#ff4560' : '#4d9fff';
+            const lbl   = isOCO ? 'SL' : isTP ? 'TP' : o.type;
+            const trigP = parseFloat(o.stop||0) > 0 ? parseFloat(o.stop) : parseFloat(o.price||0);
+            ordHtml += '<div style="display:flex;justify-content:space-between;padding:5px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
+              + '<span style="color:' + oc + ';font-weight:700;min-width:36px">' + lbl + '</span>'
+              + '<span style="color:var(--dim);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
+              + '<span style="color:var(--dim)">qty ' + parseFloat(o.qty||0).toFixed(4) + '</span>'
+              + '<span style="color:#4d9fff;font-size:10px">' + (o.status||'') + '</span>'
+              + '</div>';
+          });
+          sHtml += '<div style="border:1px solid var(--border);border-radius:8px;margin-bottom:10px;overflow:hidden">'
+            + '<div onclick="togglePos(\'' + id + '\')" style="display:flex;align-items:center;justify-content:space-between;padding:12px 14px;cursor:pointer;background:var(--bg2);user-select:none">'
+              + '<span style="font-size:14px;font-weight:700;font-family:JetBrains Mono,monospace">' + pos.symbol + '</span>'
+              + '<span style="font-size:11px;color:#00e5a0;font-weight:700">▲ LONG (spot)</span>'
+              + '<span style="font-size:11px;color:var(--dim)">' + (pos.orders||[]).length + ' orders</span>'
+              + '<span style="font-size:11px;color:var(--dim)">▾</span>'
+            + '</div>'
+            + '<div id="' + id + '" style="display:none;padding:10px 14px;border-top:1px solid var(--border)">'
+              + '<div style="font-size:11px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Open Orders (TP + SL)</div>'
+              + ordHtml
+            + '</div>'
+          + '</div>';
+        });
+        spotPosList.innerHTML = sHtml;
+      } else {
+        spotPosCard.style.display = 'none';
+      }
+    }
+
+        // Emergency stop button
+    const stopBtn = el('at-stop-btn');
+    if(stopBtn) stopBtn.style.display = (d.spot_enabled || d.futures_enabled) ? '' : 'none';
+
+    // Testnet note
+    const tn = el('at2-testnet-note');
+    if(tn) tn.style.display = d.testnet ? '' : 'none';
+
+  } catch(e){ console.warn('atLoad:', e); }
 }
 atLoad();
 setInterval(atLoad, 20000);
 
-async function atToggle(enabled){
-  const sw    = document.getElementById('at2-switch');
-  const badge = document.getElementById('at2-badge');
-  if(badge) badge.textContent = '...';
+async function atToggleSpot(enabled){
+  const sw    = document.getElementById('spot-switch');
+  const badge = document.getElementById('spot-badge');
+  const block = document.getElementById('spot-block');
 
-  if(enabled){
-    const ok = confirm('⚠️ ENABLE AUTO TRADE?\n\nThis will place REAL orders on Binance.\n\nMake sure:\n• BINANCE_API_KEY is set in .env\n• BINANCE_API_SECRET is set in .env\n• You are comfortable with the risk settings\n\nContinue?');
-    if(!ok){
-      if(sw) sw.checked = false;
-      if(badge) badge.textContent = 'OFF';
-      return;
-    }
-  }
+  // Show loading state immediately
+  panelLoading('at-spot-panel', true);
+  if(badge) badge.textContent = '...';
+  if(sw) sw.disabled = true;
 
   try{
-    const mSel = document.getElementById('at2-mode-sel');
-    const risk = document.getElementById('at2-risk');
-    const maxT = document.getElementById('at2-max');
-    const body = { enabled };
-    if(mSel) body.mode = mSel.value;
-    if(risk) body.risk_per_trade = parseFloat(risk.value);
-    if(maxT) body.max_trades_day = parseInt(maxT.value);
+    const body = {
+      spot_enabled: enabled,
+      spot_risk: parseFloat(document.getElementById('spot-risk')?.value || 2),
+      spot_max:  parseInt(document.getElementById('spot-max')?.value || 5),
+    };
+    const resp = await fetch('/api/auto/toggle/', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify(body),
+    });
+    if(!resp.ok) throw new Error('Server error '+resp.status);
+    const r = await resp.json();
 
-    const d = await fetch('/api/auto/toggle/',{
-      method:'POST',
-      headers:{'Content-Type':'application/json','X-CSRFToken':getCookie('csrftoken')},
-      body: JSON.stringify(body)
-    }).then(r=>r.json());
-
-    if(d.error){ alert('Error: '+d.error); if(sw) sw.checked=!enabled; }
-    else { await atLoad(); }
-
-    if(enabled){
-      const st = await get('/api/auto/status/');
-      if(!st.has_keys){
-        alert('⚠️ Auto-trade is ON but no API keys found!\n\nAdd to .env:\n  BINANCE_API_KEY=...\n  BINANCE_API_SECRET=...\n\nThen restart the bot.');
-      } else if(st.testnet){
-        alert('✅ Auto-trade enabled (TESTNET)\n\nOrders go to testnet.binance.vision — not real money.\nTest at least 1 week before going live.');
+    if(r.error){
+      if(block){ block.textContent = r.error; block.style.display = ''; }
+      if(sw) sw.checked = !enabled;
+      toast('Spot: '+r.error, 'error');
+    } else {
+      if(sw) sw.checked = r.spot_enabled;
+      if(block) block.style.display = 'none';
+      if(r.spot_enabled){
+        toast('Spot auto-trade enabled 🟢', 'success');
+      } else {
+        toast('Spot auto-trade disabled', 'info');
       }
     }
+    setTimeout(atLoad, 400);
   } catch(e){
-    alert('Error: '+e);
     if(sw) sw.checked = !enabled;
+    toast('Spot toggle failed: '+e.message, 'error');
+  } finally {
+    panelLoading('at-spot-panel', false);
+    if(sw) sw.disabled = false;
+  }
+}
+
+async function atToggleFutures(enabled){
+  const sw    = document.getElementById('fut-switch');
+  const badge = document.getElementById('fut-badge');
+  const block = document.getElementById('fut-block');
+
+  // Show loading state immediately
+  panelLoading('at-fut-panel', true);
+  if(badge) badge.textContent = '...';
+  if(sw) sw.disabled = true;
+
+  try{
+    const body = {
+      futures_enabled: enabled,
+      futures_risk: parseFloat(document.getElementById('fut-risk')?.value || 2),
+      futures_max:  parseInt(document.getElementById('fut-max')?.value || 5),
+    };
+    const resp = await fetch('/api/auto/toggle/', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json','X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify(body),
+    });
+    if(!resp.ok) throw new Error('Server error '+resp.status);
+    const r = await resp.json();
+
+    if(r.error){
+      if(block){ block.textContent = r.error; block.style.display = ''; }
+      if(sw) sw.checked = !enabled;
+      toast('Futures: '+r.error, 'error');
+    } else {
+      if(sw) sw.checked = r.futures_enabled;
+      if(block) block.style.display = 'none';
+      if(r.futures_enabled){
+        toast('Futures auto-trade enabled 🟡', 'success');
+      } else {
+        toast('Futures auto-trade disabled', 'info');
+      }
+    }
+    setTimeout(atLoad, 400);
+  } catch(e){
+    if(sw) sw.checked = !enabled;
+    toast('Futures toggle failed: '+e.message, 'error');
+  } finally {
+    panelLoading('at-fut-panel', false);
+    if(sw) sw.disabled = false;
   }
 }
 
 async function atSaveSettings(){
   try{
-    const mSel = document.getElementById('at2-mode-sel');
-    const risk = document.getElementById('at2-risk');
-    const maxT = document.getElementById('at2-max');
-    const body = {};
-    if(mSel) body.mode = mSel.value;
-    if(risk) body.risk_per_trade = parseFloat(risk.value);
-    if(maxT) body.max_trades_day = parseInt(maxT.value);
     await fetch('/api/auto/toggle/',{
       method:'POST',
       headers:{'Content-Type':'application/json','X-CSRFToken':getCookie('csrftoken')},
-      body: JSON.stringify(body)
+      body: JSON.stringify({
+        spot_risk:    parseFloat(document.getElementById('spot-risk')?.value||2),
+        spot_max:     parseInt(document.getElementById('spot-max')?.value||5),
+        futures_risk: parseFloat(document.getElementById('fut-risk')?.value||2),
+        futures_max:  parseInt(document.getElementById('fut-max')?.value||5),
+      })
     });
     await atLoad();
   } catch(e){ console.warn('atSaveSettings:', e); }
 }
 
 async function atEmergencyStop(){
-  if(!confirm('🛑 EMERGENCY STOP\n\nThis will:\n• Cancel ALL open orders on Binance immediately\n• Disable auto-trade\n\nYour open positions will NOT be closed automatically — you must close them manually.\n\nContinue?')) return;
-  const btn = document.getElementById('at2-stop-btn');
+  const confirmed = await modal({
+    icon: '🛑',
+    title: 'Emergency Stop',
+    body: 'This will cancel ALL open orders on Binance for both Spot and Futures.\n\nAuto-trade will be turned OFF.\n\nNote: open POSITIONS are not closed — close them manually on Binance.',
+    confirmText: 'Cancel All Orders',
+    cancelText: 'Go Back',
+    danger: true,
+  });
+  if(!confirmed) return;
+
+  const btn = document.getElementById('at-stop-btn');
   if(btn){ btn.textContent='Cancelling...'; btn.disabled=true; }
   try{
     const d = await fetch('/api/auto/stop/',{
       method:'POST',
       headers:{'X-CSRFToken':getCookie('csrftoken')}
     }).then(r=>r.json());
-    const n = (d.cancelled||[]).length;
-    if(d.ok) alert(`✅ Emergency stop done. ${n} pair(s) cancelled.\nAuto-trade is now OFF.`);
-    else alert('⚠️ Partial stop: '+(d.errors||[]).join(', '));
+    if(d.ok){
+      const n = (d.cancelled||[]).length;
+      toast(`Emergency stop done — ${n} pair(s) cancelled`, 'success', 5000);
+    } else {
+      toast('Stop had errors: '+(d.errors||[]).join(', '), 'warning', 6000);
+    }
     await atLoad();
-  } catch(e){ alert('Error: '+e); }
-  finally{ if(btn){ btn.textContent='🛑 Emergency Stop — Cancel All Orders'; btn.disabled=false; } }
+  } catch(e){
+    toast('Emergency stop error: '+e, 'error');
+  } finally {
+    if(btn){ btn.textContent='🛑 Emergency Stop — Cancel All Open Orders'; btn.disabled=false; }
+  }
+}
+
+function togglePos(id){
+  const el = document.getElementById(id);
+  if(el) el.style.display = el.style.display === 'none' ? '' : 'none';
 }
 
 function getCookie(name){
@@ -780,7 +1107,7 @@ async function runBacktest() {
     const res = await post("/api/backtest/run/", payload);
     setBar(90, "Building charts...");
 
-    if (res.error) { alert("Error: " + res.error); return; }
+    if (res.error) { toast("Error: " + res.error, "error"); return; }
 
     btAllTrades = res.trades || [];
     renderBtStats(res);
@@ -795,7 +1122,7 @@ async function runBacktest() {
     document.getElementById("bt-trades-wrap").style.display = "block";
     setBar(100, "Complete");
   } catch(e) {
-    alert("Backtest failed: " + e.message);
+    toast("Backtest failed: " + e.message, "error");
   } finally {
     btn.textContent = "Run Backtest"; btn.disabled = false;
     setTimeout(() => { document.getElementById("bt-progress").style.display = "none"; }, 2000);
@@ -1066,122 +1393,164 @@ initBacktestSymbols();
 
 <!-- AUTO TRADE PAGE -->
 <div id="page-autotrade" class="page"><main>
+<div style="max-width:900px;margin:0 auto">
 
-  <div style="max-width:820px;margin:0 auto">
-
-    <!-- Header -->
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;flex-wrap:wrap;gap:12px">
-      <div>
-        <h2 style="font-size:20px;font-weight:600;margin:0">Auto Trade</h2>
-        <p style="font-size:13px;color:var(--dim);margin:4px 0 0">Automated order execution on Binance when signals fire</p>
-      </div>
-      <div style="display:flex;align-items:center;gap:10px">
-        <span id="at2-badge" style="font-size:12px;font-weight:700;padding:4px 14px;border-radius:20px;background:rgba(136,136,136,.12);color:#888;border:1px solid rgba(136,136,136,.3)">OFF</span>
-        <label class="at-toggle" title="Master switch">
-          <input type="checkbox" id="at2-switch" onchange="atToggle(this.checked)">
-          <span class="at-slider"></span>
-        </label>
-      </div>
-    </div>
-
-    <!-- Status cards -->
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px">
-      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Balance</div>
-        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-balance">—</div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px" id="at2-env">—</div>
-      </div>
-      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Trades Today</div>
-        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-trades">—</div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px" id="at2-total">total: —</div>
-      </div>
-      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Open Orders</div>
-        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-orders">—</div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px">across all pairs</div>
-      </div>
-      <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:14px">
-        <div style="font-size:11px;color:var(--dim);margin-bottom:6px;text-transform:uppercase;letter-spacing:.05em">Mode</div>
-        <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace" id="at2-mode">—</div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px">spot or futures</div>
-      </div>
-    </div>
-
-    <!-- Settings card -->
-    <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px">
-      <div style="font-size:14px;font-weight:600;margin-bottom:16px">Settings</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
-        <div>
-          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Trading Mode</label>
-          <select id="at2-mode-sel" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" onchange="atSaveSettings()">
-            <option value="spot">Spot — BUY signals only, no leverage</option>
-            <option value="futures">Futures — LONG + SHORT, with leverage</option>
-          </select>
-          <div style="font-size:11px;color:var(--dim);margin-top:4px" id="at2-mode-note">Spot: buy coins, no risk of liquidation</div>
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Risk per trade: <span id="at2-risk-lbl" style="color:var(--gold)">2%</span></label>
-          <input type="range" id="at2-risk" min="0.5" max="5" step="0.5" value="2" style="width:100%" oninput="document.getElementById('at2-risk-lbl').textContent=this.value+'%'" onchange="atSaveSettings()">
-          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim)"><span>0.5%</span><span>5%</span></div>
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Max trades per day</label>
-          <input type="number" id="at2-max" min="1" max="20" value="5" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" onchange="atSaveSettings()">
-        </div>
-        <div>
-          <label style="font-size:12px;color:var(--dim);display:block;margin-bottom:6px">Daily loss limit (auto-disable)</label>
-          <input type="number" id="at2-loss" min="2" max="20" value="6" step="1" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" placeholder="% e.g. 6">
-          <div style="font-size:11px;color:var(--dim);margin-top:4px">Auto-disables if daily loss exceeds this %</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Open futures positions -->
-    <div id="at2-positions-card" style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px;display:none">
-      <div style="font-size:14px;font-weight:600;margin-bottom:12px">Open Positions</div>
-      <div id="at2-positions-list"></div>
-    </div>
-
-    <!-- How it works -->
-    <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px">
-      <div style="font-size:14px;font-weight:600;margin-bottom:12px">How It Works</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;font-size:12px;color:var(--dim)">
-        <div>
-          <div style="font-weight:600;color:var(--green);margin-bottom:6px">Spot Mode</div>
-          <div style="line-height:1.7">• Signal fires → Market BUY immediately<br>• OCO order placed: TP1 limit + SL stop-limit<br>• TP2 limit order for 35% of position<br>• TP3 limit order for 25% of position<br>• SL triggers automatically — no monitoring needed<br>• SELL signals are skipped (no shorting on spot)</div>
-        </div>
-        <div>
-          <div style="font-weight:600;color:var(--gold);margin-bottom:6px">Futures Mode</div>
-          <div style="line-height:1.7">• Signal fires → Sets leverage (2–3x conservative)<br>• Market LONG (BUY) or SHORT (SELL)<br>• 3x TAKE_PROFIT_MARKET orders at TP1/TP2/TP3<br>• STOP_MARKET closes full position at SL<br>• Uses MARK_PRICE to avoid wick manipulation<br>• Hedge mode: can hold LONG and SHORT same time</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Setup guide -->
-    <div style="background:var(--bg2);border-radius:var(--radius);border:1px solid var(--border);padding:20px;margin-bottom:20px">
-      <div style="font-size:14px;font-weight:600;margin-bottom:12px">Setup</div>
-      <div style="font-size:12px;color:var(--dim);line-height:1.9">
-        1. Get Binance API keys at <b style="color:var(--text)">Binance → Profile → API Management → Create API</b><br>
-        2. Enable <b style="color:var(--text)">"Spot & Margin Trading"</b> for spot mode. Enable <b style="color:var(--text)">"Futures Trading"</b> for futures. Never enable withdrawals.<br>
-        3. Add to your <b style="color:var(--text)">.env</b> file:<br>
-        <code style="display:block;background:var(--bg);padding:10px 12px;border-radius:6px;margin:8px 0;font-size:11px;line-height:1.8">BINANCE_API_KEY=your_key_here
-BINANCE_API_SECRET=your_secret_here
-AUTO_RISK_PCT=2.0
-AUTO_LOSS_LIMIT=6.0</code>
-        4. By default runs in <b style="color:var(--gold)">TESTNET mode</b> — orders go to testnet.binance.vision, not real money.<br>
-        5. Add <code style="font-size:11px;padding:1px 5px;background:var(--bg);border-radius:3px">BINANCE_TESTNET=false</code> to go live. <b style="color:var(--text)">Test for at least 1 week first.</b>
-      </div>
-    </div>
-
-    <!-- Emergency stop -->
-    <div style="text-align:center;padding:8px 0 24px">
-      <button id="at2-stop-btn" onclick="atEmergencyStop()" style="padding:12px 32px;font-size:13px;font-weight:700;border-radius:8px;background:rgba(220,50,50,.1);color:#e05555;border:1px solid rgba(220,50,50,.3);cursor:pointer;letter-spacing:.03em;display:none">
-        🛑 Emergency Stop — Cancel All Orders
-      </button>
-    </div>
-
+  <div style="margin-bottom:24px">
+    <h2 style="font-size:20px;font-weight:600;margin:0">Auto Trade</h2>
+    <p style="font-size:13px;color:var(--dim);margin:4px 0 0">Independent automated execution for Spot and Futures — each with its own toggle, risk setting and daily limit</p>
   </div>
+
+  <!-- ════ TWO PANELS SIDE BY SIDE ════ -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px">
+
+    <!-- ── SPOT PANEL ── -->
+    <div id="at-spot-panel" style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div>
+          <div style="font-size:15px;font-weight:700;color:var(--green)">Spot Trading</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:2px">BUY signals only · No leverage · OCO orders</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="spot-badge" style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;background:rgba(136,136,136,.12);color:#888;border:1px solid rgba(136,136,136,.3)">OFF</span>
+          <label class="at-toggle">
+            <input type="checkbox" id="spot-switch" onchange="atToggleSpot(this.checked)">
+            <span class="at-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Spot stats -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Balance</div>
+          <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="spot-balance">—</div>
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Trades Today</div>
+          <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="spot-trades">—</div>
+          <div style="font-size:10px;color:var(--dim)" id="spot-total">total: 0</div>
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Pending Orders</div>
+          <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="spot-orders">—</div>
+          <div style="font-size:10px;color:var(--dim)">limit sells on open trades</div>
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Status</div>
+          <div style="font-size:11px;font-weight:600;margin-top:4px;color:var(--green)" id="spot-status">—</div>
+        </div>
+      </div>
+
+      <!-- Spot settings -->
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Risk per trade: <span id="spot-risk-lbl" style="color:var(--gold);font-weight:600">2%</span></label>
+        <input type="range" id="spot-risk" min="0.5" max="5" step="0.5" value="2" style="width:100%" oninput="document.getElementById('spot-risk-lbl').textContent=this.value+'%'" onchange="atSaveSettings()">
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Max trades/day</label>
+        <input type="number" id="spot-max" min="1" max="20" value="5" style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" onchange="atSaveSettings()">
+      </div>
+
+      <!-- Block reason -->
+      <div id="spot-block" style="display:none;background:rgba(255,69,96,.08);border:1px solid rgba(255,69,96,.3);border-radius:6px;padding:8px 10px;font-size:11px;color:#ff4560;line-height:1.5;margin-bottom:10px"></div>
+
+      <!-- Spot how it works -->
+      <div style="background:var(--bg);border-radius:6px;padding:10px;font-size:11px;color:var(--dim);line-height:1.7">
+        <div style="font-weight:600;color:var(--text);margin-bottom:4px">How Spot Works</div>
+        Market BUY → OCO (TP1 + SL stop-limit) for 40%<br>
+        LIMIT sell for TP2 (35%) + TP3 (25%)<br>
+        SELL signals skipped automatically
+      </div>
+    </div>
+
+    <!-- ── FUTURES PANEL ── -->
+    <div id="at-fut-panel" style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <div>
+          <div style="font-size:15px;font-weight:700;color:var(--gold)">Futures Trading</div>
+          <div style="font-size:11px;color:var(--dim);margin-top:2px">LONG + SHORT · 2-3x leverage · MARK_PRICE stops</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="fut-badge" style="font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;background:rgba(136,136,136,.12);color:#888;border:1px solid rgba(136,136,136,.3)">OFF</span>
+          <label class="at-toggle">
+            <input type="checkbox" id="fut-switch" onchange="atToggleFutures(this.checked)">
+            <span class="at-slider"></span>
+          </label>
+        </div>
+      </div>
+
+      <!-- Futures stats -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Balance</div>
+          <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="fut-balance">—</div>
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Trades Today</div>
+          <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="fut-trades">—</div>
+          <div style="font-size:10px;color:var(--dim)" id="fut-total">total: 0</div>
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Open Orders</div>
+          <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="fut-orders">—</div>
+        </div>
+        <div style="background:var(--bg);border-radius:6px;padding:10px">
+          <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Status</div>
+          <div style="font-size:11px;font-weight:600;margin-top:4px;color:var(--gold)" id="fut-status">—</div>
+        </div>
+      </div>
+
+      <!-- Futures settings -->
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Risk per trade: <span id="fut-risk-lbl" style="color:var(--gold);font-weight:600">2%</span></label>
+        <input type="range" id="fut-risk" min="0.5" max="5" step="0.5" value="2" style="width:100%" oninput="document.getElementById('fut-risk-lbl').textContent=this.value+'%'" onchange="atSaveSettings()">
+      </div>
+      <div style="margin-bottom:14px">
+        <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Max trades/day</label>
+        <input type="number" id="fut-max" min="1" max="20" value="5" style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px" onchange="atSaveSettings()">
+      </div>
+
+      <!-- Block reason -->
+      <div id="fut-block" style="display:none;background:rgba(255,69,96,.08);border:1px solid rgba(255,69,96,.3);border-radius:6px;padding:8px 10px;font-size:11px;color:#ff4560;line-height:1.5;margin-bottom:10px"></div>
+
+      <!-- Futures how it works -->
+      <div style="background:var(--bg);border-radius:6px;padding:10px;font-size:11px;color:var(--dim);line-height:1.7">
+        <div style="font-weight:600;color:var(--text);margin-bottom:4px">How Futures Works</div>
+        Sets leverage (2x-3x) → Market LONG or SHORT<br>
+        TAKE_PROFIT_MARKET × 3 (TP1/TP2/TP3)<br>
+        STOP_MARKET closes full position at SL
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Open Futures Positions ── -->
+  <div id="fut-positions-card" style="display:none;background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px">
+    <div style="font-size:14px;font-weight:600;margin-bottom:12px">Open Futures Positions</div>
+    <div id="fut-positions-list"></div>
+  </div>
+
+  <!-- ── Setup ── -->
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px">
+    <div style="font-size:14px;font-weight:600;margin-bottom:10px">Setup</div>
+    <div style="font-size:12px;color:var(--dim);line-height:2">
+      1. Binance → Profile → API Management → Create API key<br>
+      2. Enable <b style="color:var(--text)">Spot Trading</b> for spot · Enable <b style="color:var(--text)">Futures Trading</b> for futures · Never enable withdrawals<br>
+      3. Add to <b style="color:var(--text)">.env</b>:
+      <code style="display:block;background:var(--bg);padding:10px;border-radius:6px;margin:6px 0;font-size:11px;line-height:1.9">BINANCE_API_KEY=your_key
+BINANCE_API_SECRET=your_secret
+BINANCE_TESTNET=true    # change to false when ready for live</code>
+      4. Default: <span style="color:var(--gold)">Testnet mode</span> — safe to test. Set BINANCE_TESTNET=false to go live.
+    </div>
+  </div>
+
+  <!-- ── Emergency stop ── -->
+  <div style="text-align:center;padding-bottom:24px">
+    <button id="at-stop-btn" onclick="atEmergencyStop()" style="display:none;padding:12px 36px;font-size:13px;font-weight:700;border-radius:8px;background:rgba(220,50,50,.1);color:#e05555;border:1px solid rgba(220,50,50,.3);cursor:pointer">
+      🛑 Emergency Stop — Cancel All Open Orders
+    </button>
+  </div>
+
+</div>
 </main></div>
 <!-- END AUTO TRADE PAGE -->
 

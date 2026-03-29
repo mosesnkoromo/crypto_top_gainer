@@ -519,7 +519,32 @@ class Scanner:
             log.info("No signals this cycle")
 
         # Auto-trade runs every cycle — retries today pending signals too
-        self._run_auto_trade(collected, now)
+        self._run_auto_trade(collected, spot_signals, now)
+
+        # ── Protect unprotected futures positions (every cycle) ───
+        try:
+            from dashboard.models import AutoTradeState, SignalRecord
+            _state = AutoTradeState.get()
+            if _state.futures_enabled:
+                from datetime import timedelta
+                week_ago = now - timedelta(days=7)
+                _sig_lookup = {}
+                for _rec in SignalRecord.objects.filter(
+                    created_at__gte=week_ago, outcome="PENDING"
+                ).order_by("-created_at"):
+                    if _rec.symbol not in _sig_lookup:
+                        class _S: pass
+                        _s = _S()
+                        _s.tp1=_rec.tp1; _s.tp2=_rec.tp2
+                        _s.tp3=_rec.tp3; _s.sl=_rec.sl
+                        _sig_lookup[_rec.symbol] = _s
+                _fut_t = self._get_trader_for_mode(_state, "futures")
+                if _fut_t:
+                    _protected = _fut_t.protect_open_positions(_sig_lookup)
+                    if _protected:
+                        log.info("Protected %d positions: %s", len(_protected), _protected)
+        except Exception as _pe:
+            log.warning("protect_positions error: %s", _pe)
 
         log.info("Cycle complete")
         self._daily_scan_count += 1
@@ -539,111 +564,225 @@ class Scanner:
 
     # ── Helpers ───────────────────────────────────────────────
 
-    def _run_auto_trade(self, new_signals: list, now):
+    def _get_trader_for_mode(self, state, mode: str):
+        try:
+            api_key    = self._cfg.auto.api_key
+            api_secret = self._cfg.auto.api_secret
+            if not api_key or not api_secret:
+                log.warning('Auto-trade: no API keys in .env')
+                return None
+            from src.trading.binance_trader import BinanceTrader
+            risk  = state.spot_risk        if mode == 'spot' else state.futures_risk
+            max_t = state.spot_max_trades   if mode == 'spot' else state.futures_max_trades
+            return BinanceTrader(
+                api_key    = api_key,
+                api_secret = api_secret,
+                mode       = mode,
+                live       = not self._cfg.auto.testnet,
+                risk_pct   = risk,
+                daily_loss_limit_pct = self._cfg.auto.daily_loss_limit_pct,
+                max_trades_per_day   = max_t,
+            )
+        except Exception as e:
+            log.error('Trader init error (%s): %s', mode, e)
+            return None
+
+    def _get_trader(self, state):
+        mode = getattr(state, 'mode', 'spot')
+        return self._get_trader_for_mode(state, mode)
+
+    def _run_auto_trade(self, new_signals: list, spot_signals: list, now):
+
         """
-        Execute auto-trades for:
-          1. New signals from this cycle
-          2. Today PENDING DB signals not yet auto-traded (retry)
-        Runs every scan cycle regardless of whether new signals fired.
+        Independent auto-trade for Spot and Futures.
+        - spot_enabled: BUY signals only → Market BUY + OCO + TP2/TP3
+        - futures_enabled: BUY (long) + SELL (short) → Futures with leverage
+        - Checks both new signals this cycle AND today's untraded PENDING DB signals
+        - SpotSignal records (notes starts with SPOT) also checked for spot
         """
         try:
             from dashboard.models import AutoTradeState, SignalRecord
             state = AutoTradeState.get()
-            if not state.enabled:
+
+            spot_on    = state.spot_enabled
+            fut_on     = state.futures_enabled
+            if not spot_on and not fut_on:
                 return
-            trader = self._get_trader(state)
-            if not trader:
-                log.debug("Auto-trade ON but trader not ready")
-                return
 
-            balance = trader.get_balance()
-            log.info("Auto-trade [%s] balance=$%.2f new=%d",
-                     state.mode.upper(), balance, len(new_signals))
+            # Build traders
+            spot_trader = self._get_trader_for_mode(state, "spot")    if spot_on    else None
+            fut_trader  = self._get_trader_for_mode(state, "futures") if fut_on     else None
 
-            # Build candidates: new signals + pending DB not yet traded
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-            pending_recs = list(
-                SignalRecord.objects.filter(
-                    created_at__gte=today_start,
-                    outcome="PENDING",
-                ).exclude(notes__icontains="AUTO:")
-            )
-
-            seen = set()
-
-            # --- new signals first ---
-            for sig in new_signals:
-                grade_key = sig.grade.split()[0]
-                if grade_key not in ("ULTRA", "STRONG"):
-                    continue
-                if state.trades_today >= state.max_trades_day:
-                    break
-                if sig.signal == "SELL" and state.mode == "spot":
-                    continue
-                if sig.symbol in seen:
-                    continue
-                seen.add(sig.symbol)
-                result = trader.execute_signal(sig, balance)
-                self._save_trade_result(sig, result)
-                if result.success:
-                    balance -= result.qty * result.entry_price
-                    state.trades_today += 1
-                    state.total_auto_trades += 1
-                    state.save(update_fields=["trades_today", "total_auto_trades"])
-                    log.info("AUTO TRADE OK: %s %s @ %.6g | oco=%s sl=%s",
-                             result.side, sig.symbol, result.entry_price,
-                             result.oco_id, result.sl_order_id)
-                else:
-                    log.warning("AUTO TRADE FAIL: %s %s — %s",
-                                sig.signal, sig.symbol, result.error)
-
-            # --- pending DB retries ---
-            for rec in pending_recs:
-                if rec.symbol in seen:
-                    continue
-                grade_key = rec.grade.split()[0]
-                if grade_key not in ("ULTRA", "STRONG"):
-                    continue
-                if state.trades_today >= state.max_trades_day:
-                    break
-                if rec.signal == "SELL" and state.mode == "spot":
-                    continue
-                seen.add(rec.symbol)
-
-                # Build minimal signal-like object from DB record
-                class _S:
-                    pass
-                sig = _S()
-                sig.symbol    = rec.symbol
-                sig.signal    = rec.signal
-                sig.grade     = rec.grade
-                sig.price     = rec.entry_price
-                sig.tp1       = rec.tp1
-                sig.tp2       = rec.tp2
-                sig.tp3       = rec.tp3
-                sig.sl        = rec.sl
-                sig.btc_score = rec.btc_score
-                sig.confidence= rec.confidence
-
-                result = trader.execute_signal(sig, balance)
-                # Save result to DB record notes
+            # Connectivity pre-check — log clearly if API is unreachable
+            def _check_api(url):
                 try:
-                    mark = "YES" if result.success else ("FAIL:" + result.error[:40])
-                    rec.notes = (rec.notes or "") + f" | AUTO:{mark}"
-                    rec.save(update_fields=["notes"])
+                    import requests as _rq
+                    r = _rq.get(url, timeout=4)
+                    return r.status_code == 200
+                except Exception:
+                    return False
+
+            spot_api_ok = _check_api("https://api.binance.com/api/v3/ping")
+            fut_api_ok  = _check_api("https://fapi.binance.com/fapi/v1/ping")
+
+            if spot_on and not spot_api_ok:
+                log.warning("AUTO-TRADE BLOCKED: Binance Spot API (api.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
+                spot_on = False  # disable for this cycle
+                spot_trader = None
+
+            if fut_on and not fut_api_ok:
+                log.warning("AUTO-TRADE BLOCKED: Binance Futures API (fapi.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
+                fut_on = False  # disable for this cycle
+                fut_trader = None
+
+            if not spot_on and not fut_on:
+                log.warning("Both APIs unreachable — skipping auto-trade this cycle")
+                return
+
+            spot_bal = spot_trader.get_available_balance()  if spot_trader else 0.0
+            fut_bal  = fut_trader.get_available_balance()   if fut_trader  else 0.0
+            log.info("Auto-trade | Spot=%s $%.2f (api=%s) | Futures=%s $%.2f (api=%s) | new=%d",
+                     "ON" if spot_on else "OFF", spot_bal, "✅" if spot_api_ok else "❌",
+                     "ON" if fut_on  else "OFF", fut_bal,  "✅" if fut_api_ok  else "❌",
+                     len(new_signals))
+
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            # --- Build candidates list ---
+            # Futures: ALL signals from signal_engine (BUY long + SELL short)
+            fut_candidates_new = list(new_signals)
+            # Spot: ONLY spot_signals from SpotSignalEngine (weekly oversold BUY only)
+            # Do NOT send futures signals to spot trader — they have different TP/SL logic
+            spot_candidates_new = list(spot_signals) if spot_signals else []
+
+            # Pending DB futures signals not yet auto-traded
+            pending_fut = list(SignalRecord.objects.filter(
+                created_at__gte=today_start, outcome="PENDING"
+            ).exclude(notes__icontains="AUTO_FUT:YES"))
+
+            # Pending DB spot signals — only those explicitly marked as SPOT
+            pending_spot = list(SignalRecord.objects.filter(
+                created_at__gte=today_start, outcome="PENDING",
+                signal="BUY", notes__icontains="SPOT"
+            ).exclude(notes__icontains="AUTO_SPOT:YES"))
+
+            def _sig_from_rec(rec):
+                class _S: pass
+                s = _S()
+                s.symbol=rec.symbol; s.signal=rec.signal; s.grade=rec.grade
+                # Use ORIGINAL entry_price — TP/SL levels are relative to it
+                s.price = rec.entry_price
+                s.tp1=rec.tp1; s.tp2=rec.tp2
+                s.tp3=rec.tp3; s.sl=rec.sl
+                s.btc_score=rec.btc_score; s.confidence=rec.confidence
+                # Staleness check: skip if current price blew past SL
+                try:
+                    import requests as _rq
+                    r = _rq.get("https://api.binance.com/api/v3/ticker/price",
+                                params={"symbol": rec.symbol}, timeout=4)
+                    if r.ok:
+                        cur = float(r.json().get("price", rec.entry_price))
+                        if rec.signal == "BUY"  and cur <= rec.sl:
+                            log.info("Skip %s BUY — current $%.5g already below SL $%.5g", rec.symbol, cur, rec.sl)
+                            return None
+                        if rec.signal == "SELL" and cur >= rec.sl:
+                            log.info("Skip %s SELL — current $%.5g already above SL $%.5g", rec.symbol, cur, rec.sl)
+                            return None
                 except Exception:
                     pass
+                return s
 
-                if result.success:
-                    balance -= result.qty * result.entry_price
-                    state.trades_today += 1
-                    state.total_auto_trades += 1
-                    state.save(update_fields=["trades_today", "total_auto_trades"])
-                    log.info("AUTO TRADE (retry) OK: %s %s @ %.6g",
-                             result.side, rec.symbol, result.entry_price)
-                else:
-                    log.warning("AUTO TRADE (retry) FAIL: %s %s — %s",
-                                rec.signal, rec.symbol, result.error)
+            # --- Execute SPOT trades ---
+            if spot_on and spot_trader:
+                seen_spot = set()
+                all_spot  = list(spot_candidates_new) + [_sig_from_rec(r) for r in pending_spot]
+                log.info("Spot candidates: %d (new=%d pending=%d)", len(all_spot), len(spot_candidates_new), len(pending_spot))
+                for sig in all_spot:
+                    if sig is None: continue
+                    grade_key = sig.grade.split()[0]
+                    if grade_key not in ("ULTRA","STRONG","STANDARD"):
+                        log.debug("Spot skip %s: grade=%s", sig.symbol, grade_key)
+                        continue
+                    if state.spot_trades_today >= state.spot_max_trades:
+                        log.warning("Spot daily limit %d reached", state.spot_max_trades)
+                        break
+                    if sig.signal != "BUY":
+                        log.debug("Spot skip %s: signal=%s (not BUY)", sig.symbol, sig.signal)
+                        continue
+                    if sig.symbol in seen_spot:
+                        continue
+                    seen_spot.add(sig.symbol)
+
+                    result = spot_trader.execute_signal(sig, spot_bal)
+                    # Mark DB record
+                    rec_qs = SignalRecord.objects.filter(
+                        symbol=sig.symbol, created_at__gte=today_start, outcome="PENDING"
+                    ).first()
+                    if rec_qs:
+                        mark = f"AUTO_SPOT:{'YES' if result.success else 'FAIL'}"
+                        if result.success:
+                            mark += f" oco={result.oco_id} sl={result.sl_order_id}"
+                        else:
+                            mark += f" {result.error[:40]}"
+                        rec_qs.notes = (rec_qs.notes or "") + " | " + mark
+                        rec_qs.save(update_fields=["notes"])
+
+                    if result.success:
+                        spot_bal -= result.qty * result.entry_price
+                        state.spot_trades_today += 1
+                        state.spot_total += 1
+                        state.save(update_fields=["spot_trades_today","spot_total"])
+                        log.info("SPOT TRADE ✅ %s %s @ %.6g | oco=%s sl=%s tp1=%s tp2=%s tp3=%s",
+                                 result.side, sig.symbol, result.entry_price,
+                                 result.oco_id, result.sl_order_id,
+                                 sig.tp1, sig.tp2, sig.tp3)
+                    else:
+                        log.warning("SPOT TRADE ❌ %s %s — %s",
+                                    sig.signal, sig.symbol, result.error)
+
+            # --- Execute FUTURES trades ---
+            if fut_on and fut_trader:
+                seen_fut = set()
+                all_fut  = list(fut_candidates_new) + [_sig_from_rec(r) for r in pending_fut]
+                log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new), len(pending_fut), fut_bal)
+                for sig in all_fut:
+                    if sig is None: continue
+                    grade_key = sig.grade.split()[0]
+                    if grade_key not in ("ULTRA","STRONG","STANDARD"):
+                        log.debug("Futures skip %s: grade=%s", sig.symbol, grade_key)
+                        continue
+                    if state.futures_trades_today >= state.futures_max_trades:
+                        log.warning("Futures daily limit %d reached", state.futures_max_trades)
+                        break
+                    if sig.symbol in seen_fut:
+                        continue
+                    seen_fut.add(sig.symbol)
+
+                    result = fut_trader.execute_signal(sig, fut_bal)
+                    # Mark DB record
+                    rec_qs = SignalRecord.objects.filter(
+                        symbol=sig.symbol, created_at__gte=today_start, outcome="PENDING"
+                    ).first()
+                    if rec_qs:
+                        mark = f"AUTO_FUT:{'YES' if result.success else 'FAIL'}"
+                        if result.success:
+                            mark += f" sl={result.sl_order_id} tp1={result.tp1_order_id}"
+                        else:
+                            mark += f" {result.error[:40]}"
+                        rec_qs.notes = (rec_qs.notes or "") + " | " + mark
+                        rec_qs.save(update_fields=["notes"])
+
+                    if result.success:
+                        fut_bal -= result.qty * result.entry_price
+                        state.futures_trades_today += 1
+                        state.futures_total += 1
+                        state.save(update_fields=["futures_trades_today","futures_total"])
+                        log.info("FUTURES TRADE ✅ %s %s @ %.6g | sl=%s tp1=%s tp2=%s tp3=%s",
+                                 result.side, sig.symbol, result.entry_price,
+                                 result.sl_order_id, sig.tp1, sig.tp2, sig.tp3)
+                    else:
+                        log.warning("FUTURES TRADE ❌ %s %s — %s",
+                                    sig.signal, sig.symbol, result.error)
 
         except Exception as e:
             log.error("Auto-trade error: %s", e, exc_info=True)

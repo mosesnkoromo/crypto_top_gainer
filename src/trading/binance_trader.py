@@ -160,6 +160,11 @@ class BinanceTrader:
             errors.append(str(e))
         return {"cancelled": cancelled, "errors": errors}
 
+    def get_available_balance(self) -> float:
+        """Returns available USDT as a plain float — use this for trading decisions."""
+        info = self.get_balance()
+        return float(info.get("available_balance", 0) or 0)
+
     def get_balance(self) -> dict:
         """
         Returns dict with wallet_balance, available_balance, unrealised_pnl.
@@ -295,87 +300,156 @@ class BinanceTrader:
                            tp1_order_id=tp1_id, tp2_order_id=tp2_id,
                            tp3_order_id=tp3_id, sl_order_id=sl_id)
 
-    # ── Futures ─────────────────────────────────────────────────
+    # ── Futures (ONE-WAY MODE) ──────────────────────────────────
+    # Always uses one-way mode (no positionSide parameter).
+    # BUY = open long, SELL = open short.
+    # If same symbol has open position in opposite direction,
+    # the new order will reduce/close it first (Binance default).
 
     def _futures(self, sym, signal, qty, info, risk_usdt, pos_usdt) -> TradeResult:
         is_long    = signal.signal == "BUY"
         side       = "BUY"  if is_long else "SELL"
-        ps_side    = "LONG" if is_long else "SHORT"
         close_side = "SELL" if is_long else "BUY"
 
-        # Validate levels
+        # Validate signal levels
         if is_long and signal.tp1 <= signal.price:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="futures",
-                               error=f"TP1 ({signal.tp1}) must be above entry for LONG")
+                               error=f"TP1 {signal.tp1:.6g} must be above entry {signal.price:.6g}")
         if not is_long and signal.tp1 >= signal.price:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="futures",
-                               error=f"TP1 ({signal.tp1}) must be below entry for SHORT")
+                               error=f"TP1 {signal.tp1:.6g} must be below entry {signal.price:.6g}")
 
-        # Leverage
+        # Set leverage (conservative: 2x bear, 3x bull)
         lev = 3 if getattr(signal, "btc_score", 50) >= 62 else 2
         self._req("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": lev})
 
-        # Hedge mode — detect current mode first, only switch if needed
-        # Cannot switch while position is open (Binance error -4059)
-        try:
-            mode_info = self._pub("GET", "/fapi/v1/positionSide/dual", {}) or {}
-            already_hedge = mode_info.get("dualSidePosition", False)
-            if not already_hedge:
-                switch_result = self._req("POST", "/fapi/v1/positionSide/dual",
-                                          {"dualSidePosition": "true"})
-                if switch_result is None:
-                    log.warning("Could not switch to hedge mode — likely have open positions. "
-                                "Trading in one-way mode. Close all positions first to enable hedge.")
-        except Exception as e:
-            log.debug("Hedge mode check: %s", e)
+        # NEVER attempt to switch position mode — use account's current mode as-is
+        # One-way mode: no positionSide field in any order
 
-        # Market entry
+        # Market entry — ONE-WAY MODE (no positionSide)
         entry = self._req("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": side,
-            "positionSide": ps_side, "type": "MARKET", "quantity": qty,
+            "symbol":   sym,
+            "side":     side,
+            "type":     "MARKET",
+            "quantity": qty,
         })
         if not entry or "orderId" not in entry:
             raise Exception(f"Futures {side} rejected: {entry}")
         entry_id   = str(entry["orderId"])
         fill_price = float(entry.get("avgPrice", signal.price)) or signal.price
         log.info("Futures %s %s: qty=%s @ %.6g lev=%dx id=%s",
-                 ps_side, sym, qty, fill_price, lev, entry_id)
+                 "LONG" if is_long else "SHORT", sym, qty, fill_price, lev, entry_id)
 
+        # Position split:
+        #   TP1 → 40% at TP1 level (quick profit lock)
+        #   TP2 → 35% at TP2 level (main target)
+        #   SL  → closePosition=true (closes ALL remaining when hit)
+        #   TSL → 25% trailing stop, activates at TP1 (protects runner)
+        # Total explicit qty = 75% (TP1+TP2). SL closes whatever is left.
+        # This avoids -2010 "would reduce too much" error.
         q_tp1 = self._fmt_qty(qty * 0.40, info)
         q_tp2 = self._fmt_qty(qty * 0.35, info)
-        q_tp3 = self._fmt_qty(qty * 0.25, info)
+        q_tsl = self._fmt_qty(qty * 0.25, info)
         tp1_p = self._fp(signal.tp1, info)
         tp2_p = self._fp(signal.tp2, info)
         tp3_p = self._fp(signal.tp3, info)
         sl_p  = self._fp(signal.sl,  info)
 
-        def _tp(stop_p, q) -> str:
+        def _place_tp(label, stop_p, q) -> str:
             if q < info.min_qty:
                 return ""
-            r = self._req("POST", "/fapi/v1/order", {
-                "symbol": sym, "side": close_side, "positionSide": ps_side,
-                "type": "TAKE_PROFIT_MARKET",
-                "stopPrice": stop_p, "quantity": q,
-                "timeInForce": "GTC", "workingType": "MARK_PRICE",
-                "priceProtect": "TRUE", "reduceOnly": "true",
+            if stop_p <= 0:
+                log.error("TP %s skipped — price is 0", label)
+                return ""
+            # Attempt order types in order: algo → limit
+            attempts = [
+                ("TAKE_PROFIT_MARKET", {
+                    "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+                    "stopPrice": stop_p, "quantity": q, "timeInForce": "GTC",
+                    "workingType": "MARK_PRICE", "priceProtect": "true", "reduceOnly": "true",
+                }),
+                ("LIMIT", {
+                    "symbol": sym, "side": close_side, "type": "LIMIT",
+                    "price": stop_p, "quantity": q,
+                    "timeInForce": "GTC", "reduceOnly": "true",
+                }),
+            ]
+            for name, params in attempts:
+                r = self._req("POST", "/fapi/v1/order", params)
+                if isinstance(r, dict) and "orderId" in r:
+                    log.info("Futures %s (%s) @ %.6g qty=%s id=%s ✅", label, name, stop_p, q, r["orderId"])
+                    return str(r["orderId"])
+                code = r.get("code", 0) if isinstance(r, dict) else 0
+                if code in (-4120, -1104) and name != "LIMIT":
+                    log.warning("Futures %s: %s rejected (code %d) — trying LIMIT", label, name, code)
+                    continue
+                log.error("Futures %s FAILED (%s) @ %.6g: code=%d", label, name, stop_p, code)
+                return ""
+            return ""
+
+        tp1_id = _place_tp("TP1", tp1_p, q_tp1)
+        tp2_id = _place_tp("TP2", tp2_p, q_tp2)
+
+        # ── Hard Stop-Loss: closePosition=true, NO quantity, NO reduceOnly ──
+        # closePosition closes 100% of remaining position (no qty needed, avoids conflicts)
+        sl_id = ""
+        if sl_p <= 0:
+            log.error("Futures SL skipped — price rounds to 0 (tickSize issue for %s)", sym)
+        else:
+            # Try STOP_MARKET first, fall back to STOP (limit) if rejected
+            sl_limit_p = self._fp(sl_p * 1.005 if not is_long else sl_p * 0.995, info)
+            for sl_type, sl_params in [
+                ("STOP_MARKET", {
+                    "symbol": sym, "side": close_side, "type": "STOP_MARKET",
+                    "stopPrice": sl_p, "closePosition": "true",
+                    "workingType": "MARK_PRICE", "priceProtect": "true",
+                }),
+                ("STOP", {
+                    "symbol": sym, "side": close_side, "type": "STOP",
+                    "stopPrice": sl_p, "price": sl_limit_p,
+                    "quantity": self._fmt_qty(qty, info),
+                    "timeInForce": "GTC", "reduceOnly": "true",
+                }),
+            ]:
+                sl_r = self._req("POST", "/fapi/v1/order", sl_params)
+                if isinstance(sl_r, dict) and "orderId" in sl_r:
+                    sl_id = str(sl_r["orderId"])
+                    log.info("Futures SL (%s) @ %.6g id=%s ✅", sl_type, sl_p, sl_id)
+                    break
+                code = sl_r.get("code", 0) if isinstance(sl_r, dict) else 0
+                if code in (-4120, -1104) and sl_type != "STOP":
+                    log.warning("Futures SL: %s rejected (code %d) — trying STOP", sl_type, code)
+                    continue
+                log.error("Futures SL FAILED (%s) @ %.6g: code=%d  ⚠️ NO STOP LOSS!", sl_type, sl_p, code)
+                break
+
+        # ── Trailing Stop-Loss: 25% of position, activates at TP1 ──
+        # Protects the runner portion. No qty conflict since SL uses closePosition.
+        trailing_id = ""
+        if q_tsl >= info.min_qty:
+            trail_r = self._req("POST", "/fapi/v1/order", {
+                "symbol":          sym,
+                "side":            close_side,
+                "type":            "TRAILING_STOP_MARKET",
+                "quantity":        q_tsl,
+                "callbackRate":    1.5,
+                "activationPrice": tp1_p,
+                "workingType":     "MARK_PRICE",
+                "reduceOnly":      "true",
             })
-            oid = str((r or {}).get("orderId", ""))
-            log.info("Futures TP @ %s qty=%s id=%s", stop_p, q, oid)
-            return oid
+            if isinstance(trail_r, dict) and "orderId" in trail_r:
+                trailing_id = str(trail_r["orderId"])
+                log.info("Futures TSL activation=%.6g callback=1.5%% id=%s ✅", tp1_p, trailing_id)
+            else:
+                log.warning("Futures TSL failed (non-critical): %s", trail_r)
 
-        tp1_id = _tp(tp1_p, q_tp1)
-        tp2_id = _tp(tp2_p, q_tp2)
-        tp3_id = _tp(tp3_p, q_tp3)
+        tp3_id = ""  # TP3 not placed separately — TSL covers runner portion
 
-        # Stop-market (closes full remaining position)
-        sl_r  = self._req("POST", "/fapi/v1/order", {
-            "symbol": sym, "side": close_side, "positionSide": ps_side,
-            "type": "STOP_MARKET",
-            "stopPrice": sl_p, "closePosition": "true",
-            "workingType": "MARK_PRICE", "priceProtect": "TRUE",
-        })
-        sl_id = str((sl_r or {}).get("orderId", ""))
-        log.info("Futures SL @ %s id=%s", sl_p, sl_id)
+        log.info(
+            "Futures orders placed: entry=%s tp1=%s tp2=%s sl=%s tsl=%s",
+            entry_id, tp1_id or "FAIL", tp2_id or "FAIL",
+            sl_id or "FAIL⚠️", trailing_id or "skip"
+        )
 
         return TradeResult(True, sym, side, qty, fill_price, mode="futures",
                            leverage=lev,
@@ -451,7 +525,11 @@ class BinanceTrader:
         if resp.status_code not in (200, 201):
             log.error("Binance %s %s → %d: %s", method, path,
                       resp.status_code, resp.text[:400])
-            return None
+            # Return the error body so callers can inspect error code
+            try:
+                return resp.json()   # {"code": -4120, "msg": "..."}
+            except Exception:
+                return {"code": resp.status_code, "msg": resp.text[:200]}
         return resp.json()
 
     def _pub(self, method: str, path: str, params: dict) -> dict | None:
@@ -459,7 +537,177 @@ class BinanceTrader:
         return resp.json() if resp.ok else None
 
     def _fp(self, price: float, info: SymbolInfo) -> float:
-        return round(price, info.price_precision)
+        if price <= 0:
+            return 0.0
+        # Use symbol precision, but auto-extend if it rounds to 0
+        p = info.price_precision
+        result = round(price, p)
+        if result == 0 and price > 0:
+            # tickSize is too coarse — calculate needed precision from actual price
+            import math
+            p = max(p, -int(math.floor(math.log10(abs(price)))) + 4)
+            result = round(price, p)
+        return result
 
     def _fmt_qty(self, qty: float, info: SymbolInfo) -> float:
         return round(qty, info.qty_precision)
+
+
+    # ══════════════════════════════════════════════════════════
+    # PROTECT UNPROTECTED POSITIONS
+    # Call this every cycle to set TP/SL on positions that have none
+    # ══════════════════════════════════════════════════════════
+
+    def protect_open_positions(self, signal_lookup: dict) -> list:
+        """
+        Scan all open futures positions. For any that have no open orders
+        (no TP/SL), place TP1 + TP2 + SL + TSL immediately.
+
+        signal_lookup: dict mapping symbol → signal-like object with
+                       tp1, tp2, tp3, sl fields. Can come from DB records.
+        Returns list of symbols that were protected.
+        """
+        if self._mode != "futures":
+            return []
+
+        protected = []
+        try:
+            positions = self.get_positions()
+            open_orders = self.get_open_orders() or []
+            syms_with_orders = set(o.get("symbol","") for o in open_orders)
+
+            log.info("protect_open_positions: %d positions, %d open orders, syms_with_orders=%s",
+                     len(positions), len(open_orders), sorted(syms_with_orders))
+
+            for pos in positions:
+                sym = pos.get("symbol","")
+                amt = float(pos.get("positionAmt", 0))
+                if amt == 0:
+                    continue
+
+                # Count orders for THIS symbol specifically
+                sym_order_count = sum(1 for o in open_orders if o.get("symbol") == sym)
+                log.info("  Position %s: amt=%.4f orders_for_sym=%d", sym, amt, sym_order_count)
+
+                # Already has orders — skip
+                if sym in syms_with_orders:
+                    log.info("  %s already has %d orders — skipping", sym, sym_order_count)
+                    continue
+
+                # No orders — needs protection
+                is_long    = amt > 0
+                close_side = "SELL" if is_long else "BUY"
+                qty        = abs(amt)
+                entry      = float(pos.get("entryPrice", 0))
+
+                info = self._get_symbol_info(sym)
+                sig  = signal_lookup.get(sym)
+
+                if sig and sig.tp1 > 0 and sig.sl > 0:
+                    # Use stored signal levels
+                    tp1_p = self._fp(sig.tp1, info)
+                    tp2_p = self._fp(sig.tp2, info)
+                    sl_p  = self._fp(sig.sl,  info)
+                    log.info("Using stored signal levels for %s: TP1=%.6g TP2=%.6g SL=%.6g",
+                             sym, tp1_p, tp2_p, sl_p)
+                else:
+                    # No signal data — derive from entry price with default percentages
+                    # Long: TP above entry, SL below.  Short: TP below entry, SL above.
+                    tp1_pct = 0.03   # 3%
+                    tp2_pct = 0.06   # 6%
+                    sl_pct  = 0.04   # 4%
+                    if is_long:
+                        tp1_p = self._fp(entry * (1 + tp1_pct), info)
+                        tp2_p = self._fp(entry * (1 + tp2_pct), info)
+                        sl_p  = self._fp(entry * (1 - sl_pct),  info)
+                    else:
+                        tp1_p = self._fp(entry * (1 - tp1_pct), info)
+                        tp2_p = self._fp(entry * (1 - tp2_pct), info)
+                        sl_p  = self._fp(entry * (1 + sl_pct),  info)
+                    log.warning("No signal data for %s — using default TP/SL from entry %.6g: "
+                                "TP1=%.6g TP2=%.6g SL=%.6g", sym, entry, tp1_p, tp2_p, sl_p)
+
+                if tp1_p <= 0 or sl_p <= 0:
+                    log.error("Skipping %s — could not calculate valid TP/SL prices", sym)
+                    continue
+
+                q_tp1 = self._fmt_qty(qty * 0.40, info)
+                q_tp2 = self._fmt_qty(qty * 0.35, info)
+                q_tsl = self._fmt_qty(qty * 0.25, info)
+
+                log.info("Protecting unprotected position: %s %s qty=%.4f entry=%.6g → TP1=%.6g TP2=%.6g SL=%.6g",
+                         "LONG" if is_long else "SHORT", sym, qty, entry, tp1_p, tp2_p, sl_p)
+
+                def _prot_tp(label, stop_p, qty_p):
+                    if stop_p <= 0 or qty_p < info.min_qty:
+                        return
+                    for name, params in [
+                        ("TAKE_PROFIT_MARKET", {
+                            "symbol": sym, "side": close_side,
+                            "type": "TAKE_PROFIT_MARKET",
+                            "stopPrice": stop_p, "quantity": qty_p,
+                            "timeInForce": "GTC", "workingType": "MARK_PRICE",
+                            "priceProtect": "true", "reduceOnly": "true",
+                        }),
+                        ("LIMIT", {
+                            "symbol": sym, "side": close_side, "type": "LIMIT",
+                            "price": stop_p, "quantity": qty_p,
+                            "timeInForce": "GTC", "reduceOnly": "true",
+                        }),
+                    ]:
+                        r = self._req("POST", "/fapi/v1/order", params)
+                        if isinstance(r, dict) and "orderId" in r:
+                            log.info("  %s (%s) @ %.6g id=%s ✅", label, name, stop_p, r["orderId"])
+                            return
+                        code = r.get("code", 0) if isinstance(r, dict) else 0
+                        if code in (-4120, -1104) and name != "LIMIT":
+                            log.warning("  %s: %s rejected (code %d) — trying LIMIT", label, name, code)
+                            continue
+                        log.error("  %s FAILED (%s): code=%d", label, name, code)
+                        return
+
+                _prot_tp("TP1", tp1_p, q_tp1)
+                _prot_tp("TP2", tp2_p, q_tp2)
+
+                # SL with closePosition
+                if sl_p > 0:
+                    for sl_t, sl_p2 in [
+                        ("STOP_MARKET", {"stopPrice": sl_p, "closePosition": "true",
+                                         "workingType": "MARK_PRICE", "priceProtect": "true"}),
+                        ("STOP", {"stopPrice": sl_p,
+                                  "price": self._fp(sl_p * (1.005 if not is_long else 0.995), info),
+                                  "quantity": self._fmt_qty(qty, info),
+                                  "timeInForce": "GTC", "reduceOnly": "true"}),
+                    ]:
+                        sl_r = self._req("POST", "/fapi/v1/order", {
+                            "symbol": sym, "side": close_side, "type": sl_t, **sl_p2})
+                        if isinstance(sl_r, dict) and "orderId" in sl_r:
+                            log.info("  SL (%s) @ %.6g id=%s ✅", sl_t, sl_p, sl_r["orderId"])
+                            break
+                        code = sl_r.get("code", 0) if isinstance(sl_r, dict) else 0
+                        if code in (-4120, -1104) and sl_t != "STOP":
+                            log.warning("  SL: %s rejected (code %d) — trying STOP", sl_t, code)
+                            continue
+                        log.error("  SL FAILED (%s): code=%d  ⚠️ STILL UNPROTECTED!", sl_t, code)
+                        break
+                else:
+                    log.error("  SL skipped — price rounds to 0 for %s", sym)
+
+                # Trailing SL (activates at TP1)
+                if q_tsl >= info.min_qty and tp1_p > 0:
+                    r = self._req("POST", "/fapi/v1/order", {
+                        "symbol": sym, "side": close_side,
+                        "type": "TRAILING_STOP_MARKET",
+                        "quantity": q_tsl, "callbackRate": 1.5,
+                        "activationPrice": tp1_p,
+                        "workingType": "MARK_PRICE", "reduceOnly": "true",
+                    })
+                    if isinstance(r, dict) and "orderId" in r:
+                        log.info("  TSL set activation=%.6g callback=1.5%% id=%s ✅", tp1_p, r["orderId"])
+
+                protected.append(sym)
+
+        except Exception as e:
+            log.error("protect_open_positions error: %s", e, exc_info=True)
+
+        return protected
