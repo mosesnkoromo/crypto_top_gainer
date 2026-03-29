@@ -16,6 +16,7 @@ urlpatterns = [
     path("api/signal/<int:signal_id>/outcome/",views.api_update_outcome,  name="api_outcome"),
     path("api/backtest/symbols/",              views.api_backtest_symbols,  name="api_bt_symbols"),
     path("api/backtest/run/",                  views.api_backtest_run,      name="api_bt_run"),    path("api/auto/status/", views.auto_trade_status, name="auto_status"),
+    path("api/auto/alerts/", views.auto_trade_alerts, name="auto_alerts"),
     path("api/auto/toggle/", views.auto_trade_toggle, name="auto_toggle"),
     path("api/auto/stop/", views.auto_trade_emergency_stop, name="auto_stop"),
     path("api/autotrade/",        views.auto_trade_status,        name="auto_status_compat"),

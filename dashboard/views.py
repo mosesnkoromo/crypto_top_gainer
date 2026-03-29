@@ -14,7 +14,7 @@ from django.http import JsonResponse
 from django.utils import timezone
 from django.db.models import Count, Avg, Sum, Q, F
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_POST ,require_http_methods
 
 from .models import SignalRecord, ScanRecord, CapitalRecord
 
@@ -443,6 +443,8 @@ def auto_trade_status(request):
                     live["spot_balance"]      = round(float(b.get("available_balance", 0) or 0), 2)
                     live["spot_wallet"]       = round(float(b.get("wallet_balance",   0) or 0), 2)
                     spot_orders = st.get_open_orders() or []
+                    # Ensure it's actually a list of dicts
+                    spot_orders = [o for o in spot_orders if isinstance(o, dict)]
                     live["spot_open_orders"] = len(spot_orders)
                     # Group orders by symbol to display as "positions"
                     spot_by_sym = {}
@@ -718,3 +720,19 @@ def auto_trade_emergency_stop(request):
     state.save(update_fields=["enabled"])
 
     return JsonResponse(result)
+
+_TRADE_ALERTS = []
+
+def push_trade_alert(level: str, message: str):
+    import time
+    _TRADE_ALERTS.append({"level": level, "msg": message, "ts": time.time()})
+    if len(_TRADE_ALERTS) > 30:
+        _TRADE_ALERTS.pop(0)
+
+@require_http_methods(["GET"])
+def auto_trade_alerts(request):
+    import time
+    now = time.time()
+    recent = [a for a in _TRADE_ALERTS if now - a["ts"] < 120]
+    _TRADE_ALERTS.clear()
+    return JsonResponse({"alerts": recent})

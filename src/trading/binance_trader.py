@@ -198,11 +198,71 @@ class BinanceTrader:
             result["error"] = str(e)
         return result
 
+    def _order(self, params: dict) -> dict:
+        """Smart order routing:
+        - TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET → /fapi/v1/algoOrder
+        - MARKET, LIMIT, STOP → /fapi/v1/order
+        """
+        if self._mode != "futures":
+            return self._req("POST", "/api/v3/order", params) or {}
+
+        otype = params.get("type", "")
+        algo_types = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TRAILING_STOP_MARKET",
+                      "TAKE_PROFIT", "STOP"}
+
+        if otype in algo_types:
+            # Build algo order params — different field names from standard order
+            algo = {
+                "algoType":   "CONDITIONAL",
+                "symbol":     params["symbol"],
+                "side":       params["side"],
+                "type":       otype,
+                "timeInForce": params.get("timeInForce", "GTC"),
+            }
+            # triggerPrice (algo) = stopPrice (standard)
+            stop_p = params.get("stopPrice") or params.get("triggerPrice")
+            if stop_p:
+                algo["triggerPrice"] = stop_p
+
+            # price for TAKE_PROFIT / STOP limit types
+            if params.get("price"):
+                algo["price"] = params["price"]
+
+            # quantity (not used with closePosition=true)
+            close_pos = str(params.get("closePosition", "false")).lower() == "true"
+            if close_pos:
+                algo["closePosition"] = "true"
+            elif params.get("quantity"):
+                algo["quantity"]   = params["quantity"]
+                algo["reduceOnly"] = params.get("reduceOnly", "true")
+
+            if params.get("workingType"):
+                algo["workingType"] = params["workingType"]
+            if params.get("priceProtect"):
+                algo["priceProtect"] = params["priceProtect"]
+            # Trailing stop fields
+            if params.get("callbackRate"):
+                algo["callbackRate"] = params["callbackRate"]
+            if params.get("activationPrice") or params.get("activatePrice"):
+                algo["activatePrice"] = params.get("activationPrice") or params.get("activatePrice")
+
+            r = self._req("POST", "/fapi/v1/algoOrder", algo) or {}
+            # algoOrder returns algoId, not orderId — normalise response
+            if isinstance(r, dict) and "algoId" in r and "orderId" not in r:
+                r["orderId"] = r["algoId"]
+            return r
+
+        # Standard order (MARKET, LIMIT, STOP)
+        return self._req("POST", "/fapi/v1/order", params) or {}
+
     def get_open_orders(self, symbol: str = None) -> list:
         try:
             path   = "/fapi/v1/openOrders" if self._mode == "futures" else "/api/v3/openOrders"
             params = {"symbol": symbol} if symbol else {}
-            return self._req("GET", path, params) or []
+            result = self._req("GET", path, params)
+            if isinstance(result, list):
+                return result
+            return []  # API error returned a dict — treat as empty
         except Exception as e:
             log.error("Open orders error: %s", e)
             return []
@@ -349,7 +409,8 @@ class BinanceTrader:
         # This avoids -2010 "would reduce too much" error.
         q_tp1 = self._fmt_qty(qty * 0.40, info)
         q_tp2 = self._fmt_qty(qty * 0.35, info)
-        q_tsl = self._fmt_qty(qty * 0.25, info)
+        q_tp3 = self._fmt_qty(qty * 0.15, info)
+        q_tsl = self._fmt_qty(qty * 0.10, info)
         tp1_p = self._fp(signal.tp1, info)
         tp2_p = self._fp(signal.tp2, info)
         tp3_p = self._fp(signal.tp3, info)
@@ -389,6 +450,7 @@ class BinanceTrader:
 
         tp1_id = _place_tp("TP1", tp1_p, q_tp1)
         tp2_id = _place_tp("TP2", tp2_p, q_tp2)
+        tp3_id = _place_tp("TP3", tp3_p, q_tp3)
 
         # ── Hard Stop-Loss: closePosition=true, NO quantity, NO reduceOnly ──
         # closePosition closes 100% of remaining position (no qty needed, avoids conflicts)
@@ -421,13 +483,17 @@ class BinanceTrader:
                     log.warning("Futures SL: %s rejected (code %d) — trying STOP", sl_type, code)
                     continue
                 log.error("Futures SL FAILED (%s) @ %.6g: code=%d  ⚠️ NO STOP LOSS!", sl_type, sl_p, code)
+                try:
+                    from dashboard.views import push_trade_alert
+                    push_trade_alert("error", f"⚠️ NO STOP LOSS on {sym} — SL order failed (code {code})")
+                except Exception: pass
                 break
 
         # ── Trailing Stop-Loss: 25% of position, activates at TP1 ──
         # Protects the runner portion. No qty conflict since SL uses closePosition.
         trailing_id = ""
         if q_tsl >= info.min_qty:
-            trail_r = self._req("POST", "/fapi/v1/order", {
+            trail_r = self._order({
                 "symbol":          sym,
                 "side":            close_side,
                 "type":            "TRAILING_STOP_MARKET",
@@ -442,8 +508,6 @@ class BinanceTrader:
                 log.info("Futures TSL activation=%.6g callback=1.5%% id=%s ✅", tp1_p, trailing_id)
             else:
                 log.warning("Futures TSL failed (non-critical): %s", trail_r)
-
-        tp3_id = ""  # TP3 not placed separately — TSL covers runner portion
 
         log.info(
             "Futures orders placed: entry=%s tp1=%s tp2=%s sl=%s tsl=%s",
@@ -496,6 +560,8 @@ class BinanceTrader:
                 lf   = filters.get("LOT_SIZE",     {})
                 nf   = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
                 tick = float(pf.get("tickSize",      "0.0001") or "0.0001")
+                info.symbol    = sym
+                info.tick_size = tick
                 step = float(lf.get("stepSize",      "0.001")  or "0.001")
                 mq   = float(lf.get("minQty",        "0.001")  or "0.001")
                 mn   = float(nf.get("minNotional",   "5")      or nf.get("notional", "5") or "5")
@@ -537,14 +603,29 @@ class BinanceTrader:
         return resp.json() if resp.ok else None
 
     def _fp(self, price: float, info: SymbolInfo) -> float:
+        """Snap price to nearest valid tick size. Fixes -4014 errors."""
         if price <= 0:
             return 0.0
-        # Use symbol precision, but auto-extend if it rounds to 0
+        # Get tickSize from symbol info cache
+        try:
+            sym_data = self._sym_cache.get(info.symbol if hasattr(info, "symbol") else "")
+        except Exception:
+            sym_data = None
+
+        tick = getattr(info, "tick_size", 0)
+        if tick and tick > 0:
+            # Snap to nearest tick: round(price / tick) * tick
+            snapped = round(round(price / tick) * tick, 10)
+            # Count decimal places needed
+            tick_str = f"{tick:.10f}".rstrip("0")
+            dec = len(tick_str.split(".")[1]) if "." in tick_str else 0
+            return round(snapped, dec)
+
+        # Fallback: use price_precision
+        import math
         p = info.price_precision
         result = round(price, p)
         if result == 0 and price > 0:
-            # tickSize is too coarse — calculate needed precision from actual price
-            import math
             p = max(p, -int(math.floor(math.log10(abs(price)))) + 4)
             result = round(price, p)
         return result
@@ -646,7 +727,7 @@ class BinanceTrader:
                             "symbol": sym, "side": close_side,
                             "type": "TAKE_PROFIT_MARKET",
                             "stopPrice": stop_p, "quantity": qty_p,
-                            "timeInForce": "GTC", "workingType": "MARK_PRICE",
+                            "workingType": "MARK_PRICE",
                             "priceProtect": "true", "reduceOnly": "true",
                         }),
                         ("LIMIT", {
@@ -655,31 +736,35 @@ class BinanceTrader:
                             "timeInForce": "GTC", "reduceOnly": "true",
                         }),
                     ]:
-                        r = self._req("POST", "/fapi/v1/order", params)
+                        r = self._order(params)
                         if isinstance(r, dict) and "orderId" in r:
                             log.info("  %s (%s) @ %.6g id=%s ✅", label, name, stop_p, r["orderId"])
                             return
                         code = r.get("code", 0) if isinstance(r, dict) else 0
-                        if code in (-4120, -1104) and name != "LIMIT":
-                            log.warning("  %s: %s rejected (code %d) — trying LIMIT", label, name, code)
+                        if code in (-4120, -1104, -2015) and name != "LIMIT":
+                            log.warning("  %s: algo rejected (code %d) → LIMIT", label, code)
                             continue
-                        log.error("  %s FAILED (%s): code=%d", label, name, code)
+                        log.error("  %s FAILED (%s): code=%d %s",
+                                  label, name, code, r.get("msg",""))
                         return
 
                 _prot_tp("TP1", tp1_p, q_tp1)
                 _prot_tp("TP2", tp2_p, q_tp2)
+                _prot_tp("TP3", self._fp(getattr(sig, "tp3", tp2_p * 0.99), info), q_tsl)
 
                 # SL with closePosition
                 if sl_p > 0:
+                    _sl_qty  = self._fmt_qty(qty, info)
+                    _sl_limp = self._fp(sl_p * (1.005 if not is_long else 0.995), info)
                     for sl_t, sl_p2 in [
-                        ("STOP_MARKET", {"stopPrice": sl_p, "closePosition": "true",
-                                         "workingType": "MARK_PRICE", "priceProtect": "true"}),
-                        ("STOP", {"stopPrice": sl_p,
-                                  "price": self._fp(sl_p * (1.005 if not is_long else 0.995), info),
-                                  "quantity": self._fmt_qty(qty, info),
+                        ("STOP_MARKET", {"stopPrice": sl_p, "quantity": _sl_qty,
+                                         "workingType": "MARK_PRICE", "priceProtect": "true",
+                                         "reduceOnly": "true"}),
+                        ("STOP", {"stopPrice": sl_p, "price": _sl_limp,
+                                  "quantity": _sl_qty,
                                   "timeInForce": "GTC", "reduceOnly": "true"}),
                     ]:
-                        sl_r = self._req("POST", "/fapi/v1/order", {
+                        sl_r = self._order({
                             "symbol": sym, "side": close_side, "type": sl_t, **sl_p2})
                         if isinstance(sl_r, dict) and "orderId" in sl_r:
                             log.info("  SL (%s) @ %.6g id=%s ✅", sl_t, sl_p, sl_r["orderId"])
@@ -689,13 +774,17 @@ class BinanceTrader:
                             log.warning("  SL: %s rejected (code %d) — trying STOP", sl_t, code)
                             continue
                         log.error("  SL FAILED (%s): code=%d  ⚠️ STILL UNPROTECTED!", sl_t, code)
+                        try:
+                            from dashboard.views import push_trade_alert
+                            push_trade_alert("error", f"⚠️ {sym} still unprotected — SL failed (code {code})")
+                        except Exception: pass
                         break
                 else:
                     log.error("  SL skipped — price rounds to 0 for %s", sym)
 
                 # Trailing SL (activates at TP1)
                 if q_tsl >= info.min_qty and tp1_p > 0:
-                    r = self._req("POST", "/fapi/v1/order", {
+                    r = self._order({
                         "symbol": sym, "side": close_side,
                         "type": "TRAILING_STOP_MARKET",
                         "quantity": q_tsl, "callbackRate": 1.5,

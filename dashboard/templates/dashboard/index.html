@@ -705,31 +705,98 @@ async function atLoad(){
           const pnlSign = pnl >= 0 ? '+' : '';
           const pctSign = pnlPct >= 0 ? '+' : '';
 
-          function orderLabel(t){
-            if(t === 'TAKE_PROFIT_MARKET') return 'TP';
-            if(t === 'STOP_MARKET') return 'SL';
-            if(t === 'TRAILING_STOP_MARKET') return 'TSL';
-            if(t === 'LIMIT') return 'LMT';
-            return t;
+          // Smart order labelling: rank LIMITs as TP1/TP2/TP3, STOPs as SL
+          // Sort: close_side LIMITs by price direction to assign TP1/2/3
+          const orders = (p.orders || []).slice();
+          const isLongPos = p.side === 'LONG';
+
+          // Separate order types
+          const tpOrders  = orders.filter(function(o){
+            return o.type === 'TAKE_PROFIT_MARKET' || o.type === 'TAKE_PROFIT' ||
+                   (o.type === 'LIMIT' && o.side !== (isLongPos ? 'BUY' : 'SELL'));
+          });
+          const slOrders  = orders.filter(function(o){
+            return o.type === 'STOP_MARKET' || o.type === 'STOP' ||
+                   o.type === 'STOP_LOSS' || o.type === 'STOP_LOSS_LIMIT';
+          });
+          const tslOrders = orders.filter(function(o){
+            return o.type === 'TRAILING_STOP_MARKET';
+          });
+          const otherOrders = orders.filter(function(o){
+            return !tpOrders.includes(o) && !slOrders.includes(o) && !tslOrders.includes(o);
+          });
+
+          // Sort TPs: LONG = ascending price (TP1 lowest), SHORT = descending (TP1 highest)
+          tpOrders.sort(function(a, b){
+            const pa = parseFloat(a.stop_price || a.price || 0);
+            const pb = parseFloat(b.stop_price || b.price || 0);
+            return isLongPos ? pa - pb : pb - pa;
+          });
+
+          const entry = parseFloat(p.entry || 0);
+          function pctFromEntry(price){
+            if(!entry || !price) return '';
+            const d = ((price - entry) / entry * 100);
+            return (d >= 0 ? '+' : '') + d.toFixed(1) + '%';
           }
 
           let ordersHtml = '';
-          const orders = p.orders || [];
+          const hasSL  = slOrders.length > 0;
+          const hasTSL = tslOrders.length > 0;
+          const hasTP  = tpOrders.length > 0;
+
           if(orders.length > 0){
-            orders.forEach(function(o){
-              const isTP   = o.type === 'TAKE_PROFIT_MARKET';
-              const isSL   = o.type === 'STOP_MARKET';
-              const isTSL  = o.type === 'TRAILING_STOP_MARKET';
-              const oc     = isTP ? '#00e5a0' : isSL ? '#ff4560' : isTSL ? '#ffba08' : '#4d9fff';
-              const trigP  = parseFloat(o.stop_price || o.price || 0);
-              const stColor= o.status === 'NEW' ? '#4d9fff' : 'var(--dim)';
-              ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
-                + '<span style="color:' + oc + ';font-weight:700;min-width:36px">' + orderLabel(o.type) + '</span>'
-                + '<span style="color:var(--dim);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
-                + '<span style="color:var(--dim)">qty ' + parseFloat(o.qty||0).toFixed(2) + '</span>'
-                + '<span style="color:' + stColor + ';font-size:10px">' + (o.status||'') + '</span>'
+            // Render TPs
+            tpOrders.forEach(function(o, idx){
+              const lbl   = 'TP' + (idx + 1);
+              const trigP = parseFloat(o.stop_price || o.price || 0);
+              const pct   = pctFromEntry(trigP);
+              const qty   = parseFloat(o.qty || o.origQty || 0);
+              ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
+                + '<span style="color:#00e5a0;font-weight:700;min-width:36px">' + lbl + '</span>'
+                + '<span style="color:var(--text);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
+                + '<span style="color:#00e5a0;font-size:10px">' + pct + '</span>'
+                + '<span style="color:var(--dim)">qty ' + qty.toFixed(2) + '</span>'
                 + '</div>';
             });
+
+            // Render SL
+            slOrders.forEach(function(o){
+              const trigP = parseFloat(o.stop_price || o.price || 0);
+              const pct   = pctFromEntry(trigP);
+              const qty   = parseFloat(o.qty || o.origQty || 0);
+              ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
+                + '<span style="color:#ff4560;font-weight:700;min-width:36px">SL</span>'
+                + '<span style="color:var(--text);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
+                + '<span style="color:#ff4560;font-size:10px">' + pct + '</span>'
+                + '<span style="color:var(--dim)">' + (qty > 0 ? 'qty ' + qty.toFixed(2) : 'close-all') + '</span>'
+                + '</div>';
+            });
+
+            // Render TSL
+            tslOrders.forEach(function(o){
+              const actP  = parseFloat(o.stop_price || o.price || 0);
+              const qty   = parseFloat(o.qty || o.origQty || 0);
+              ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
+                + '<span style="color:#ffba08;font-weight:700;min-width:36px">TSL</span>'
+                + '<span style="color:var(--dim);font-size:10px">trailing 1.5% · activates at TP1</span>'
+                + '<span style="color:var(--dim)">qty ' + qty.toFixed(2) + '</span>'
+                + '</div>';
+            });
+
+            // Render others
+            otherOrders.forEach(function(o){
+              const trigP = parseFloat(o.stop_price || o.price || 0);
+              ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
+                + '<span style="color:#4d9fff;font-weight:700;min-width:36px">' + (o.type||'?') + '</span>'
+                + '<span style="color:var(--dim);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
+                + '</div>';
+            });
+
+            // Warn if missing SL
+            if(!hasSL && !hasTSL){
+              ordersHtml += '<div style="font-size:10px;color:#ff4560;padding:4px 10px">⚠️ No stop-loss set</div>';
+            }
           } else {
             ordersHtml = '<div style="font-size:11px;color:var(--red);padding:6px 10px">⚠️ No TP/SL orders — position unprotected</div>';
           }
@@ -824,6 +891,18 @@ async function atLoad(){
 }
 atLoad();
 setInterval(atLoad, 20000);
+
+// Poll for trade alerts (TP/SL errors, order failures) every 15s
+async function pollAlerts(){
+  try {
+    const d = await get('/api/auto/alerts/');
+    (d.alerts || []).forEach(function(a){
+      const isErr = a.level === 'error' || a.msg.includes('FAIL') || a.msg.includes('⚠️');
+      toast(a.msg, isErr ? 'error' : 'info', 6000);
+    });
+  } catch(e){}
+}
+setInterval(pollAlerts, 15000);
 
 async function atToggleSpot(enabled){
   const sw    = document.getElementById('spot-switch');
