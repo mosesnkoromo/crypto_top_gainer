@@ -632,12 +632,24 @@ class Scanner:
 
             if fut_on and not fut_api_ok:
                 log.warning("AUTO-TRADE BLOCKED: Binance Futures API (fapi.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
-                fut_on = False  # disable for this cycle
+                fut_on = False
                 fut_trader = None
 
             if not spot_on and not fut_on:
                 log.warning("Both APIs unreachable — skipping auto-trade this cycle")
                 return
+
+            # Reset daily trade counters at midnight EAT
+            from zoneinfo import ZoneInfo as _ZI
+            _eat = now.astimezone(_ZI("Africa/Dar_es_Salaam"))
+            _today = _eat.replace(hour=0, minute=0, second=0, microsecond=0)
+            last_reset = getattr(self, "_last_counter_reset", None)
+            if last_reset is None or last_reset < _today:
+                state.spot_trades_today    = 0
+                state.futures_trades_today = 0
+                state.save(update_fields=["spot_trades_today", "futures_trades_today"])
+                self._last_counter_reset = _today
+                log.info("Daily trade counters reset to 0 (new day)")
 
             spot_bal = spot_trader.get_available_balance()  if spot_trader else 0.0
             fut_bal  = fut_trader.get_available_balance()   if fut_trader  else 0.0

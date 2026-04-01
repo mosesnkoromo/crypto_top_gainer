@@ -14,7 +14,7 @@ from django.http import JsonResponse
 from django.utils import timezone
 from django.db.models import Count, Avg, Sum, Q, F
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_GET, require_POST ,require_http_methods
+from django.views.decorators.http import require_http_methods, require_POST
 
 from .models import SignalRecord, ScanRecord, CapitalRecord
 
@@ -482,21 +482,37 @@ def auto_trade_status(request):
                     live["futures_balance"]     = round(float(b.get("available_balance", 0) or 0), 2)
                     live["futures_wallet"]      = round(float(b.get("wallet_balance",   0) or 0), 2)
                     live["futures_pnl"]         = round(float(b.get("unrealised_pnl",  0) or 0), 2)
-                    live["futures_open_orders"] = len(ft.get_open_orders())
+                    regular_orders = ft.get_open_orders() or []
+                    # Also fetch algo orders (TAKE_PROFIT_MARKET, STOP_MARKET placed via algoOrder)
+                    try:
+                        algo_resp = ft._req("GET", "/fapi/v1/openAlgoOrders", {})
+                        algo_orders = algo_resp if isinstance(algo_resp, list) else                                       (algo_resp or {}).get("orders", []) if isinstance(algo_resp, dict) else []
+                        # Normalise algo order fields to match regular order format
+                        for ao in algo_orders:
+                            if "algoId" in ao and "orderId" not in ao:
+                                ao["orderId"]    = ao["algoId"]
+                                ao["stop_price"] = ao.get("triggerPrice", "0")
+                                ao["type"]       = ao.get("orderType", ao.get("type",""))
+                                ao["origQty"]    = ao.get("quantity","0")
+                                ao["status"]     = ao.get("algoStatus","NEW")
+                    except Exception:
+                        algo_orders = []
+                    all_orders = regular_orders + algo_orders
+                    live["futures_open_orders"] = len(all_orders)
                     pos = ft.get_positions()
                     # Get open orders to match with positions
-                    open_orders = ft.get_open_orders() or []
+                    # Build orders-by-symbol using combined regular+algo orders
                     orders_by_sym = {}
-                    for o in open_orders:
-                        s = o.get("symbol","")
-                        orders_by_sym.setdefault(s, []).append({
-                            "order_id":   str(o.get("orderId","")),
+                    for o in all_orders:
+                        s2 = o.get("symbol","")
+                        orders_by_sym.setdefault(s2, []).append({
+                            "order_id":   str(o.get("orderId", o.get("algoId",""))),
                             "type":       o.get("type",""),
                             "side":       o.get("side",""),
-                            "stop_price": o.get("stopPrice","0"),
-                            "price":      o.get("price","0"),
-                            "qty":        o.get("origQty","0"),
-                            "status":     o.get("status",""),
+                            "stop_price": str(o.get("stopPrice", o.get("triggerPrice","0"))),
+                            "price":      str(o.get("price","0")),
+                            "qty":        str(o.get("origQty", o.get("quantity","0"))),
+                            "status":     o.get("status", o.get("algoStatus","NEW")),
                         })
 
                     live["futures_positions"] = []
@@ -605,6 +621,23 @@ def _execute_pending_signals(state, cfg):
     EAT = ZoneInfo("Africa/Dar_es_Salaam")
     now = timezone.now().astimezone(EAT)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    # Count actual trades executed today from DB — single source of truth
+    from dashboard.models import SignalRecord
+    from datetime import timedelta
+    today_end = today_start + timedelta(days=1)
+    actual_spot = SignalRecord.objects.filter(
+        created_at__gte=today_start, created_at__lt=today_end,
+        notes__icontains="AUTO_SPOT:YES"
+    ).count()
+    actual_fut  = SignalRecord.objects.filter(
+        created_at__gte=today_start, created_at__lt=today_end,
+        notes__icontains="AUTO_FUT:YES"
+    ).count()
+    if state.spot_trades_today != actual_spot or state.futures_trades_today != actual_fut:
+        state.spot_trades_today    = actual_spot
+        state.futures_trades_today = actual_fut
+        state.save(update_fields=["spot_trades_today","futures_trades_today"])
+        logger.info("Counters corrected → spot=%d fut=%d today", actual_spot, actual_fut)
 
     pending = list(SignalRecord.objects.filter(
         created_at__gte=today_start,
