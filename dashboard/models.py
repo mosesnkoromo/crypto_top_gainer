@@ -187,3 +187,29 @@ class AutoTradeState(models.Model):
             v = getattr(self, f, None)
             if v is not None and v < 1: setattr(self, f, 1)
         super().save(*args, **kwargs)
+
+
+class ScalpPosition(models.Model):
+    """Tracks when each futures position was opened for time-exit logic."""
+    symbol    = models.CharField(max_length=20)
+    side      = models.CharField(max_length=10)   # LONG or SHORT
+    qty       = models.FloatField(default=0)
+    entry     = models.FloatField(default=0)
+    opened_at = models.DateTimeField(auto_now_add=True)
+    closed    = models.BooleanField(default=False)
+    close_reason = models.CharField(max_length=20, default="")  # TP1/TP2/SL/TIME/MANUAL
+
+    class Meta:
+        ordering = ["-opened_at"]
+
+    def __str__(self):
+        return f"{self.symbol} {self.side} @ {self.entry} ({'closed' if self.closed else 'open'})"
+
+    @classmethod
+    def open(cls, symbol, side, qty, entry):
+        return cls.objects.create(symbol=symbol, side=side, qty=qty, entry=entry)
+
+    @classmethod
+    def close_sym(cls, symbol, reason=""):
+        cls.objects.filter(symbol=symbol, closed=False).update(
+            closed=True, close_reason=reason)

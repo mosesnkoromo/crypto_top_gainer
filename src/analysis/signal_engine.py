@@ -154,6 +154,40 @@ class SignalEngine:
         news_sent = (self._news.get_sentiment_for(sym)
                      if self._news else {"label": "neutral", "articles": 0})
 
+        # ── SCALP PRE-FILTERS (mandatory gates) ───────────────
+        # Fetch 15m for entry timing and volatility
+        df_15m = self._b.get_klines(sym, "15m", 30)
+        close_15m = df_15m["close"] if not df_15m.empty and len(df_15m) >= 14 else close_1h
+
+        # MANDATORY 1: Volatility filter — ATR(15m) > 0.6% price
+        # Skip quiet/choppy markets entirely
+        atr_15m_val = atr(df_15m, 14) if not df_15m.empty and len(df_15m) >= 14 else 0
+        atr_15m_pct = (atr_15m_val / price_now * 100) if price_now > 0 else 0
+        if 0 < atr_15m_pct < 0.6:
+            return None  # market too quiet
+
+        # MANDATORY 2: 4H trend alignment — only trade WITH macro direction
+        macro_bull = price_now > e50_4h   # LONG only above 4H EMA50
+        macro_bear = price_now < e50_4h   # SHORT only below 4H EMA50
+
+        # MANDATORY 3: No-trade zone — RSI 45-55 = chop, no edge
+        if 45 < rsi_1h < 55:
+            return None
+
+        # MANDATORY 4: 15m structure confirmation
+        # LONG: last 15m candle closes higher than previous (momentum up)
+        # SHORT: last 15m candle closes lower than previous (momentum down)
+        if len(close_15m) >= 2:
+            m_structure_bull = float(close_15m.iloc[-1]) > float(close_15m.iloc[-2])
+            m_structure_bear = float(close_15m.iloc[-1]) < float(close_15m.iloc[-2])
+        else:
+            m_structure_bull = m_structure_bear = True  # no data, don't filter
+
+        # MANDATORY 5: EMA20 direction on 1H
+        e20_1h = ema_value(close_1h, 20) if len(close_1h) >= 20 else price_now
+        ema_bull = price_now > e20_1h   # price above 1H EMA20 = bullish
+        ema_bear = price_now < e20_1h   # price below 1H EMA20 = bearish
+
         # ── Score ─────────────────────────────────────────────
         buy_score, buy_factors = self._buy_score(
             price_now, gain, rsi_d, rsi_4h, rsi_1h,
@@ -174,14 +208,20 @@ class SignalEngine:
         buy_core  = int(buy_score)
         sell_core = int(sell_score)
 
-        if buy_core >= self._s.min_buy_confluence and buy_score > sell_score:
-            return self._build("BUY", sym, buy_score, buy_factors, ["SwingPullback"],
+        # MANDATORY gates must ALL pass before optional score is checked
+        buy_mandatory  = macro_bull and ema_bull and m_structure_bull
+        sell_mandatory = macro_bear and ema_bear and m_structure_bear
+
+        if buy_core >= self._s.min_buy_confluence and buy_score > sell_score and buy_mandatory:
+            buy_factors.insert(0, f"✅ Scalp gates: 4H={price_now:.4g}>EMA50, 1H EMA↑, 15m↑, ATR={atr_15m_pct:.1f}%")
+            return self._build("BUY", sym, buy_score, buy_factors, ["ScalpPullback"],
                                price_now, gain, rsi_1h, rsi_4h, rsi_d, btc,
                                srsi_4h, bb_4h["pct_b"], wr_4h,
                                news_sent.get("label", "neutral"),
                                e50_4h, atr_4h, swing_low)
-        if sell_core >= self._s.min_sell_confluence and sell_score > buy_score:
-            return self._build("SELL", sym, sell_score, sell_factors, ["SwingPullback"],
+        if sell_core >= self._s.min_sell_confluence and sell_score > buy_score and sell_mandatory:
+            sell_factors.insert(0, f"✅ Scalp gates: 4H={price_now:.4g}<EMA50, 1H EMA↓, 15m↓, ATR={atr_15m_pct:.1f}%")
+            return self._build("SELL", sym, sell_score, sell_factors, ["ScalpPullback"],
                                price_now, gain, rsi_1h, rsi_4h, rsi_d, btc,
                                srsi_4h, bb_4h["pct_b"], wr_4h,
                                news_sent.get("label", "neutral"),

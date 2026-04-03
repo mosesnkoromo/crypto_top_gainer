@@ -546,6 +546,85 @@ class Scanner:
         except Exception as _pe:
             log.warning("protect_positions error: %s", _pe)
 
+        # ── SCALP TIME-EXIT: force-close positions open > 1 hour ──
+        try:
+            from dashboard.models import AutoTradeState, ScalpPosition
+            _st = AutoTradeState.get()
+            if _st.futures_enabled:
+                from src.trading.binance_trader import BinanceTrader
+                from config import load_config as _lc
+                _cfg = _lc()
+                if _cfg.auto.has_keys:
+                    _ft = BinanceTrader(_cfg.auto.api_key, _cfg.auto.api_secret,
+                                        mode="futures", live=not _cfg.auto.testnet)
+                    _open_pos = _ft.get_positions()
+                    for _pos in _open_pos:
+                        _sym = _pos.get("symbol", "")
+                        _amt = float(_pos.get("positionAmt", 0))
+                        if not _sym or _amt == 0:
+                            continue
+                        # Check if we have a recorded open time
+                        _sp = ScalpPosition.objects.filter(symbol=_sym, closed=False).first()
+                        if not _sp:
+                            continue
+                        from zoneinfo import ZoneInfo
+                        from datetime import timedelta
+                        _EAT = ZoneInfo("Africa/Dar_es_Salaam")
+                        _age = (now - _sp.opened_at.astimezone(_EAT)).total_seconds() / 3600
+
+                        # Smart time exit:
+                        # > 60min AND profit < 0.5% → close (dead trade)
+                        # > 90min regardless → close (hard cap)
+                        if _age < 1.0:
+                            continue
+
+                        # Check current P&L
+                        _should_close = False
+                        _reason = ""
+                        try:
+                            _pos_data = next((p for p in _ft.get_positions()
+                                              if p.get("symbol") == _sym), None)
+                            if _pos_data:
+                                _notional = abs(float(_pos_data.get("positionAmt",0))) * float(_pos_data.get("entryPrice",1))
+                                _pnl_pct = float(_pos_data.get("unRealizedProfit",0)) / max(_notional, 1) * 100
+                                if _age >= 1.5:  # 90min hard cap
+                                    _should_close = True
+                                    _reason = f"90min hard cap (pnl={_pnl_pct:.1f}%)"
+                                elif _age >= 1.0 and _pnl_pct < 0.5:
+                                    _should_close = True
+                                    _reason = f"60min + low profit ({_pnl_pct:.1f}%)"
+                                else:
+                                    log.info("⏱ %s at %.1fh — profit %.1f%% — extending", _sym, _age, _pnl_pct)
+                            else:
+                                _should_close = True  # position gone, close record
+                                _reason = "position already closed"
+                        except Exception:
+                            _should_close = _age >= 1.5
+
+                        if _should_close:
+                            _side = "SELL" if _amt > 0 else "BUY"
+                            _qty  = abs(_amt)
+                            _ft._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _sym})
+                            try:
+                                _ta = _ft._req("GET", "/fapi/v1/openAlgoOrders", {"symbol": _sym}) or {}
+                                for _tao in (_ta.get("algoOrders",[]) if isinstance(_ta,dict) else []):
+                                    _tid = _tao.get("algoId") or _tao.get("orderId")
+                                    if _tid: _ft._req("DELETE", "/fapi/v1/algoOrder", {"symbol": _sym, "algoId": _tid})
+                            except Exception: pass
+                            _close = _ft._req("POST", "/fapi/v1/order", {
+                                "symbol": _sym, "side": _side,
+                                "type": "MARKET", "quantity": _qty,
+                                "reduceOnly": "true",
+                            })
+                            if isinstance(_close, dict) and "orderId" in _close:
+                                _sp.closed = True
+                                _sp.save(update_fields=["closed"])
+                                log.info("⏱️ TIME-EXIT %s after %.1fh: %s", _sym, _age, _reason)
+                            else:
+                                log.error("Time-exit FAILED %s: %s", _sym, _close)
+        except Exception as _te:
+            log.debug("Time-exit check: %s", _te)
+
         log.info("Cycle complete")
         self._daily_scan_count += 1
         # Reset auto-trade daily count at midnight EAT
@@ -632,12 +711,30 @@ class Scanner:
 
             if fut_on and not fut_api_ok:
                 log.warning("AUTO-TRADE BLOCKED: Binance Futures API (fapi.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
-                fut_on = False  # disable for this cycle
+                fut_on = False
                 fut_trader = None
 
             if not spot_on and not fut_on:
                 log.warning("Both APIs unreachable — skipping auto-trade this cycle")
                 return
+
+            # Sync daily trade counters from DB (single source of truth)
+            from zoneinfo import ZoneInfo as _ZI
+            from datetime import timedelta as _td
+            _eat      = now.astimezone(_ZI("Africa/Dar_es_Salaam"))
+            _t_start  = _eat.replace(hour=0, minute=0, second=0, microsecond=0)
+            _t_end    = _t_start + _td(days=1)
+            _spot_cnt = SignalRecord.objects.filter(
+                created_at__gte=_t_start, created_at__lt=_t_end,
+                notes__icontains="AUTO_SPOT:YES").count()
+            _fut_cnt  = SignalRecord.objects.filter(
+                created_at__gte=_t_start, created_at__lt=_t_end,
+                notes__icontains="AUTO_FUT:YES").count()
+            if state.spot_trades_today != _spot_cnt or state.futures_trades_today != _fut_cnt:
+                state.spot_trades_today    = _spot_cnt
+                state.futures_trades_today = _fut_cnt
+                state.save(update_fields=["spot_trades_today","futures_trades_today"])
+                log.info("Counters synced → spot=%d fut=%d (today only)", _spot_cnt, _fut_cnt)
 
             spot_bal = spot_trader.get_available_balance()  if spot_trader else 0.0
             fut_bal  = fut_trader.get_available_balance()   if fut_trader  else 0.0
@@ -675,19 +772,37 @@ class Scanner:
                 s.tp1=rec.tp1; s.tp2=rec.tp2
                 s.tp3=rec.tp3; s.sl=rec.sl
                 s.btc_score=rec.btc_score; s.confidence=rec.confidence
-                # Staleness check: skip if current price blew past SL
+                # Staleness checks — skip stale pending signals
                 try:
                     import requests as _rq
                     r = _rq.get("https://api.binance.com/api/v3/ticker/price",
                                 params={"symbol": rec.symbol}, timeout=4)
                     if r.ok:
                         cur = float(r.json().get("price", rec.entry_price))
+                        entry = rec.entry_price or cur
+
+                        # 1. Price already past SL → trade would immediately lose
                         if rec.signal == "BUY"  and cur <= rec.sl:
-                            log.info("Skip %s BUY — current $%.5g already below SL $%.5g", rec.symbol, cur, rec.sl)
+                            log.info("Skip %s BUY — price $%.5g already below SL $%.5g", rec.symbol, cur, rec.sl)
                             return None
                         if rec.signal == "SELL" and cur >= rec.sl:
-                            log.info("Skip %s SELL — current $%.5g already above SL $%.5g", rec.symbol, cur, rec.sl)
+                            log.info("Skip %s SELL — price $%.5g already above SL $%.5g", rec.symbol, cur, rec.sl)
                             return None
+
+                        # 2. Price already past TP1 → trade opens and closes instantly
+                        if rec.signal == "BUY"  and rec.tp1 > 0 and cur >= rec.tp1:
+                            log.info("Skip %s BUY — price $%.5g already past TP1 $%.5g", rec.symbol, cur, rec.tp1)
+                            return None
+                        if rec.signal == "SELL" and rec.tp1 > 0 and cur <= rec.tp1:
+                            log.info("Skip %s SELL — price $%.5g already past TP1 $%.5g", rec.symbol, cur, rec.tp1)
+                            return None
+
+                        # 3. Entry divergence > 3% → signal is stale, conditions changed
+                        if entry > 0:
+                            divergence = abs(cur - entry) / entry * 100
+                            if divergence > 3.0:
+                                log.info("Skip %s — entry divergence %.1f%% too large (stale signal)", rec.symbol, divergence)
+                                return None
                 except Exception:
                     pass
                 return s
@@ -751,9 +866,9 @@ class Scanner:
                     if grade_key not in ("ULTRA","STRONG","STANDARD"):
                         log.debug("Futures skip %s: grade=%s", sig.symbol, grade_key)
                         continue
-                    if state.futures_trades_today >= state.futures_max_trades:
-                        log.warning("Futures daily limit %d reached", state.futures_max_trades)
-                        break
+                    # Unlimited mode — no daily cap
+                    # if state.futures_trades_today >= state.futures_max_trades:
+                    #     break
                     if sig.symbol in seen_fut:
                         continue
                     seen_fut.add(sig.symbol)
@@ -780,6 +895,13 @@ class Scanner:
                         log.info("FUTURES TRADE ✅ %s %s @ %.6g | sl=%s tp1=%s tp2=%s tp3=%s",
                                  result.side, sig.symbol, result.entry_price,
                                  result.sl_order_id, sig.tp1, sig.tp2, sig.tp3)
+                        # Record open time for scalp time-exit
+                        try:
+                            from dashboard.models import ScalpPosition
+                            _pos_side = "LONG" if result.side == "BUY" else "SHORT"
+                            ScalpPosition.open(sig.symbol, _pos_side,
+                                               result.qty, result.entry_price)
+                        except Exception: pass
                     else:
                         log.warning("FUTURES TRADE ❌ %s %s — %s",
                                     sig.signal, sig.symbol, result.error)
@@ -802,10 +924,7 @@ class Scanner:
         return (now - self._last_btc_update).total_seconds() >= self._cfg.alert.btc_update_every_hours * 3600
 
     def _is_in_cooldown(self, symbol: str, now: datetime) -> bool:
-        # FIX 5: 4-hour cooldown per symbol regardless of direction.
-        # Report showed GUSDT signaled 6x in one day, MEUSDT 5x — compounding losses.
-        # The cooldown now blocks BOTH BUY and SELL on the same symbol for 4 hours
-        # after any signal (win or loss) to prevent repeated entries on volatile pairs.
+
         COOLDOWN_SECONDS = max(
             self._cfg.alert.cooldown_hours * 3600,
             24 * 3600   # minimum 24 hours for swing trading — let the trade breathe

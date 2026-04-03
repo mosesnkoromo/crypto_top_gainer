@@ -49,9 +49,9 @@ class WhatsAppConfig:
 
 @dataclass(frozen=True)
 class ScanConfig:
-    top_gainers_count:     int   = field(default_factory=lambda: _get("TOP_GAINERS_COUNT", 25, int))
+    top_gainers_count:     int   = field(default_factory=lambda: _get("TOP_GAINERS_COUNT", 40, int))
     min_gain_percent:      float = field(default_factory=lambda: _get("MIN_GAIN_PERCENT", 5.0, float))
-    scan_interval_minutes: int   = field(default_factory=lambda: _get("SCAN_INTERVAL_MINUTES", 15, int))
+    scan_interval_minutes: int   = field(default_factory=lambda: _get("SCAN_INTERVAL_MINUTES", 5, int))
     timeframe:             str   = field(default_factory=lambda: _get("TIMEFRAME", "1h"))
     candle_limit:          int   = field(default_factory=lambda: _get("CANDLE_LIMIT", 80, int))
     min_quote_volume:      float = 5_000_000.0
@@ -71,15 +71,15 @@ class SignalConfig:
     volume_climax:         float = field(default_factory=lambda: _get("VOLUME_CLIMAX", 3.0, float))
     volume_strong:         float = field(default_factory=lambda: _get("VOLUME_STRONG", 2.0, float))
     volume_buy_min:        float = field(default_factory=lambda: _get("VOLUME_BUY_MIN", 1.3, float))
-    min_sell_confluence:   float = field(default_factory=lambda: _get("MIN_SELL_CONFLUENCE", 5.0, float))
-    min_buy_confluence:    float = field(default_factory=lambda: _get("MIN_BUY_CONFLUENCE", 5.0, float))
+    min_sell_confluence:   float = field(default_factory=lambda: _get("MIN_SELL_CONFLUENCE", 4.0, float))
+    min_buy_confluence:    float = field(default_factory=lambda: _get("MIN_BUY_CONFLUENCE", 4.0, float))
 
 
 @dataclass(frozen=True)
 class RiskConfig:
-    tp1_pct:       float = field(default_factory=lambda: _get("TP1_PCT", 3.0, float))
-    tp2_pct:       float = field(default_factory=lambda: _get("TP2_PCT", 6.0, float))
-    tp3_pct:       float = field(default_factory=lambda: _get("TP3_PCT", 10.0, float))
+    tp1_pct:       float = field(default_factory=lambda: _get("TP1_PCT", 0.8, float))
+    tp2_pct:       float = field(default_factory=lambda: _get("TP2_PCT", 1.6, float))
+    tp3_pct:       float = field(default_factory=lambda: _get("TP3_PCT", 2.8, float))
     sl_pct:        float = field(default_factory=lambda: _get("SL_PCT", 3.0, float))
     tp1_close_pct: int   = field(default_factory=lambda: _get("TP1_CLOSE", 40, int))
     tp2_close_pct: int   = field(default_factory=lambda: _get("TP2_CLOSE", 35, int))
@@ -130,7 +130,7 @@ class AutoTradeConfig:
     testnet: bool = field(default_factory=lambda: _get_bool("BINANCE_TESTNET", default=True))
 
     # Risk — defaults used when DB value not available
-    risk_pct_per_trade:   float = field(default_factory=lambda: _get("AUTO_RISK_PCT", 2.0, float))
+    risk_pct_per_trade:   float = field(default_factory=lambda: _get("AUTO_RISK_PCT", 1.5, float))
     daily_loss_limit_pct: float = field(default_factory=lambda: _get("AUTO_LOSS_LIMIT", 6.0, float))
 
     @property

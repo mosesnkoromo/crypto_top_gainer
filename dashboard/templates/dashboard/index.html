@@ -637,7 +637,7 @@ async function atLoad(){
       else el('spot-balance').textContent = fmt(d.spot_balance);
     }
     if(el('spot-trades'))  el('spot-trades').textContent  = (d.spot_trades_today||0)+'/'+(d.spot_max_trades||5);
-    if(el('spot-total'))   el('spot-total').textContent   = 'total: '+(d.spot_total||0);
+    if(el('spot-total'))   el('spot-total').textContent   = 'all-time: '+(d.spot_total||0);
     if(el('spot-orders'))  el('spot-orders').textContent  = d.spot_open_orders ?? '—';
     if(el('spot-status'))  el('spot-status').textContent  = d.spot_enabled ? (d.block_spot || '✅ Ready') : 'Off';
     if(el('spot-risk'))    el('spot-risk').value           = d.spot_risk || 2;
@@ -673,7 +673,7 @@ async function atLoad(){
       }
     }
     if(el('fut-trades'))  el('fut-trades').textContent  = (d.futures_trades_today||0)+'/'+(d.futures_max_trades||5);
-    if(el('fut-total'))   el('fut-total').textContent   = 'total: '+(d.futures_total||0);
+    if(el('fut-total'))   el('fut-total').textContent   = 'all-time: '+(d.futures_total||0);
     if(el('fut-orders'))  el('fut-orders').textContent  = d.futures_open_orders ?? '—';
     if(el('fut-status'))  el('fut-status').textContent  = d.futures_enabled ? (d.block_futures || '✅ Ready') : 'Off';
     if(el('fut-risk'))    el('fut-risk').value           = d.futures_risk || 2;
@@ -705,22 +705,37 @@ async function atLoad(){
           const pnlSign = pnl >= 0 ? '+' : '';
           const pctSign = pnlPct >= 0 ? '+' : '';
 
-          // Smart order labelling: rank LIMITs as TP1/TP2/TP3, STOPs as SL
-          // Sort: close_side LIMITs by price direction to assign TP1/2/3
+          // Smart order labelling — handles both standard and algo orders
+          // Algo orders: orderType field; Standard: type field
           const orders = (p.orders || []).slice();
           const isLongPos = p.side === 'LONG';
 
-          // Separate order types
+          function getOrderType(o){
+            return o.orderType || o.type || '';
+          }
+          function getOrderPrice(o){
+            // Algo orders use triggerPrice, standard use stopPrice or price
+            return parseFloat(o.triggerPrice || o.stop_price || o.price || 0);
+          }
+          function getOrderQty(o){
+            return parseFloat(o.quantity || o.qty || o.origQty || 0);
+          }
+
+          const TP_TYPES  = ['TAKE_PROFIT_MARKET','TAKE_PROFIT'];
+          const SL_TYPES  = ['STOP_MARKET','STOP','STOP_LOSS','STOP_LOSS_LIMIT'];
+          const TSL_TYPES = ['TRAILING_STOP_MARKET'];
+          // LIMIT orders on the close side count as TPs
+          const closeSide = isLongPos ? 'SELL' : 'BUY';
+
           const tpOrders  = orders.filter(function(o){
-            return o.type === 'TAKE_PROFIT_MARKET' || o.type === 'TAKE_PROFIT' ||
-                   (o.type === 'LIMIT' && o.side !== (isLongPos ? 'BUY' : 'SELL'));
+            const t = getOrderType(o);
+            return TP_TYPES.includes(t) || (t === 'LIMIT' && o.side === closeSide);
           });
           const slOrders  = orders.filter(function(o){
-            return o.type === 'STOP_MARKET' || o.type === 'STOP' ||
-                   o.type === 'STOP_LOSS' || o.type === 'STOP_LOSS_LIMIT';
+            return SL_TYPES.includes(getOrderType(o));
           });
           const tslOrders = orders.filter(function(o){
-            return o.type === 'TRAILING_STOP_MARKET';
+            return TSL_TYPES.includes(getOrderType(o));
           });
           const otherOrders = orders.filter(function(o){
             return !tpOrders.includes(o) && !slOrders.includes(o) && !tslOrders.includes(o);
@@ -728,10 +743,27 @@ async function atLoad(){
 
           // Sort TPs: LONG = ascending price (TP1 lowest), SHORT = descending (TP1 highest)
           tpOrders.sort(function(a, b){
-            const pa = parseFloat(a.stop_price || a.price || 0);
-            const pb = parseFloat(b.stop_price || b.price || 0);
+            const pa = getOrderPrice(a);
+            const pb = getOrderPrice(b);
             return isLongPos ? pa - pb : pb - pa;
           });
+          // Deduplicate: keep only unique prices, max 3 TPs, 1 SL, 1 TSL
+          function dedupeByPrice(arr){
+            const seen = {};
+            return arr.filter(function(o){
+              const k = getOrderPrice(o).toFixed(8);
+              if(seen[k]) return false;
+              seen[k] = true;
+              return true;
+            });
+          }
+          const tpUniq  = dedupeByPrice(tpOrders).slice(0, 3);
+          const slUniq  = slOrders.slice(0, 1);
+          const tslUniq = tslOrders.slice(0, 1);
+          // Replace arrays with deduped versions
+          tpOrders.length = 0; tpUniq.forEach(function(o){ tpOrders.push(o); });
+          slOrders.length = 0; slUniq.forEach(function(o){ slOrders.push(o); });
+          tslOrders.length = 0; tslUniq.forEach(function(o){ tslOrders.push(o); });
 
           const entry = parseFloat(p.entry || 0);
           function pctFromEntry(price){
@@ -749,9 +781,9 @@ async function atLoad(){
             // Render TPs
             tpOrders.forEach(function(o, idx){
               const lbl   = 'TP' + (idx + 1);
-              const trigP = parseFloat(o.stop_price || o.price || 0);
+              const trigP = getOrderPrice(o);
               const pct   = pctFromEntry(trigP);
-              const qty   = parseFloat(o.qty || o.origQty || 0);
+              const qty   = getOrderQty(o);
               ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
                 + '<span style="color:#00e5a0;font-weight:700;min-width:36px">' + lbl + '</span>'
                 + '<span style="color:var(--text);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
@@ -764,7 +796,7 @@ async function atLoad(){
             slOrders.forEach(function(o){
               const trigP = parseFloat(o.stop_price || o.price || 0);
               const pct   = pctFromEntry(trigP);
-              const qty   = parseFloat(o.qty || o.origQty || 0);
+              const qty   = getOrderQty(o);
               ordersHtml += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 10px;background:var(--bg);border-radius:5px;font-size:11px;margin-bottom:3px">'
                 + '<span style="color:#ff4560;font-weight:700;min-width:36px">SL</span>'
                 + '<span style="color:var(--text);font-family:monospace">' + (trigP > 0 ? trigP.toFixed(6) : '—') + '</span>'
@@ -810,6 +842,7 @@ async function atLoad(){
               + '</div>'
               + '<span style="font-size:11px;color:var(--dim)">qty <b style="color:var(--text)">' + parseFloat(p.qty).toFixed(4) + '</b></span>'
               + '<span style="font-size:11px;color:var(--dim)">entry <b style="color:var(--text);font-family:monospace">' + parseFloat(p.entry).toFixed(6) + '</b></span>'
+              + (p.opened_at ? '<span style="font-size:10px;color:' + (p.minutes_open >= 50 ? '#ff4560' : '#ffba08') + '">' + (p.minutes_open >= 60 ? '⏰ CLOSING' : '⏱' + p.minutes_open + 'm') + '</span>' : '')
               + '<div style="text-align:right">'
                 + '<div style="font-size:13px;font-weight:700;color:' + pColor + '">' + pnlSign + pnl.toFixed(3) + ' USDT</div>'
                 + '<div style="font-size:10px;color:' + pColor + '">' + pctSign + pnlPct.toFixed(2) + '%</div>'
@@ -1012,6 +1045,14 @@ async function atSaveSettings(){
     });
     await atLoad();
   } catch(e){ console.warn('atSaveSettings:', e); }
+}
+
+async function resetCounters(){
+  try {
+    const r = await fetch('/api/auto/reset/', {method:'POST', headers:{'X-CSRFToken':getCookie('csrftoken')}});
+    const d = await r.json();
+    if(d.ok){ toast('Daily trade counters reset to 0', 'success'); atLoad(); }
+  } catch(e){ toast('Reset failed', 'error'); }
 }
 
 async function atEmergencyStop(){
@@ -1507,7 +1548,7 @@ initBacktestSymbols();
         <div style="background:var(--bg);border-radius:6px;padding:10px">
           <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Trades Today</div>
           <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="spot-trades">—</div>
-          <div style="font-size:10px;color:var(--dim)" id="spot-total">total: 0</div>
+          <div style="font-size:10px;color:var(--dim)" id="spot-total">all-time: 0</div>
         </div>
         <div style="background:var(--bg);border-radius:6px;padding:10px">
           <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Pending Orders</div>
@@ -1567,7 +1608,7 @@ initBacktestSymbols();
         <div style="background:var(--bg);border-radius:6px;padding:10px">
           <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Trades Today</div>
           <div style="font-size:18px;font-weight:700;margin-top:3px;font-family:'JetBrains Mono',monospace" id="fut-trades">—</div>
-          <div style="font-size:10px;color:var(--dim)" id="fut-total">total: 0</div>
+          <div style="font-size:10px;color:var(--dim)" id="fut-total">all-time: 0</div>
         </div>
         <div style="background:var(--bg);border-radius:6px;padding:10px">
           <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em">Open Orders</div>
@@ -1624,7 +1665,8 @@ BINANCE_TESTNET=true    # change to false when ready for live</code>
 
   <!-- ── Emergency stop ── -->
   <div style="text-align:center;padding-bottom:24px">
-    <button id="at-stop-btn" onclick="atEmergencyStop()" style="display:none;padding:12px 36px;font-size:13px;font-weight:700;border-radius:8px;background:rgba(220,50,50,.1);color:#e05555;border:1px solid rgba(220,50,50,.3);cursor:pointer">
+    <button onclick="resetCounters()" style="background:var(--bg2);color:var(--dim);border:1px solid var(--border);border-radius:6px;padding:8px 16px;font-size:12px;cursor:pointer;margin-right:8px">🔄 Reset Today's Count</button>
+        <button id="at-stop-btn" onclick="atEmergencyStop()" style="display:none;padding:12px 36px;font-size:13px;font-weight:700;border-radius:8px;background:rgba(220,50,50,.1);color:#e05555;border:1px solid rgba(220,50,50,.3);cursor:pointer">
       🛑 Emergency Stop — Cancel All Open Orders
     </button>
   </div>
