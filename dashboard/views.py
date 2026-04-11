@@ -14,9 +14,34 @@ from django.http import JsonResponse
 from django.utils import timezone
 from django.db.models import Count, Avg, Sum, Q, F
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_http_methods, require_POST
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from .models import SignalRecord, ScanRecord, CapitalRecord
+
+# ── Scanner reference (set by runall.py on startup) ───────────────────
+_scanner_instance = None
+
+def set_scanner(scanner):
+    global _scanner_instance
+    _scanner_instance = scanner
+
+
+# ── Trade alerts (pushed from trader, polled by dashboard JS) ─────────
+_TRADE_ALERTS = []
+
+def push_trade_alert(level: str, message: str):
+    import time
+    _TRADE_ALERTS.append({"level": level, "msg": message, "ts": time.time()})
+    if len(_TRADE_ALERTS) > 30:
+        _TRADE_ALERTS.pop(0)
+
+@require_http_methods(["GET"])
+def auto_trade_alerts(request):
+    import time
+    now = time.time()
+    recent = [a for a in _TRADE_ALERTS if now - a["ts"] < 120]
+    _TRADE_ALERTS.clear()
+    return JsonResponse({"alerts": recent})
 
 logger = logging.getLogger(__name__)
 _AT_CACHE: dict = {}   # cache for auto-trade status (avoids hammering Binance)
@@ -387,6 +412,59 @@ def api_backtest_run(request):
 
 # ── Auto-trade API ────────────────────────────────────────────
 
+
+@require_GET
+def sim_stats(request):
+    """GET: simulation gate statistics — block rate, approved/blocked counts."""
+    try:
+        from dashboard.models import SignalRecord
+        from datetime import timedelta
+        from django.utils import timezone
+        since = timezone.now() - timedelta(days=7)
+        sigs  = SignalRecord.objects.filter(created_at__gte=since)
+        total = sigs.count()
+        sim_approved = sigs.filter(factors__icontains="Sim: WR=").count()
+        sim_blocked  = sigs.filter(factors__icontains="Sim blocked").count()
+        block_rate   = round(sim_blocked / max(total, 1) * 100, 1)
+        return JsonResponse({
+            "total_signals":  total,
+            "sim_approved":   sim_approved,
+            "sim_blocked":    sim_blocked,
+            "block_rate_pct": block_rate,
+            "message": f"Sim blocked {sim_blocked} trades in last 7 days ({block_rate}% block rate)",
+        })
+    except Exception as e:
+        return JsonResponse({"error": str(e)})
+
+
+def ml_insights(request):
+    """GET: ML model status, build progress, and top predictive features."""
+    try:
+        from src.analysis.ml_filter import MLSignalFilter
+        from src.analysis.ml_historical import _BUILD_PROGRESS
+        ml = MLSignalFilter()
+        insights = ml.get_insights()
+        return JsonResponse({"model": insights, "progress": _BUILD_PROGRESS})
+    except Exception as e:
+        return JsonResponse({"model": {"ready": False, "message": str(e)}, "progress": {}})
+
+
+@csrf_exempt
+def auto_trade_reset_counters(request):
+    """POST: Reset daily trade counters."""
+    try:
+        from dashboard.models import AutoTradeState
+        state = AutoTradeState.get()
+        state.spot_trades_today    = 0
+        state.futures_trades_today = 0
+        if hasattr(state, "trades_today"):
+            state.trades_today = 0
+        state.save()
+        return JsonResponse({"ok": True, "message": "Daily counters reset"})
+    except Exception as e:
+        return JsonResponse({"ok": False, "error": str(e)})
+
+
 def auto_trade_status(request):
     """GET: independent spot + futures status."""
     from .models import AutoTradeState
@@ -537,21 +615,34 @@ def auto_trade_status(request):
                                 opened_at_str = _sp.opened_at.isoformat()
                         except Exception:
                             pass
+                        # Check if signal record exists for this position
+                        _has_signal = False
+                        try:
+                            from datetime import timedelta as _td2
+                            _ts = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                            _has_signal = SignalRecord.objects.filter(
+                                symbol=p["symbol"],
+                                notes__icontains="AUTO_FUT:YES",
+                                outcome="PENDING",
+                            ).exists()
+                        except Exception:
+                            _has_signal = True  # assume OK if check fails
                         live["futures_positions"].append({
-                            "symbol":      p["symbol"],
-                            "side":        side,
-                            "qty":         abs(amt),
-                            "raw_qty":     amt,
-                            "entry":       entry,
-                            "mark":        float(p.get("markPrice", 0)),
-                            "liq":         float(p.get("liquidationPrice", 0)),
-                            "leverage":    int(p.get("leverage", 1)),
-                            "pnl":         round(pnl_usdt, 4),
-                            "pnl_pct":     pnl_pct,
-                            "notional":    round(notional, 2),
-                            "orders":      orders_by_sym.get(p["symbol"], []),
-                            "opened_at":   opened_at_str,
-                            "minutes_open": mins_open,
+                            "symbol":        p["symbol"],
+                            "side":          side,
+                            "qty":           abs(amt),
+                            "raw_qty":       amt,
+                            "entry":         entry,
+                            "mark":          float(p.get("markPrice", 0)),
+                            "liq":           float(p.get("liquidationPrice", 0)),
+                            "leverage":      int(p.get("leverage", 1)),
+                            "pnl":           round(pnl_usdt, 4),
+                            "pnl_pct":       pnl_pct,
+                            "notional":      round(notional, 2),
+                            "orders":        orders_by_sym.get(p["symbol"], []),
+                            "opened_at":     opened_at_str,
+                            "minutes_open":  mins_open,
+                            "has_signal":    _has_signal,  # False = untracked position
                         })
                 except Exception as e:
                     live["futures_error"] = str(e)[:80]
@@ -772,20 +863,3 @@ def auto_trade_emergency_stop(request):
     state.save(update_fields=["enabled"])
 
     return JsonResponse(result)
-
-
-_TRADE_ALERTS = []
-
-def push_trade_alert(level: str, message: str):
-    import time
-    _TRADE_ALERTS.append({"level": level, "msg": message, "ts": time.time()})
-    if len(_TRADE_ALERTS) > 30:
-        _TRADE_ALERTS.pop(0)
-
-@require_http_methods(["GET"])
-def auto_trade_alerts(request):
-    import time
-    now = time.time()
-    recent = [a for a in _TRADE_ALERTS if now - a["ts"] < 120]
-    _TRADE_ALERTS.clear()
-    return JsonResponse({"alerts": recent})

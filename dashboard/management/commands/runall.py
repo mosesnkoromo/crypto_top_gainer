@@ -50,7 +50,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(
             f"\n"
             f"  ╔══════════════════════════════════╗\n"
-            f"  ║  BTC Strength Bot v{cfg.version}        ║\n"
+            f"  ║  BTC Scalp Bot v{cfg.version}        ║\n"
             f"  ╚══════════════════════════════════╝\n"
             f"\n"
             f"  Dashboard : http://{host}:{port}\n"
@@ -64,8 +64,8 @@ class Command(BaseCommand):
             try:
                 scanner = Scanner(cfg)
                 from dashboard import views as dash_views
-                dash_views.api_scans(scanner)
-                sender = WhatsAppSender(cfg.whatsapp)
+                dash_views.set_scanner(scanner)
+                sender  = WhatsAppSender(cfg.whatsapp)
                 sender.send(fmt_startup(
                     cfg.version, cfg.scan.scan_interval_minutes,
                     cfg.scan.top_gainers_count, cfg.scan.min_gain_percent,

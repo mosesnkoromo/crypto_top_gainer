@@ -38,6 +38,7 @@ from src.trading.binance_trader import BinanceTrader, TradeResult
 from src.data.binance_client import BinanceClient
 from src.utils.formatter import fmt_btc_update, fmt_digest, fmt_no_signals
 from src.utils.logger import get_logger
+from src.analysis.signal_simulator import get_simulator, SimResult
 
 log = get_logger(__name__)
 
@@ -197,7 +198,7 @@ class OutcomeChecker:
         """
         try:
             resp = requests.get(_BINANCE_KLINES, params={
-                "symbol": sig.symbol, "interval": "1h",
+                "symbol": sig.symbol, "interval": "5m",
                 "startTime": since_ms, "limit": 168,
             }, timeout=12)
             resp.raise_for_status()
@@ -291,11 +292,15 @@ class Scanner:
         self._checker = OutcomeChecker()
         self._learner = PatternLearner()
 
+
         self._cooldowns: dict[str, datetime] = {}
         self._last_btc_update: datetime | None = None
         self._last_daily_report: datetime | None = None
         self._daily_scan_count: int = 0
         self._pending_symbols: set[str] = set()
+        self._pair_cooldowns: dict = {}   # {symbol: datetime} — 10min cooldown after loss
+        self._delayed_entries: dict = {}  # {symbol: {signal, retries, added_at}} delayed retry
+        self._sim = get_simulator()       # pre-trade backtest simulation gate
 
     def run_cycle(self) -> None:
         from dashboard.models import ScanRecord, SignalRecord, NewsItem
@@ -306,6 +311,21 @@ class Scanner:
         _EAT = ZoneInfo("Africa/Dar_es_Salaam")
         now_eat = now.astimezone(_EAT)
         log.info("Scan cycle started at %s EAT", now_eat.strftime("%H:%M:%S"))
+
+        # ── DAILY LOSS CIRCUIT BREAKER ────────────────────────────────
+        try:
+            from dashboard.models import SignalRecord
+            _today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            _day_losses  = list(SignalRecord.objects.filter(
+                created_at__gte=_today_start, outcome="SL"
+            ).values_list("profit_pct", flat=True))
+            _total_loss  = sum(abs(p or 0) for p in _day_losses)
+            if _total_loss > 10.0:  # >4% total SL losses today → pause
+                log.warning("🛑 CIRCUIT BREAKER: %.1f%% SL losses today — pausing new entries",
+                            _total_loss)
+                return
+        except Exception:
+            pass
 
         # ── Step 1: Auto-resolve pending outcomes ────────────
         resolved = self._checker.check_pending()
@@ -363,9 +383,84 @@ class Scanner:
                 gainers.append(t)
         log.info("Pairs to scan: %d (top gainers + liquid) | BTC Score: %d/100", len(gainers), btc.score)
 
+        # ── CRASH PROTECTION: BTC < 15 → close all LONG positions ────
+        if btc.score < 15:
+            try:
+                from dashboard.models import AutoTradeState as _ATSC
+                from config import load_config as _lcc
+                _stc = _ATSC.get()
+                _cfgc = _lcc()
+                if _stc.futures_enabled and _cfgc.auto.has_keys:
+                    from src.trading.binance_trader import BinanceTrader as _BTC2
+                    _ftc = _BTC2(_cfgc.auto.api_key, _cfgc.auto.api_secret,
+                                 mode="futures", live=not _cfgc.auto.testnet)
+                    for _pc in _ftc.get_positions():
+                        if float(_pc.get("positionAmt", 0)) > 0:
+                            _sc2 = _pc.get("symbol", "")
+                            _qc  = abs(float(_pc.get("positionAmt", 0)))
+                            _ftc._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _sc2})
+                            _ftc._req("POST", "/fapi/v1/order", {
+                                "symbol": _sc2, "side": "SELL", "type": "MARKET",
+                                "quantity": _qc, "reduceOnly": "true"})
+                            log.warning("🚨 CRASH PROTECTION: closed LONG %s (BTC=%d/100)",
+                                        _sc2, btc.score)
+            except Exception as _ce:
+                log.debug("Crash protection: %s", _ce)
+
+        # ── Step 4b: Retry delayed entries ───────────────────
+        # Signals that passed score but sniper rejected — retry up to 3 cycles
+        collected: list[Signal] = []      # define early so delayed entries can append
+        spot_signals: list = []
+        to_remove = []
+        for _dsym, _de in list(self._delayed_entries.items()):
+            _dsig    = _de["signal"]
+            _retries = _de["retries"]
+            _added   = _de["added_at"]
+            # Expire after 3 retries (6 minutes) or 10 min max
+            age_min = (now - _added).total_seconds() / 60
+            if _retries >= 3 or age_min > 10:
+                to_remove.append(_dsym)
+                log.debug("Delayed entry %s expired (%d retries, %.0fmin)", _dsym, _retries, age_min)
+                continue
+            try:
+                # Fetch fresh ticker
+                _fresh = self._bin.get_ticker(_dsym)
+                if not _fresh:
+                    _de["retries"] += 1; continue
+                _cur_p = float(_fresh.get("lastPrice", 0) or 0)
+                _entry_p = float(_dsig.price)
+                if _entry_p <= 0:
+                    to_remove.append(_dsym); continue
+                # Price must still be within 0.5% of original entry
+                _drift = abs(_cur_p - _entry_p) / _entry_p * 100
+                if _drift > 0.5:
+                    log.debug("Delayed %s: price drifted %.2f%% — discarding", _dsym, _drift)
+                    to_remove.append(_dsym); continue
+                # Re-check sniper on fresh 1m candle
+                _df1m = self._bin.get_klines(_dsym, "1m", 20)
+                from src.analysis.indicators import ema_value
+                _sniper_ok = True
+                if not _df1m.empty and len(_df1m) >= 10:
+                    _c1m = _df1m["close"].astype(float)
+                    _e9  = ema_value(_c1m, 9)
+                    _e21 = ema_value(_c1m, 21)
+                    _is_buy = _dsig.signal == "BUY"
+                    _sniper_ok = (_e9 > _e21) if _is_buy else (_e9 < _e21)
+                if _sniper_ok:
+                    log.info("  ⏰ %s DELAYED ENTRY fired (retry %d, drift=%.2f%%)",
+                             _dsym, _retries+1, _drift)
+                    collected.append(_dsig)
+                    to_remove.append(_dsym)
+                else:
+                    _de["retries"] += 1
+                    log.debug("Delayed %s: sniper still weak (retry %d)", _dsym, _retries+1)
+            except Exception as _dex:
+                log.debug("Delayed entry check %s: %s", _dsym, _dex)
+                _de["retries"] += 1
+        for _k in to_remove:
+            self._delayed_entries.pop(_k, None)
+
         # ── Step 5: Analyse pairs ─────────────────────────────
-        collected: list[Signal] = []
-        spot_signals: list = []   # spot engine results (default empty)
         for ticker in gainers:
             sym = ticker["symbol"]
 
@@ -380,6 +475,25 @@ class Scanner:
                 continue
 
             signal = self._sig.analyze(ticker, btc)
+
+            # Check if signal engine queued a delayed entry (sniper rejected good signal)
+            if signal is None and getattr(self._sig, "_delayed_sym", None) == sym:
+                self._sig._delayed_sym = None
+                # Build lightweight delayed entry object using last ticker data
+                if sym not in self._delayed_entries:
+                    # Re-analyze to get the signal object (sniper check bypassed)
+                    try:
+                        _ticker_copy = dict(ticker)
+                        _prev_check = self._sig._sniper_score_1m
+                        self._sig._sniper_score_1m = lambda *a, **k: 0.6   # force pass
+                        _delayed_sig = self._sig.analyze(_ticker_copy, btc)
+                        self._sig._sniper_score_1m = _prev_check
+                        if _delayed_sig:
+                            self._delayed_entries[sym] = {
+                                "signal": _delayed_sig, "retries": 0, "added_at": now}
+                            log.info("  ⏰ %s queued for delayed entry (3 retries)", sym)
+                    except Exception: pass
+
             if signal:
                 # Apply pattern-learning confidence boost
                 boost = self._learner.get_confidence_boost(
@@ -388,6 +502,45 @@ class Scanner:
                 if boost != 0:
                     signal = self._apply_boost(signal, boost)
                     log.info("Pattern boost %+d%% applied to %s", boost, sym)
+
+                # ── PRE-TRADE SIMULATION GATE ─────────────────────────
+                # Simulate the trade on recent candle history before queuing.
+                # Blocks false signals like the ones that caused -5.46% losses.
+                try:
+                    df_5m_sim = self._bin.get_klines(sym, "5m", 120)
+                    sim_result = self._sim.simulate(signal, df_5m_sim)
+
+                    if not sim_result.approved:
+                        log.warning(
+                            "🚫 SIM BLOCKED %s %s | WR=%.0f%% E=%+.2f%% | %s",
+                            signal.signal, sym, sim_result.win_rate * 100,
+                            sim_result.expectancy * 100, sim_result.reason,
+                        )
+                        # Store sim result on signal for dashboard visibility
+                        signal.factors = signal.factors + [
+                            f"🚫 Sim blocked: {sim_result.reason}",
+                            f"Sim WR={sim_result.win_rate:.0%} ({sim_result.wins}/{sim_result.n_trades}) vP&L=${sim_result.virtual_pnl:+.2f}",
+                        ]
+                        # Queue for delayed retry — maybe next cycle is better
+                        if sym not in self._delayed_entries:
+                            self._delayed_entries[sym] = {
+                                "signal": signal, "retries": 0, "added_at": now}
+                            log.info("  ⏰ %s queued for delayed retry after sim block", sym)
+                        continue   # skip this signal — do NOT add to collected
+
+                    # Sim approved — attach result to signal for logging/display
+                    signal.factors = signal.factors + [
+                        f"✅ Sim: WR={sim_result.win_rate:.0%} ({sim_result.wins}/{sim_result.n_trades}) E={sim_result.expectancy:+.2%}",
+                    ]
+                    log.info(
+                        "✅ SIM APPROVED %s %s | WR=%.0f%% (%d/%d) E=%+.2f%% vP&L=$%+.2f",
+                        signal.signal, sym,
+                        sim_result.win_rate * 100, sim_result.wins, sim_result.n_trades,
+                        sim_result.expectancy * 100, sim_result.virtual_pnl,
+                    )
+                except Exception as _sim_err:
+                    log.warning("Sim error %s: %s — allowing trade", sym, _sim_err)
+                # ── END SIM GATE ──────────────────────────────────────
 
                 collected.append(signal)
                 log.info(
@@ -398,6 +551,8 @@ class Scanner:
             time.sleep(self._cfg.alert.binance_rate_limit_seconds)
 
         log.info("Scan done — %d pairs, %d signals queued", len(gainers), len(collected))
+        if not collected:
+            log.info("  ℹ️  No signals this cycle — all pairs scored below threshold or rejected")
 
         # ── Step 6: Save scan record ──────────────────────────
         scan_rec = ScanRecord.objects.create(
@@ -420,12 +575,10 @@ class Scanner:
             log.info("Direction consensus: kept %s only (buy avg=%.1f sell avg=%.1f)",
                      "BUY" if buy_avg >= sell_avg else "SELL", buy_avg, sell_avg)
 
-        MAX_SIGNALS = 5
-        collected = sorted(collected, key=lambda s: s.confluence, reverse=True)[:MAX_SIGNALS]
-        if len(collected) < len(buy_sigs) + len(sell_sigs):
-            log.info("Signal cap: trimmed to top %d by confluence", MAX_SIGNALS)
+        # Sort by confluence — no hard cap, allow all quality signals
+        collected = sorted(collected, key=lambda s: s.confluence, reverse=True)[:10]
 
-        # Always send combined report every scan — weekly stats + open positions + new signals
+        # Always send combined report every scan — positions + new signals
         if not collected:
             import inspect as _ins
             _fmt_p = _ins.signature(fmt_digest).parameters
@@ -546,6 +699,77 @@ class Scanner:
         except Exception as _pe:
             log.warning("protect_positions error: %s", _pe)
 
+        # ── ORPHAN ORDER CLEANUP ──────────────────────────────────
+        # If orders exist for a symbol that has NO open position,
+        # the position was closed (TP/SL/trailing hit) but orders remain.
+        # Cancel them and auto-update the signal outcome.
+        try:
+            from src.trading.binance_trader import BinanceTrader as _BT2
+            from config import load_config as _lc3
+            from dashboard.models import AutoTradeState as _ATS2, SignalRecord
+            _st2 = _ATS2.get()
+            if _st2.futures_enabled:
+                _cfg3 = _lc3()
+                if _cfg3.auto.has_keys:
+                    _ft2 = _BT2(_cfg3.auto.api_key, _cfg3.auto.api_secret,
+                                 mode="futures", live=not _cfg3.auto.testnet)
+                    _open_positions  = {p["symbol"] for p in _ft2.get_positions()}
+                    _all_orders      = _ft2.get_open_orders()
+                    _syms_with_orders = {o.get("symbol","") for o in _all_orders}
+                    _orphan_syms = _syms_with_orders - _open_positions - {""}
+                    for _osym in _orphan_syms:
+                        # Skip symbols recently traded (grace period 90s)
+                        from dashboard.models import ScalpPosition as _SPG
+                        _sp_ts = _SPG.objects.filter(symbol=_osym).order_by("-opened_at").first()
+                        if _sp_ts and _sp_ts.opened_at:
+                            import datetime as _dtg
+                            _age_s = (_dtg.datetime.now(_dtg.timezone.utc) - _sp_ts.opened_at.astimezone(_dtg.timezone.utc)).total_seconds()
+                            if _age_s < 90:
+                                log.debug("Orphan grace: %s opened %.0fs ago — skipping", _osym, _age_s)
+                                continue
+                        log.info("🧹 Orphan orders for %s (position closed) — cancelling", _osym)
+                        _ft2._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _osym})
+                        try:
+                            _algos2 = _ft2._req("GET", "/fapi/v1/openAlgoOrders",
+                                                {"symbol": _osym}) or {}
+                            for _ao2 in (_algos2.get("algoOrders",[])
+                                         if isinstance(_algos2,dict) else []):
+                                _aid2 = _ao2.get("algoId") or _ao2.get("orderId")
+                                if _aid2:
+                                    _ft2._req("DELETE","/fapi/v1/algoOrder",
+                                              {"symbol":_osym,"algoId":_aid2})
+                        except Exception: pass
+                        # Auto-update pending signal outcome → TP1 (position closed with profit)
+                        from zoneinfo import ZoneInfo
+                        _EAT2 = ZoneInfo("Africa/Dar_es_Salaam")
+                        _today2 = now.astimezone(_EAT2).replace(
+                            hour=0, minute=0, second=0, microsecond=0)
+                        _pending = SignalRecord.objects.filter(
+                            symbol=_osym, outcome="PENDING",
+                            created_at__gte=_today2,
+                            notes__icontains="AUTO_FUT:YES"
+                        ).order_by("-created_at").first()
+                        if _pending:
+                            # Mark as TP1 hit (most likely — position closed in profit)
+                            _pending.outcome = "TP1"
+                            _pending.save(update_fields=["outcome"])
+                            log.info("  Signal %s outcome → TP1 (position closed)", _osym)
+                        # Close ScalpPosition record
+                        try:
+                            from dashboard.models import ScalpPosition
+                            ScalpPosition.objects.filter(
+                                symbol=_osym, closed=False
+                            ).update(closed=True, close_reason="AUTO")
+                        except Exception: pass
+        except Exception as _oe:
+            log.debug("Orphan cleanup: %s", _oe)
+
+        # ── GRACE PERIOD: skip positions opened in last 90 seconds ──
+        # Prevents protect_loop and orphan_cleanup from interfering with
+        # freshly placed TP/SL orders that haven't propagated to Binance yet
+        import time as _time
+        _grace_cutoff_ts = _time.time() - 90  # 90 second grace window
+
         # ── SCALP TIME-EXIT: force-close positions open > 1 hour ──
         try:
             from dashboard.models import AutoTradeState, ScalpPosition
@@ -563,22 +787,55 @@ class Scanner:
                         _amt = float(_pos.get("positionAmt", 0))
                         if not _sym or _amt == 0:
                             continue
-                        # Check if we have a recorded open time
-                        _sp = ScalpPosition.objects.filter(symbol=_sym, closed=False).first()
-                        if not _sp:
-                            continue
+                        # Get open time — use ScalpPosition if recorded,
+                        # otherwise fall back to Binance position updateTime
                         from zoneinfo import ZoneInfo
-                        from datetime import timedelta
+                        from datetime import timedelta, timezone as _tzutc
+                        import datetime as _dt2
                         _EAT = ZoneInfo("Africa/Dar_es_Salaam")
-                        _age = (now - _sp.opened_at.astimezone(_EAT)).total_seconds() / 3600
+                        _sp = ScalpPosition.objects.filter(symbol=_sym, closed=False).first()
+                        if _sp:
+                            _opened = _sp.opened_at
+                        else:
+                            # Fallback: use Binance position updateTime
+                            _upd_ms = int(_pos.get("updateTime", 0) or 0)
+                            if _upd_ms > 0:
+                                _opened = _dt2.datetime.fromtimestamp(
+                                    _upd_ms / 1000, tz=_tzutc)
+                                # Auto-create ScalpPosition so future cycles track it
+                                try:
+                                    _is_l = _amt > 0
+                                    ScalpPosition.open(
+                                        _sym, "LONG" if _is_l else "SHORT",
+                                        abs(_amt), float(_pos.get("entryPrice", 0))
+                                    )
+                                    log.info("⏱ Created missing ScalpPosition for %s", _sym)
+                                except Exception: pass
+                            else:
+                                # No time data at all — assume it's been open a long time
+                                _opened = now - _dt2.timedelta(hours=2)
+                                log.warning("⏱ No open time for %s — assuming 2h old", _sym)
+                        # Bulletproof age calculation
+                        try:
+                            import datetime as _dt3
+                            from zoneinfo import ZoneInfo as _ZI
+                            _now_utc = _dt3.datetime.now(_dt3.timezone.utc)
+                            if _opened.tzinfo is None:
+                                # naive datetime — assume EAT
+                                _opened = _opened.replace(tzinfo=ZoneInfo("Africa/Dar_es_Salaam"))
+                            _age = (_now_utc - _opened.astimezone(_dt3.timezone.utc)).total_seconds() / 3600
+                            if _age < 0:
+                                _age = 0.1  # clock issue — treat as fresh
+                        except Exception:
+                            _age = 2.0  # assume old if all else fails → will trigger exit
 
-                        # Smart time exit:
-                        # > 60min AND profit < 0.5% → close (dead trade)
-                        # > 90min regardless → close (hard cap)
-                        if _age < 1.0:
-                            continue
+                        # 5m SCALP time exit:
+                        # > 8min AND profit < 0.2% → close (dead trade, capital recycling)
+                        # > 15min hard cap → close regardless (5m trades don't hold longer)
+                        _age_min = _age * 60   # convert hours to minutes
+                        if _age_min < 5.0:
+                            continue   # give at least 5 minutes
 
-                        # Check current P&L
                         _should_close = False
                         _reason = ""
                         try:
@@ -587,43 +844,106 @@ class Scanner:
                             if _pos_data:
                                 _notional = abs(float(_pos_data.get("positionAmt",0))) * float(_pos_data.get("entryPrice",1))
                                 _pnl_pct = float(_pos_data.get("unRealizedProfit",0)) / max(_notional, 1) * 100
-                                if _age >= 1.5:  # 90min hard cap
+                                if _age_min >= 20.0:   # 20min absolute cap regardless of profit
                                     _should_close = True
-                                    _reason = f"90min hard cap (pnl={_pnl_pct:.1f}%)"
-                                elif _age >= 1.0 and _pnl_pct < 0.5:
+                                    _reason = f"20min hard cap (pnl={_pnl_pct:.1f}%)"
+                                elif _age_min >= 15.0 and _pnl_pct < 0.0:  # 15min if in loss
                                     _should_close = True
-                                    _reason = f"60min + low profit ({_pnl_pct:.1f}%)"
+                                    _reason = f"15min + in loss {_pnl_pct:.1f}% → cut"
+                                elif _age_min >= 8.0 and _pnl_pct < -0.1:  # 8min if going negative
+                                    _should_close = True
+                                    _reason = f"8min + going negative {_pnl_pct:.1f}% → exit"
+                                # NOTE: if in profit, let TP/SL handle the exit — don't force-close
                                 else:
-                                    log.info("⏱ %s at %.1fh — profit %.1f%% — extending", _sym, _age, _pnl_pct)
+                                    log.info("⏱ %s at %.0fmin — profit %.2f%% — running",
+                                             _sym, _age_min, _pnl_pct)
                             else:
-                                _should_close = True  # position gone, close record
+                                _should_close = True
                                 _reason = "position already closed"
                         except Exception:
-                            _should_close = _age >= 1.5
+                            _should_close = _age_min >= 15.0
 
                         if _should_close:
                             _side = "SELL" if _amt > 0 else "BUY"
                             _qty  = abs(_amt)
-                            _ft._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _sym})
+                            # Cancel ALL orders first (standard + algo)
                             try:
+                                _ft._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _sym})
                                 _ta = _ft._req("GET", "/fapi/v1/openAlgoOrders", {"symbol": _sym}) or {}
                                 for _tao in (_ta.get("algoOrders",[]) if isinstance(_ta,dict) else []):
                                     _tid = _tao.get("algoId") or _tao.get("orderId")
-                                    if _tid: _ft._req("DELETE", "/fapi/v1/algoOrder", {"symbol": _sym, "algoId": _tid})
+                                    if _tid:
+                                        _ft._req("DELETE", "/fapi/v1/algoOrder",
+                                                 {"symbol": _sym, "algoId": _tid})
                             except Exception: pass
+                            # Market close entire position
                             _close = _ft._req("POST", "/fapi/v1/order", {
                                 "symbol": _sym, "side": _side,
                                 "type": "MARKET", "quantity": _qty,
                                 "reduceOnly": "true",
                             })
                             if isinstance(_close, dict) and "orderId" in _close:
-                                _sp.closed = True
-                                _sp.save(update_fields=["closed"])
-                                log.info("⏱️ TIME-EXIT %s after %.1fh: %s", _sym, _age, _reason)
+                                log.info("⏱️ TIME-EXIT %s after %.0fmin: %s ✅",
+                                         _sym, _age_min, _reason)
+                                # Close ScalpPosition if it exists (don't crash if None)
+                                try:
+                                    if _sp is not None:
+                                        _sp.closed = True
+                                        _sp.save(update_fields=["closed"])
+                                    # Also mark any newer ScalpPosition
+                                    from dashboard.models import ScalpPosition as _SPClose
+                                    _SPClose.objects.filter(symbol=_sym, closed=False).update(
+                                        closed=True, close_reason="TIME_EXIT")
+                                except Exception: pass
                             else:
-                                log.error("Time-exit FAILED %s: %s", _sym, _close)
+                                log.error("⏱️ TIME-EXIT FAILED %s: %s ⚠️", _sym, _close)
         except Exception as _te:
-            log.debug("Time-exit check: %s", _te)
+            log.warning("Time-exit check error: %s", _te)
+
+        # ── Auto-check outcomes for pending signals ──────────────
+        try:
+            from dashboard.management.commands.check_outcomes import (
+                get_candles_5m, determine_outcome_from_candles,
+                get_actual_trades, determine_outcome_from_trades
+            )
+            from dashboard.models import SignalRecord as _SR
+            import os as _os
+            _api_key    = _os.environ.get("BINANCE_API_KEY","")
+            _api_secret = _os.environ.get("BINANCE_API_SECRET","")
+            from datetime import timedelta as _td3
+            _EAT3 = ZoneInfo("Africa/Dar_es_Salaam")
+            _cutoff3 = now - _td3(hours=2)
+            _pending3 = _SR.objects.filter(
+                outcome="PENDING", created_at__gte=_cutoff3)
+            for _sig3 in _pending3:
+                try:
+                    _since3 = int(_sig3.created_at.timestamp() * 1000)
+                    _trades3 = get_actual_trades(
+                        _sig3.symbol, _since3, _api_key, _api_secret)
+                    if _trades3:
+                        _out3, _cp3, _pnl3 = determine_outcome_from_trades(
+                            _sig3, _trades3)
+                    else:
+                        _df3 = get_candles_5m(_sig3.symbol, _since3, 60)
+                        _out3, _cp3 = determine_outcome_from_candles(_sig3, _df3)
+                        if _cp3 and _sig3.entry_price:
+                            _pnl3 = round(
+                                (_cp3 - _sig3.entry_price) / _sig3.entry_price * 100
+                                * (1 if _sig3.signal == "BUY" else -1), 2)
+                        else:
+                            _pnl3 = 0.0
+                    if _out3 != "PENDING":
+                        _sig3.outcome    = _out3
+                        _sig3.profit_pct = _pnl3
+                        _sig3.save(update_fields=["outcome","profit_pct"])
+                        log.info("Outcome: %s %s → %s (%+.2f%%)",
+                                 _sig3.symbol, _sig3.signal, _out3, _pnl3)
+                except Exception as _se3:
+                    log.debug("Outcome check %s: %s", _sig3.symbol, _se3)
+        except Exception as _oe3:
+            log.debug("Auto outcome check: %s", _oe3)
+
+
 
         log.info("Cycle complete")
         self._daily_scan_count += 1
@@ -748,7 +1068,7 @@ class Scanner:
             # --- Build candidates list ---
             # Futures: ALL signals from signal_engine (BUY long + SELL short)
             fut_candidates_new = list(new_signals)
-            # Spot: ONLY spot_signals from SpotSignalEngine (weekly oversold BUY only)
+            # Spot: ONLY spot_signals from SpotSignalEngine (BUY only, no short)
             # Do NOT send futures signals to spot trader — they have different TP/SL logic
             spot_candidates_new = list(spot_signals) if spot_signals else []
 
@@ -858,6 +1178,8 @@ class Scanner:
             # --- Execute FUTURES trades ---
             if fut_on and fut_trader:
                 seen_fut = set()
+                trades_this_cycle = 0          # max 2 new trades per cycle
+                MAX_PER_CYCLE     = 2          # prevents 3 simultaneous losses
                 all_fut  = list(fut_candidates_new) + [_sig_from_rec(r) for r in pending_fut]
                 log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new), len(pending_fut), fut_bal)
                 for sig in all_fut:
@@ -866,12 +1188,51 @@ class Scanner:
                     if grade_key not in ("ULTRA","STRONG","STANDARD"):
                         log.debug("Futures skip %s: grade=%s", sig.symbol, grade_key)
                         continue
-                    # Unlimited mode — no daily cap
-                    # if state.futures_trades_today >= state.futures_max_trades:
-                    #     break
+                    if trades_this_cycle >= MAX_PER_CYCLE:
+                        log.info("Cycle trade limit (%d) reached — deferring %s to next cycle",
+                                 MAX_PER_CYCLE, sig.symbol)
+                        break
+                    try:
+                        from src.trading.binance_trader import BinanceTrader as _BT
+                        from config import load_config as _lc2
+                        _c2 = _lc2()
+                        if _c2.auto.has_keys:
+                            _tmp = _BT(_c2.auto.api_key, _c2.auto.api_secret,
+                                       mode="futures", live=not _c2.auto.testnet)
+                            _open_count = len(_tmp.get_positions())
+                            if _open_count >= 2:
+                                log.info("Max 2 positions cap reached (%d) — protecting capital: skip %s",
+                                         _open_count, sig.symbol)
+                                continue
+                    except Exception:
+                        pass
                     if sig.symbol in seen_fut:
                         continue
                     seen_fut.add(sig.symbol)
+
+                    # Cooldown check — skip pair for 10 min after a loss (Improvement 3.4)
+                    import datetime as _dtc
+                    _cool_until = self._pair_cooldowns.get(sig.symbol)
+                    if _cool_until and _dtc.datetime.now() < _cool_until:
+                        _rem = int((_cool_until - _dtc.datetime.now()).total_seconds() / 60)
+                        log.info("  ⏸ %s in cooldown (%d min remaining) — skipping",
+                                 sig.symbol, _rem)
+                        continue
+
+                    # Double-check simulation before real execution
+                    try:
+                        df_5m_exec = self._bin.get_klines(sig.symbol, "5m", 120)
+                        _exec_sim  = self._sim.simulate(sig, df_5m_exec)
+                        if not _exec_sim.approved:
+                            log.warning(
+                                "🚫 EXEC SIM BLOCKED %s | %s",
+                                sig.symbol, _exec_sim.reason)
+                            continue   # skip — don't execute
+                        log.info("✅ EXEC SIM OK %s WR=%.0f%% E=%+.2f%%",
+                                 sig.symbol, _exec_sim.win_rate*100,
+                                 _exec_sim.expectancy*100)
+                    except Exception as _es:
+                        log.warning("Exec sim error %s: %s", sig.symbol, _es)
 
                     result = fut_trader.execute_signal(sig, fut_bal)
                     # Mark DB record
@@ -924,10 +1285,13 @@ class Scanner:
         return (now - self._last_btc_update).total_seconds() >= self._cfg.alert.btc_update_every_hours * 3600
 
     def _is_in_cooldown(self, symbol: str, now: datetime) -> bool:
-
+        # FIX 5: 4-hour cooldown per symbol regardless of direction.
+        # Report showed GUSDT signaled 6x in one day, MEUSDT 5x — compounding losses.
+        # The cooldown now blocks BOTH BUY and SELL on the same symbol for 4 hours
+        # after any signal (win or loss) to prevent repeated entries on volatile pairs.
         COOLDOWN_SECONDS = max(
             self._cfg.alert.cooldown_hours * 3600,
-            24 * 3600   # minimum 24 hours for swing trading — let the trade breathe
+            5 * 60      # minimum 5 minutes for scalp trade before staleness check
         )
         last = self._cooldowns.get(symbol)
         if last is None:

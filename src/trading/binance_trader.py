@@ -1,19 +1,22 @@
 """
-src/trading/binance_trader.py — v3
-Full automated execution for both SPOT and FUTURES on Binance.
-
-Fixes vs v2:
-  - _daily_loss now tracked correctly after each trade
-  - prec() variable name 's' no longer shadows loop variable
-  - cancel_all_orders uses correct separate paths for GET vs DELETE
-  - OCO validation: checks TP1 > entry > SL before placing
-  - hmac.new → hmac.new (was already correct, confirmed)
+src/trading/binance_trader.py — Institutional Scalp v2
+───────────────────────────────────────────────────────
+Regime-adaptive execution with state machine position management.
 """
-import hmac, hashlib, time, requests
-from urllib.parse import urlencode
+from __future__ import annotations
+
+import hashlib
+import hmac
+import time
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlencode
+
+import pandas as pd
+import requests as _requests
+
 from src.utils.logger import get_logger
+from src.analysis.trade_state_machine import TradeStateMachine
 
 log = get_logger(__name__)
 
@@ -31,6 +34,7 @@ class SymbolInfo:
     min_notional:    float = 5.0
     tick_size:       float = 0.0001
     step_size:       float = 0.001
+    symbol:          str   = ""
 
 
 @dataclass
@@ -55,31 +59,35 @@ class TradeResult:
 
 class BinanceTrader:
 
-    def __init__(self, api_key: str, api_secret: str,
-                 mode: Literal["spot", "futures"] = "spot",
-                 live: bool = False,
-                 risk_pct: float = 2.0,
-                 daily_loss_limit_pct: float = 6.0,
-                 max_trades_per_day: int = 10):
-        self._key          = api_key
-        self._secret       = api_secret
-        self._mode         = mode
-        self._live         = live
-        self._risk         = risk_pct
-        self._loss_limit   = daily_loss_limit_pct
-        self._max_trades   = max_trades_per_day
-        self._daily_loss   = 0.0   # % lost today — updated after each SL hit
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        mode: Literal["spot", "futures"] = "spot",
+        live: bool = False,
+        risk_pct: float = 1.5,
+        daily_loss_limit_pct: float = 6.0,
+        max_trades_per_day: int = 999,
+    ):
+        self._key        = api_key
+        self._secret     = api_secret
+        self._mode       = mode
+        self._live       = live
+        self._risk       = risk_pct
+        self._loss_limit = daily_loss_limit_pct
+        self._max_trades = max_trades_per_day
+        self._daily_loss   = 0.0
         self._daily_trades = 0
         self._sym_cache: dict[str, SymbolInfo] = {}
+        self._state_machine = TradeStateMachine()
 
-        self._base = (_FUT_BASE if live else _FUT_TEST) if mode == "futures" \
-                     else (_SPOT_BASE if live else _SPOT_TEST)
-
+        self._base = (
+            (_FUT_BASE if live else _FUT_TEST) if mode == "futures"
+            else (_SPOT_BASE if live else _SPOT_TEST)
+        )
         log.info("BinanceTrader: %s %s | risk=%.1f%% | loss_limit=%.1f%%",
                  mode.upper(), "LIVE" if live else "TESTNET",
                  risk_pct, daily_loss_limit_pct)
-
-    # ── Public ──────────────────────────────────────────────────
 
     def execute_signal(self, signal, balance_usdt: float) -> TradeResult:
         sym = signal.symbol
@@ -91,29 +99,43 @@ class BinanceTrader:
 
         info    = self._get_symbol_info(sym)
         sl_dist = abs(signal.price - signal.sl) / max(signal.price, 1e-10)
-        # Use ATR-based SL if available (smarter than fixed %)
-        if hasattr(signal, "atr") and signal.atr and signal.atr > 0:
-            atr_sl = (signal.atr * 1.2) / max(signal.price, 1e-10)
-            sl_dist = max(sl_dist, atr_sl)  # use whichever is wider
+        atr_val = getattr(signal, "atr", 0) or 0
+        if atr_val > 0:
+            sl_dist = max(sl_dist, (atr_val * 1.2) / max(signal.price, 1e-10))
         if sl_dist < 0.001:
             return TradeResult(False, sym, signal.signal, 0, signal.price,
                                mode=self._mode, error="SL too close to entry")
 
-        risk_usdt = balance_usdt * (self._risk / 100)
+        # ML-based dynamic risk sizing
+        _ml_p  = float(getattr(signal, "ml_prob",     0) or 0)
+        _sn_p  = float(getattr(signal, "sniper_conf", 1) or 1)
+        # Count open positions for capital scaling
+        try:
+            _open_count = len(self.get_positions()) if self._mode == "futures" else 0
+        except Exception:
+            _open_count = 0
+        if _open_count >= 3:   _cap = 0.50
+        elif _open_count == 2: _cap = 0.65
+        elif _open_count == 1: _cap = 0.80
+        else:                  _cap = 1.00
+        # ML confidence scaling
+        if _ml_p >= 0.75 or _sn_p >= 0.90: _conf = 1.2
+        elif _ml_p >= 0.55 or _sn_p >= 0.65: _conf = 1.0
+        else: _conf = 0.7
+        dyn_risk = max(min(self._risk * _cap * _conf, 2.5), 0.5)
+        log.debug("Risk: ML=%.0f%% sniper=%.0f%% open=%d cap=%.0f%% → %.1f%%",
+                  _ml_p*100, _sn_p*100, _open_count, _cap*100, dyn_risk)
+        risk_usdt = balance_usdt * (dyn_risk / 100)
         pos_usdt  = min(risk_usdt / sl_dist, balance_usdt * 0.25)
-        # If calculated position is below minimum, bump up to minimum notional
-        # This can happen when risk% is low but SL distance is large
+
         if pos_usdt < info.min_notional:
             if balance_usdt >= info.min_notional * 2:
-                # Enough balance — just use the minimum notional
                 pos_usdt = info.min_notional
-                log.info("Position bumped to minimum notional $%.0f for %s",
-                         info.min_notional, sym)
+                log.info("Position bumped to minimum $%.0f for %s", info.min_notional, sym)
             else:
                 return TradeResult(False, sym, signal.signal, 0, signal.price,
                                    mode=self._mode,
-                                   error=f"Balance ${balance_usdt:.2f} too low for minimum "
-                                         f"${info.min_notional:.0f} position on {sym}")
+                                   error=f"Balance ${balance_usdt:.2f} too low for ${info.min_notional:.0f} min on {sym}")
 
         qty = self._fmt_qty(pos_usdt / signal.price, info)
         if qty <= 0:
@@ -123,10 +145,11 @@ class BinanceTrader:
         log.info("AUTO → %s %s mode=%s qty=%s entry=%.6g TP1=%.6g TP2=%.6g TP3=%.6g SL=%.6g",
                  signal.signal, sym, self._mode, qty,
                  signal.price, signal.tp1, signal.tp2, signal.tp3, signal.sl)
+
         try:
-            r = self._spot(sym, signal, qty, info, risk_usdt, pos_usdt) \
-                if self._mode == "spot" \
-                else self._futures(sym, signal, qty, info, risk_usdt, pos_usdt)
+            r = (self._spot(sym, signal, qty, info, risk_usdt, pos_usdt)
+                 if self._mode == "spot"
+                 else self._futures(sym, signal, qty, info, risk_usdt, pos_usdt))
             if r.success:
                 self._daily_trades += 1
             return r
@@ -135,835 +158,861 @@ class BinanceTrader:
             return TradeResult(False, sym, signal.signal, qty, signal.price,
                                mode=self._mode, error=str(e))
 
-    def record_loss(self, loss_pct: float):
-        """Call this when a SL is hit so daily_loss limit is tracked."""
-        self._daily_loss += abs(loss_pct)
-        log.info("Daily loss updated: %.1f%% / %.1f%% limit",
-                 self._daily_loss, self._loss_limit)
-        if self._daily_loss >= self._loss_limit:
-            log.warning("Daily loss limit %.1f%% reached — auto-trade will pause",
-                        self._loss_limit)
+    # ─── protect_open_positions ────────────────────────────────────────
 
-    def cancel_all_orders(self, symbol: str = None) -> dict:
-        cancelled, errors = [], []
+
+    def cancel_orphan_orders(self) -> list:
+        """Cancel all open orders for symbols with no open position."""
+        cancelled = []
         try:
-            # Separate paths for GET (list) and DELETE (cancel)
-            if self._mode == "futures":
-                get_path = "/fapi/v1/openOrders"
-                del_path = "/fapi/v1/allOpenOrders"
-            else:
-                get_path = "/api/v3/openOrders"
-                del_path = "/api/v3/openOrders"   # same path, DELETE method
+            if self._mode != 'futures': return []
+            live = {p['symbol'] for p in self.get_positions()
+                    if abs(float(p.get('positionAmt', 0))) > 0}
+            for o in self.get_open_orders():
+                sym = o.get('symbol', '')
+                if sym and sym not in live:
+                    self._req('DELETE', '/fapi/v1/allOpenOrders', {'symbol': sym})
+                    log.info('🧹 Orphan orders cancelled for %s (no position)', sym)
+                    cancelled.append(sym)
+        except Exception as _e:
+            log.debug('Orphan cleanup: %s', _e)
+        return list(set(cancelled))
 
-            if symbol:
-                self._req("DELETE", del_path, {"symbol": symbol})
-                cancelled.append(symbol)
-            else:
-                open_orders = self._req("GET", get_path, {}) or []
-                syms = set(o["symbol"] for o in open_orders)
-                for s in syms:
+    def protect_open_positions(self, signal_lookup: dict) -> list:
+        if self._mode != "futures":
+            return []
+        protected = []
+        try:
+            positions   = self.get_positions()
+            open_orders = self.get_open_orders() or []
+            total_orders = len(open_orders)
+
+            # Duplicate cleanup — each position can have up to 8 orders legitimately
+            max_ok = max(len(positions) * 8, 20)
+            if total_orders > max_ok and positions:
+                log.warning("Duplicate orders (%d > %d) — cancelling all to reset",
+                            total_orders, max_ok)
+                for _pos in positions:
+                    _s = _pos.get("symbol", "")
+                    if _s:
+                        self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _s})
+                        try:
+                            algos = self._req("GET", "/fapi/v1/openAlgoOrders", {"symbol": _s}) or {}
+                            for ao in (algos.get("algoOrders", []) if isinstance(algos, dict) else []):
+                                aid = ao.get("algoId") or ao.get("orderId")
+                                if aid:
+                                    self._req("DELETE", "/fapi/v1/algoOrder",
+                                              {"symbol": _s, "algoId": aid})
+                        except Exception:
+                            pass
+                open_orders = self.get_open_orders() or []
+                log.info("After cleanup: %d orders", len(open_orders))
+
+            # Build per-symbol order map
+            sym_orders: dict[str, list] = {}
+            for o in open_orders:
+                sym_orders.setdefault(o.get("symbol", ""), []).append(o)
+
+            # Fetch algo orders and merge — SL/TSL placed via algoOrder
+            # live in /fapi/v1/openAlgoOrders, NOT in standard openOrders
+            try:
+                algo_resp = self._req("GET", "/fapi/v1/openAlgoOrders", {}) or {}
+                algo_all  = algo_resp.get("algoOrders", []) if isinstance(algo_resp, dict) else []
+                for ao in algo_all:
+                    _sym  = ao.get("symbol", "")
+                    _type = ao.get("orderType") or ao.get("type", "")
+                    if _sym:
+                        # Normalise to standard order shape for type detection
+                        sym_orders.setdefault(_sym, []).append({
+                            "type":      _type,
+                            "orderId":   ao.get("algoId", ""),
+                            "symbol":    _sym,
+                            "_is_algo":  True,
+                        })
+                if algo_all:
+                    log.debug("Merged %d algo orders into protect map", len(algo_all))
+            except Exception as _ae:
+                log.debug("Algo orders fetch: %s", _ae)
+
+            SL_TYPES  = {"STOP_MARKET", "STOP", "STOP_LOSS", "STOP_LOSS_LIMIT"}
+            TSL_TYPES = {"TRAILING_STOP_MARKET"}
+            TP_TYPES  = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT", "LIMIT"}
+
+            log.info("protect_open_positions: %d positions, %d open orders",
+                     len(positions), len(open_orders))
+
+            for pos in positions:
+                sym = pos.get("symbol", "")
+                amt = float(pos.get("positionAmt", 0))
+                if abs(amt) < 0.0001:
+                    continue
+
+                orders_sym = sym_orders.get(sym, [])
+                has_sl  = any(o.get("type") in SL_TYPES  for o in orders_sym)
+                has_tsl = any(o.get("type") in TSL_TYPES for o in orders_sym)
+                has_tp  = any(o.get("type") in TP_TYPES  for o in orders_sym)
+
+                log.info("  %s: amt=%.4f orders=%d has_tp=%s has_sl=%s has_tsl=%s",
+                         sym, amt, len(orders_sym),
+                         "✅" if has_tp  else "❌",
+                         "✅" if has_sl  else "❌",
+                         "✅" if has_tsl else "❌")
+
+                if has_tp and has_sl and has_tsl:
+                    log.info("  %s: fully protected ✅", sym)
+                    continue
+
+                is_long    = amt > 0
+                close_side = "SELL" if is_long else "BUY"
+                qty        = abs(amt)
+                entry      = float(pos.get("entryPrice", 0))
+                mark       = float(pos.get("markPrice",  entry))
+                unreal     = float(pos.get("unRealizedProfit", 0))
+                notional   = qty * entry if entry > 0 else 1.0
+                pnl_pct    = (unreal / notional * 100) if notional > 0 else 0.0
+                info       = self._get_symbol_info(sym)
+
+                sig = signal_lookup.get(sym)
+                regime = getattr(sig, "regime", "Trending") if sig else "Trending"
+                state  = getattr(sig, "state",  "ACTIVE_INTRADAY") if sig else "ACTIVE_INTRADAY"
+
+                # MACD slope for momentum decay check
+                macd_slope = 0.0
+                try:
+                    klines = self._pub("GET", "/fapi/v1/klines",
+                                       {"symbol": sym, "interval": "5m", "limit": 40})
+                    if klines:
+                        df_ = pd.DataFrame(klines,
+                            columns=["open_time","open","high","low","close","volume",
+                                     "close_time","qt","tr","bb","bq","ig"])
+                        df_ = df_[["close"]].astype(float)
+                        macd_slope = self._macd_histogram_slope(df_)
+                except Exception: pass
+
+                # State machine decision
+                new_state, action = self._state_machine.update_state(
+                    state, regime, pnl_pct,
+                    getattr(sig, "atr", 0) if sig else 0,
+                    macd_slope, mark,
+                )
+
+                if action == "EXIT":
+                    # Safety: never state-exit a trade that opened < 5 min ago
+                    # This prevents immediately killing freshly placed trades
                     try:
-                        self._req("DELETE", del_path, {"symbol": s})
-                        cancelled.append(s)
-                    except Exception as e:
-                        errors.append(f"{s}: {e}")
-            log.warning("EMERGENCY STOP — cancelled orders for: %s", cancelled)
+                        from dashboard.models import ScalpPosition as _SPE
+                        import datetime as _dte
+                        _sp_e = _SPE.objects.filter(symbol=sym, closed=False).first()
+                        if _sp_e and _sp_e.opened_at:
+                            _age_s = (_dte.datetime.now(_dte.timezone.utc) -
+                                      _sp_e.opened_at.astimezone(_dte.timezone.utc)).total_seconds()
+                            if _age_s < 300:  # < 5 minutes old
+                                log.info("  %s STATE-EXIT deferred (%.0fs old < 5min)", sym, _age_s)
+                                action = "HOLD"   # skip exit, continue to protection
+                    except Exception:
+                        pass
+
+                if action == "EXIT":
+                    self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": sym})
+                    self._req("POST", "/fapi/v1/order", {
+                        "symbol": sym, "side": close_side,
+                        "type": "MARKET", "quantity": qty, "reduceOnly": "true",
+                    })
+                    log.info("  %s STATE-EXIT | State=%s→%s | PnL=%.2f%%",
+                             sym, state, new_state, pnl_pct)
+                    continue
+
+                # Break-even after TP1 fills
+                tp_remaining = [o for o in orders_sym if o.get("type") in TP_TYPES]
+                be_set = any(
+                    o.get("type") in SL_TYPES and entry > 0 and
+                    abs(float(o.get("stopPrice") or 0) - entry) / max(entry, 1e-10) < 0.005
+                    for o in orders_sym
+                )
+                if len(tp_remaining) <= 1 and has_sl and not be_set and entry > 0:
+                    be_p  = self._fp(entry*(1.002 if is_long else 0.998), info)
+                    be_st = self._fp(entry*(1.001 if is_long else 0.999), info)
+                    be_q  = self._fmt_qty(qty * 0.6, info)
+                    if be_p > 0 and be_q >= info.min_qty:
+                        r_ = self._req("POST", "/fapi/v1/order", {
+                            "symbol": sym, "side": close_side, "type": "STOP",
+                            "stopPrice": be_st, "price": be_p,
+                            "quantity": be_q, "timeInForce": "GTC", "reduceOnly": "true",
+                        })
+                        if isinstance(r_, dict) and "orderId" in r_:
+                            log.info("  %s: TP1 filled → break-even @ %.6g ✅", sym, be_p)
+
+                # ── TRAILING TP: move SL to lock profit when trade running well ──
+                # When PnL > 0.4%: cancel existing SL + replace with tighter one
+                # This prevents giving back gains when position is in profit
+                if pnl_pct >= 0.4 and has_sl and entry > 0 and mark > 0:
+                    # New SL = lock in 0.2% minimum profit (was at entry or below)
+                    trail_lock_pct = 0.002   # lock 0.2% minimum
+                    new_sl_p = self._fp(
+                        entry * (1 + trail_lock_pct) if is_long
+                        else entry * (1 - trail_lock_pct), info
+                    )
+                    # Only update if new SL is better than existing
+                    existing_sl = next(
+                        (float(o.get("stopPrice") or 0)
+                         for o in orders_sym if o.get("type") in SL_TYPES), 0)
+                    should_update = (
+                        (is_long  and new_sl_p > existing_sl > 0) or
+                        (not is_long and 0 < new_sl_p < existing_sl)
+                    )
+                    if should_update:
+                        try:
+                            # Cancel old SL orders
+                            for o in orders_sym:
+                                if o.get("type") in SL_TYPES:
+                                    _oid = o.get("orderId") or o.get("algoId")
+                                    if _oid:
+                                        self._req("DELETE", "/fapi/v1/algoOrder",
+                                                  {"symbol": sym, "algoId": _oid})
+                            # Place tighter SL
+                            _nsl_ap = self._algo_params({
+                                "symbol": sym, "side": close_side,
+                                "type": "STOP_MARKET", "stopPrice": new_sl_p,
+                                "quantity": self._fmt_qty(qty, info),
+                                "workingType": "MARK_PRICE", "reduceOnly": "true",
+                            })
+                            _nsl_r = self._req("POST", "/fapi/v1/algoOrder", _nsl_ap) or {}
+                            if _nsl_r.get("algoId") or _nsl_r.get("orderId"):
+                                log.info("  %s: trailing SL moved to %.6g (pnl=%.2f%%) ✅",
+                                         sym, new_sl_p, pnl_pct)
+                        except Exception as _tsl_e:
+                            log.debug("Trailing SL update: %s", _tsl_e)
+
+                # Micro trailing at +0.25% profit (Improvement 3.2)
+                # Locks small wins before TP1, prevents reversals eating profit
+                if pnl_pct >= 0.25 and not has_tsl and entry > 0 and mark > 0:
+                    micro_qty = self._fmt_qty(qty * 0.4, info)
+                    if micro_qty >= info.min_qty:
+                        micro_act = self._fp(mark * (1.001 if is_long else 0.999), info)
+                        m_ap = self._algo_params({
+                            "symbol": sym, "side": close_side,
+                            "type": "TRAILING_STOP_MARKET",
+                            "quantity": micro_qty, "callbackRate": 0.25,
+                            "activatePrice": micro_act,
+                            "workingType": "MARK_PRICE", "reduceOnly": "true",
+                        })
+                        mr = self._req("POST", "/fapi/v1/algoOrder", m_ap) or {}
+                        if mr.get("algoId") or mr.get("orderId"):
+                            log.info("  %s: micro TSL 0.25%% @ pnl=%.2f%% ✅", sym, pnl_pct)
+
+                # Regime-adaptive trailing stop
+                if not has_tsl:
+                    atr_v = getattr(sig, "atr", entry * 0.015) if sig else entry * 0.015
+                    atr_mult = (1.4 if regime == "Strong_Trend_Impulse" else
+                                2.1 if regime == "Trending" else
+                                1.2)   # tighter in choppy
+                    trail_dist = (atr_v or entry * 0.015) * atr_mult
+                    act_p      = self._fp(
+                        mark - trail_dist if is_long else mark + trail_dist, info)
+                    tsl_qty = self._fmt_qty(qty * 0.6, info)
+                    if tsl_qty >= info.min_qty and act_p > 0:
+                        tsl_r = self._order({
+                            "symbol": sym, "side": close_side,
+                            "type": "TRAILING_STOP_MARKET",
+                            "quantity": tsl_qty, "callbackRate": 0.5,
+                            "activationPrice": act_p,
+                            "workingType": "MARK_PRICE", "reduceOnly": "true",
+                        })
+                        if isinstance(tsl_r, dict) and "orderId" in tsl_r:
+                            log.info("  %s: TSL placed (%s × %.1f) ✅", sym, regime, atr_mult)
+
+                # Place SL if missing
+                if not has_sl:
+                    # Calculate SL from entry if no signal available
+                    if sig:
+                        sl_p = self._fp(getattr(sig, "sl", 0), info)
+                    else:
+                        # Default SL: 0.8% from entry
+                        sl_p = self._fp(entry * (0.992 if is_long else 1.008), info)
+
+                    if sl_p > 0:
+                        sl_q = self._fmt_qty(qty, info)
+                        if sl_q >= info.min_qty:
+                            # Use algoOrder directly — avoids -4120
+                            sl_ap = self._algo_params({
+                                "symbol": sym, "side": close_side,
+                                "type": "STOP_MARKET", "stopPrice": sl_p,
+                                "quantity": sl_q, "workingType": "MARK_PRICE",
+                                "reduceOnly": "true",
+                            })
+                            sl_r = self._req("POST", "/fapi/v1/algoOrder", sl_ap) or {}
+                            sl_ok = sl_r.get("algoId") or sl_r.get("orderId") if isinstance(sl_r, dict) else None
+                            if sl_ok:
+                                log.info("  %s: SL placed @ %.6g id=%s ✅", sym, sl_p, sl_ok)
+                            else:
+                                # Fallback: STOP_MARKET on regular endpoint
+                                sl_r2 = self._req("POST", "/fapi/v1/order", {
+                                    "symbol": sym, "side": close_side,
+                                    "type": "STOP_MARKET", "stopPrice": sl_p,
+                                    "quantity": sl_q, "workingType": "MARK_PRICE",
+                                    "reduceOnly": "true",
+                                })
+                                if isinstance(sl_r2, dict) and "orderId" in sl_r2:
+                                    log.info("  %s: SL (fallback) @ %.6g ✅", sym, sl_p)
+                                else:
+                                    # Final fallback: STOP_LIMIT (supported even without algoOrder)
+                                    try:
+                                        _lmt_px = round(sl_p * (0.997 if close_side == "SELL" else 1.003), 8)
+                                        sl_r3 = self._req("POST", "/fapi/v1/order", {
+                                            "symbol": sym, "side": close_side,
+                                            "type": "STOP", "quantity": str(round(sl_q, 8)),
+                                            "price": str(_lmt_px), "stopPrice": str(sl_p),
+                                            "timeInForce": "GTC", "reduceOnly": "true",
+                                        })
+                                        if isinstance(sl_r3, dict) and "orderId" in sl_r3:
+                                            log.info("  %s: SL (STOP_LIMIT last resort) @ %.6g ✅", sym, sl_p)
+                                        else:
+                                            log.error("  %s: SL FAILED all 3 methods — position runs without SL ⚠️", sym)
+                                    except Exception as _sl3_e:
+                                        log.error("  %s: SL FAILED all methods: %s ⚠️", sym, _sl3_e)
+
+                # Place TP orders if missing
+                if not has_tp and sig:
+                    tp_targets = [
+                        (getattr(sig, "tp1", 0), qty*0.50, "TP1"),   # 50% at TP1
+                        (getattr(sig, "tp2", 0), qty*0.30, "TP2"),   # 30% at TP2
+                        (getattr(sig, "tp3", 0), qty*0.20, "TP3"),   # 20% runner
+                    ]
+                    for tp_price, tp_qty_raw, tp_lbl in tp_targets:
+                        tp_p = self._fp(tp_price, info)
+                        tp_q = self._fmt_qty(tp_qty_raw, info)
+                        if tp_p <= 0 or tp_q < info.min_qty: continue
+                        r_ = self._order({
+                            "symbol": sym, "side": close_side,
+                            "type": "TAKE_PROFIT_MARKET",
+                            "stopPrice": tp_p, "quantity": tp_q,
+                            "workingType": "MARK_PRICE", "reduceOnly": "true",
+                        })
+                        if isinstance(r_, dict) and "orderId" in r_:
+                            log.info("  %s: %s placed @ %.6g ✅", sym, tp_lbl, tp_p)
+
+                protected.append(sym)
+                log.info("  %s: protected ✅ | State=%s→%s | PnL=%.2f%%",
+                         sym, state, new_state, pnl_pct)
+
         except Exception as e:
-            log.error("Emergency stop error: %s", e)
-            errors.append(str(e))
-        return {"cancelled": cancelled, "errors": errors}
+            log.error("protect_open_positions error: %s", e, exc_info=True)
 
-    def get_available_balance(self) -> float:
-        """Returns available USDT as a plain float — use this for trading decisions."""
-        info = self.get_balance()
-        return float(info.get("available_balance", 0) or 0)
-
-    def get_balance(self) -> dict:
-        """
-        Returns dict with wallet_balance, available_balance, unrealised_pnl.
-        wallet_balance = total USDT deposited (stable, use for display).
-        available_balance = free margin (fluctuates with open positions).
-        """
-        result = {"wallet_balance": 0.0, "available_balance": 0.0,
-                  "unrealised_pnl": 0.0, "error": ""}
+        # After protect loop: cleanup orphan orders (positions that closed since last cycle)
         try:
-            if self._mode == "futures":
-                assets = self._req("GET", "/fapi/v2/balance", {}) or []
-                for a in assets:
-                    if a.get("asset") == "USDT":
-                        result["wallet_balance"]    = float(a.get("balance",           0))
-                        result["available_balance"] = float(a.get("availableBalance",  0))
-                        result["unrealised_pnl"]    = float(a.get("crossUnPnl",        0))
-                        log.info("Futures wallet=$%.2f available=$%.2f pnl=%+.2f",
-                                 result["wallet_balance"],
-                                 result["available_balance"],
-                                 result["unrealised_pnl"])
-                        return result
-            else:
-                acct = self._req("GET", "/api/v3/account", {}) or {}
-                for a in acct.get("balances", []):
-                    if a["asset"] == "USDT":
-                        result["wallet_balance"]    = float(a["free"]) + float(a["locked"])
-                        result["available_balance"] = float(a["free"])
-                        return result
-        except Exception as e:
-            log.error("Balance error: %s", e)
-            result["error"] = str(e)
-        return result
+            orphans = self.cancel_orphan_orders()
+            if orphans:
+                log.info("🧹 Orphan orders cleaned up for: %s", orphans)
+        except Exception as _oe:
+            log.debug("Orphan cleanup in protect: %s", _oe)
 
-    def _order(self, params: dict) -> dict:
-        """Smart order routing:
-        - TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET → /fapi/v1/algoOrder
-        - MARKET, LIMIT, STOP → /fapi/v1/order
-        """
-        if self._mode != "futures":
-            return self._req("POST", "/api/v3/order", params) or {}
+        return protected
 
-        otype = params.get("type", "")
-        algo_types = {"TAKE_PROFIT_MARKET", "STOP_MARKET", "TRAILING_STOP_MARKET",
-                      "TAKE_PROFIT", "STOP"}
+    # ─── MACD slope helper ──────────────────────────────────────────────
 
-        if otype in algo_types:
-            # Build algo order params — different field names from standard order
-            algo = {
-                "algoType":   "CONDITIONAL",
-                "symbol":     params["symbol"],
-                "side":       params["side"],
-                "type":       otype,
-                "timeInForce": params.get("timeInForce", "GTC"),
-            }
-            # triggerPrice (algo) = stopPrice (standard)
-            stop_p = params.get("stopPrice") or params.get("triggerPrice")
-            if stop_p:
-                algo["triggerPrice"] = stop_p
-
-            # price for TAKE_PROFIT / STOP limit types
-            if params.get("price"):
-                algo["price"] = params["price"]
-
-            # quantity (not used with closePosition=true)
-            close_pos = str(params.get("closePosition", "false")).lower() == "true"
-            if close_pos:
-                algo["closePosition"] = "true"
-            elif params.get("quantity"):
-                algo["quantity"]   = params["quantity"]
-                algo["reduceOnly"] = params.get("reduceOnly", "true")
-
-            if params.get("workingType"):
-                algo["workingType"] = params["workingType"]
-            if params.get("priceProtect"):
-                algo["priceProtect"] = params["priceProtect"]
-            # Trailing stop fields
-            if params.get("callbackRate"):
-                algo["callbackRate"] = params["callbackRate"]
-            if params.get("activationPrice") or params.get("activatePrice"):
-                algo["activatePrice"] = params.get("activationPrice") or params.get("activatePrice")
-
-            r = self._req("POST", "/fapi/v1/algoOrder", algo) or {}
-            # algoOrder returns algoId, not orderId — normalise response
-            if isinstance(r, dict) and "algoId" in r and "orderId" not in r:
-                r["orderId"] = r["algoId"]
-            return r
-
-        # Standard order (MARKET, LIMIT, STOP)
-        return self._req("POST", "/fapi/v1/order", params) or {}
-
-    def get_open_orders(self, symbol: str = None) -> list:
-        """Returns ALL open orders including algo orders (TP/SL/TSL placed via algoOrder)."""
+    def _macd_histogram_slope(self, df: pd.DataFrame, period: int = 5) -> float:
         try:
-            params = {"symbol": symbol} if symbol else {}
-            # Standard orders
-            path   = "/fapi/v1/openOrders" if self._mode == "futures" else "/api/v3/openOrders"
-            result = self._req("GET", path, params)
-            orders = result if isinstance(result, list) else []
+            ema12 = df["close"].ewm(span=12, adjust=False).mean()
+            ema26 = df["close"].ewm(span=26, adjust=False).mean()
+            macd_ = ema12 - ema26
+            sig_  = macd_.ewm(span=9, adjust=False).mean()
+            hist  = macd_ - sig_
+            if len(hist) < period+1: return 0.0
+            return float((hist.iloc[-1] - hist.iloc[-period]) / period)
+        except Exception:
+            return 0.0
 
-            # Algo orders (futures only) — TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET
-            if self._mode == "futures":
-                algo = self._req("GET", "/fapi/v1/openAlgoOrders", params)
-                if isinstance(algo, dict):
-                    # Response: {"total": N, "algoOrders": [...]}
-                    algo_list = algo.get("algoOrders", algo.get("orders", []))
-                elif isinstance(algo, list):
-                    algo_list = algo
-                else:
-                    algo_list = []
-                # Normalise algo order fields to match standard order format
-                for o in algo_list:
-                    if "algoId" in o and "orderId" not in o:
-                        o["orderId"] = o["algoId"]
-                    if "triggerPrice" in o and "stopPrice" not in o:
-                        o["stopPrice"] = o["triggerPrice"]
-                    if "orderType" in o and "type" not in o:
-                        o["type"] = o["orderType"]
-                orders = orders + algo_list
-            return orders
-        except Exception as e:
-            log.error("Open orders error: %s", e)
-            return []
-
-    def get_positions(self) -> list:
-        if self._mode != "futures":
-            return []
-        try:
-            pos = self._req("GET", "/fapi/v2/positionRisk", {}) or []
-            return [p for p in pos if float(p.get("positionAmt", 0)) != 0]
-        except Exception as e:
-            log.error("Positions error: %s", e)
-            return []
-
-    def reset_daily_counters(self):
-        self._daily_trades = 0
-        self._daily_loss   = 0.0
-        log.info("Daily counters reset")
-
-    # ── Spot ────────────────────────────────────────────────────
+    # ─── SPOT ───────────────────────────────────────────────────────────
 
     def _spot(self, sym, signal, qty, info, risk_usdt, pos_usdt) -> TradeResult:
         if signal.signal != "BUY":
-            return TradeResult(False, sym, signal.signal, qty, signal.price, mode="spot",
-                               error="SELL signals not supported on spot. Enable futures mode.")
-
-        # Validate levels before placing any order
+            return TradeResult(False, sym, signal.signal, qty, signal.price,
+                               mode="spot", error="SELL not supported on spot")
         if signal.tp1 <= signal.price:
-            return TradeResult(False, sym, signal.signal, qty, signal.price, mode="spot",
-                               error=f"TP1 ({signal.tp1}) must be above entry ({signal.price})")
-        if signal.sl >= signal.price:
-            return TradeResult(False, sym, signal.signal, qty, signal.price, mode="spot",
-                               error=f"SL ({signal.sl}) must be below entry ({signal.price})")
+            return TradeResult(False, sym, signal.signal, qty, signal.price,
+                               mode="spot", error="TP1 must be above entry")
 
-        # Market BUY
-        buy = self._req("POST", "/api/v3/order", {
-            "symbol": sym, "side": "BUY", "type": "MARKET", "quantity": qty,
-        })
+        buy = self._req("POST", "/api/v3/order",
+                        {"symbol": sym, "side": "BUY", "type": "MARKET", "quantity": qty})
         if not buy or "orderId" not in buy:
             raise Exception(f"Market BUY rejected: {buy}")
+
         fills      = buy.get("fills", [])
         fill_price = float(fills[0]["price"]) if fills else signal.price
         entry_id   = str(buy["orderId"])
-        log.info("Spot BUY: %s qty=%s @ %.6g id=%s", sym, qty, fill_price, entry_id)
 
-        q_oco = self._fmt_qty(qty * 0.40, info)
-        q_tp2 = self._fmt_qty(qty * 0.35, info)
-        q_tp3 = self._fmt_qty(qty * 0.25, info)
-        tp1_p = self._fp(signal.tp1, info)
-        tp2_p = self._fp(signal.tp2, info)
-        tp3_p = self._fp(signal.tp3, info)
-        sl_p  = self._fp(signal.sl,  info)
-        sl_lim= self._fp(signal.sl * 0.998, info)
-
-        # OCO: TP1 limit + SL stop-limit
+        q_oco = self._fmt_qty(qty*0.40, info)
         oco_id = tp1_id = sl_id = ""
         if q_oco >= info.min_qty:
             oco = self._req("POST", "/api/v3/order/oco", {
                 "symbol": sym, "side": "SELL", "quantity": q_oco,
-                "price": tp1_p,              # take-profit limit
-                "stopPrice": sl_p,           # stop trigger
-                "stopLimitPrice": sl_lim,    # stop limit fill
+                "price": self._fp(signal.tp1, info),
+                "stopPrice": self._fp(signal.sl, info),
+                "stopLimitPrice": self._fp(signal.sl*0.998, info),
                 "stopLimitTimeInForce": "GTC",
             })
             if oco:
                 oco_id = str(oco.get("orderListId", ""))
                 orders = oco.get("orders", [])
                 tp1_id = str(orders[0]["orderId"]) if orders else ""
-                sl_id  = str(orders[1]["orderId"]) if len(orders) > 1 else ""
-                log.info("OCO placed: %s TP1=%s SL=%s oco=%s", sym, tp1_id, sl_id, oco_id)
-            else:
-                log.error("OCO FAILED for %s — position has NO stop-loss!", sym)
+                sl_id  = str(orders[1]["orderId"]) if len(orders)>1 else ""
 
-        tp2_id = ""
-        if q_tp2 >= info.min_qty:
-            r = self._req("POST", "/api/v3/order", {
-                "symbol": sym, "side": "SELL", "type": "LIMIT",
-                "timeInForce": "GTC", "quantity": q_tp2, "price": tp2_p,
-            })
-            tp2_id = str((r or {}).get("orderId", ""))
-            log.info("TP2: %s qty=%s @ %s id=%s", sym, q_tp2, tp2_p, tp2_id)
+        q_tp2=self._fmt_qty(qty*0.35,info); q_tp3=self._fmt_qty(qty*0.25,info)
+        tp2_id=tp3_id=""
+        if q_tp2>=info.min_qty:
+            r=self._req("POST","/api/v3/order",{"symbol":sym,"side":"SELL","type":"LIMIT",
+                "timeInForce":"GTC","quantity":q_tp2,"price":self._fp(signal.tp2,info)})
+            tp2_id=str((r or {}).get("orderId",""))
+        if q_tp3>=info.min_qty:
+            r=self._req("POST","/api/v3/order",{"symbol":sym,"side":"SELL","type":"LIMIT",
+                "timeInForce":"GTC","quantity":q_tp3,"price":self._fp(signal.tp3,info)})
+            tp3_id=str((r or {}).get("orderId",""))
 
-        tp3_id = ""
-        if q_tp3 >= info.min_qty:
-            r = self._req("POST", "/api/v3/order", {
-                "symbol": sym, "side": "SELL", "type": "LIMIT",
-                "timeInForce": "GTC", "quantity": q_tp3, "price": tp3_p,
-            })
-            tp3_id = str((r or {}).get("orderId", ""))
-            log.info("TP3: %s qty=%s @ %s id=%s", sym, q_tp3, tp3_p, tp3_id)
-
+        log.info("Spot BUY %s qty=%.4f @ %.6g OCO=%s SL=%s TP2=%s TP3=%s",
+                 sym, qty, fill_price, oco_id, sl_id, tp2_id, tp3_id)
         return TradeResult(True, sym, "BUY", qty, fill_price, mode="spot",
-                           position_usdt=round(pos_usdt, 2), risk_usdt=round(risk_usdt, 2),
+                           position_usdt=round(pos_usdt,2), risk_usdt=round(risk_usdt,2),
                            entry_order_id=entry_id, oco_id=oco_id,
                            tp1_order_id=tp1_id, tp2_order_id=tp2_id,
                            tp3_order_id=tp3_id, sl_order_id=sl_id)
 
-    # ── Futures (ONE-WAY MODE) ──────────────────────────────────
-    # Always uses one-way mode (no positionSide parameter).
-    # BUY = open long, SELL = open short.
-    # If same symbol has open position in opposite direction,
-    # the new order will reduce/close it first (Binance default).
+    # ─── FUTURES ────────────────────────────────────────────────────────
 
     def _futures(self, sym, signal, qty, info, risk_usdt, pos_usdt) -> TradeResult:
         is_long    = signal.signal == "BUY"
-        side       = "BUY"  if is_long else "SELL"
+        side       = "BUY" if is_long else "SELL"
         close_side = "SELL" if is_long else "BUY"
 
-        # Validate signal levels
-        if is_long and signal.tp1 <= signal.price:
-            return TradeResult(False, sym, signal.signal, qty, signal.price, mode="futures",
-                               error=f"TP1 {signal.tp1:.6g} must be above entry {signal.price:.6g}")
-        if not is_long and signal.tp1 >= signal.price:
-            return TradeResult(False, sym, signal.signal, qty, signal.price, mode="futures",
-                               error=f"TP1 {signal.tp1:.6g} must be below entry {signal.price:.6g}")
-
-        # Set leverage (conservative: 2x bear, 3x bull)
-        lev = 3 if getattr(signal, "btc_score", 50) >= 62 else 2
+        btc_score = getattr(signal, "btc_score", 50)
+        regime    = getattr(signal, "regime", "Trending")
+        lev = 3 if btc_score >= 62 or regime == "Strong_Trend_Impulse" else 2
         self._req("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": lev})
 
-        # NEVER attempt to switch position mode — use account's current mode as-is
-        # One-way mode: no positionSide field in any order
+        # 70% market entry (immediate) + 30% limit at slight pullback
+        # Improvement 5.3: improves average entry price, reduces drawdown
+        qty_market = self._fmt_qty(qty * 0.70, info)
+        qty_limit  = self._fmt_qty(qty * 0.30, info)
+        if qty_limit < info.min_qty:   # too small for limit — go all market
+            qty_market = qty; qty_limit = 0
 
-        # Market entry — ONE-WAY MODE (no positionSide)
-        entry = self._req("POST", "/fapi/v1/order", {
-            "symbol":   sym,
-            "side":     side,
-            "type":     "MARKET",
-            "quantity": qty,
-        })
-        if not entry or "orderId" not in entry:
-            raise Exception(f"Futures {side} rejected: {entry}")
-        entry_id   = str(entry["orderId"])
-        fill_price = float(entry.get("avgPrice", signal.price)) or signal.price
-        log.info("Futures %s %s: qty=%s @ %.6g lev=%dx id=%s",
-                 "LONG" if is_long else "SHORT", sym, qty, fill_price, lev, entry_id)
+        entry_resp = self._req("POST", "/fapi/v1/order",
+                               {"symbol": sym, "side": side, "type": "MARKET",
+                                "quantity": qty_market})
+        if not entry_resp or "orderId" not in entry_resp:
+            raise Exception(f"Futures {side} rejected: {entry_resp}")
 
-        # Position split:
-        #   TP1 → 40% at TP1 level (quick profit lock)
-        #   TP2 → 35% at TP2 level (main target)
-        #   SL  → closePosition=true (closes ALL remaining when hit)
-        #   TSL → 25% trailing stop, activates at TP1 (protects runner)
-        # Total explicit qty = 75% (TP1+TP2). SL closes whatever is left.
-        # This avoids -2010 "would reduce too much" error.
-        q_tp1 = self._fmt_qty(qty * 0.40, info)
-        q_tp2 = self._fmt_qty(qty * 0.35, info)
-        q_tp3 = self._fmt_qty(qty * 0.15, info)
-        q_tsl = self._fmt_qty(qty * 0.10, info)
-        tp1_p = self._fp(signal.tp1, info)
-        tp2_p = self._fp(signal.tp2, info)
-        tp3_p = self._fp(signal.tp3, info)
+        entry_id   = str(entry_resp["orderId"])
+        fill_price = float(entry_resp.get("avgPrice", signal.price)) or signal.price
 
-        # ATR-based SL: use 1.2x ATR(4H) for dynamic stop
-        # This is wider in volatile markets (won't get noise-stopped)
-        # and tighter in calm markets
-        atr_val = getattr(signal, "atr", 0) or 0
-        if atr_val > 0:
-            atr_sl_dist = atr_val * 1.2
-            if is_long:
-                atr_sl_price = self._fp(fill_price - atr_sl_dist, info)
+        # Place 30% limit at 0.1% better price
+        if qty_limit >= info.min_qty:
+            limit_p = self._fp(fill_price * (0.999 if is_long else 1.001), info)
+            lim_r = self._req("POST", "/fapi/v1/order", {
+                "symbol": sym, "side": side, "type": "LIMIT",
+                "price": limit_p, "quantity": qty_limit,
+                "timeInForce": "GTC",
+            })
+            if isinstance(lim_r, dict) and "orderId" in lim_r:
+                log.info("Futures limit entry (30%%) @ %.6g id=%s ✅", limit_p, lim_r["orderId"])
             else:
-                atr_sl_price = self._fp(fill_price + atr_sl_dist, info)
-            # Use ATR-based SL only if tighter than signal SL (safety)
-            signal_sl = self._fp(signal.sl, info)
-            if is_long:
-                sl_p = max(atr_sl_price, signal_sl) if signal_sl > 0 else atr_sl_price
-            else:
-                sl_p = min(atr_sl_price, signal_sl) if signal_sl > 0 else atr_sl_price
-            log.debug("ATR SL: %.6g (atr=%.4g × 1.2)", sl_p, atr_val)
-        else:
-            sl_p = self._fp(signal.sl, info)
+                # Limit failed — add to market order qty
+                log.debug("Limit entry failed — using full market qty")
 
-        def _place_tp(label, stop_p, q) -> str:
-            if q < info.min_qty:
-                return ""
-            if stop_p <= 0:
-                log.error("TP %s skipped — price is 0", label)
-                return ""
-            # Attempt order types in order: algo → limit
-            attempts = [
-                ("TAKE_PROFIT_MARKET", {
-                    "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
-                    "stopPrice": stop_p, "quantity": q, "timeInForce": "GTC",
-                    "workingType": "MARK_PRICE", "priceProtect": "true", "reduceOnly": "true",
-                }),
-                ("LIMIT", {
-                    "symbol": sym, "side": close_side, "type": "LIMIT",
-                    "price": stop_p, "quantity": q,
-                    "timeInForce": "GTC", "reduceOnly": "true",
-                }),
-            ]
-            for name, params in attempts:
-                # _order() routes TAKE_PROFIT_MARKET → /fapi/v1/algoOrder automatically
-                # This avoids the -4120 error from hitting /fapi/v1/order with algo types
-                r = self._order(params)
-                if isinstance(r, dict) and "orderId" in r:
-                    log.info("Futures %s (%s) @ %.6g qty=%s id=%s ✅", label, name, stop_p, q, r["orderId"])
-                    return str(r["orderId"])
-                code = r.get("code", 0) if isinstance(r, dict) else 0
-                if code in (-4120, -1104, -4045) and name != "LIMIT":
-                    log.warning("Futures %s: algo rejected (code %d) → LIMIT fallback", label, code)
-                    continue
-                log.error("Futures %s FAILED (%s) @ %.6g: code=%d", label, name, stop_p, code)
-                return ""
+        # TP distribution: 50/30/20 — secure 50% profit early (Improvement 3.3)
+        q_tp1=self._fmt_qty(qty*0.50,info)
+        q_tp2=self._fmt_qty(qty*0.30,info)
+        q_tp3=self._fmt_qty(qty*0.20,info)
+
+        def _place_tp(lbl, stop_p, q):
+            """LIMIT order — universal, no -4120 issues."""
+            if q < info.min_qty or stop_p <= 0: return ""
+            r = self._req("POST", "/fapi/v1/order", {
+                "symbol": sym, "side": close_side, "type": "LIMIT",
+                "price": stop_p, "quantity": q,
+                "timeInForce": "GTC", "reduceOnly": "true",
+            })
+            if isinstance(r, dict) and "orderId" in r:
+                log.info("Futures %s (LIMIT) @ %.6g qty=%s id=%s ✅", lbl, stop_p, q, r["orderId"])
+                return str(r["orderId"])
+            log.warning("Futures %s failed: %s", lbl, r)
             return ""
 
-        tp1_id = _place_tp("TP1", tp1_p, q_tp1)
-        tp2_id = _place_tp("TP2", tp2_p, q_tp2)
-        tp3_id = _place_tp("TP3", tp3_p, q_tp3)
-
-        # ── Hard Stop-Loss: closePosition=true, NO quantity, NO reduceOnly ──
-        # closePosition closes 100% of remaining position (no qty needed, avoids conflicts)
-        sl_id = ""
-        if sl_p <= 0:
-            log.error("Futures SL skipped — price is 0 for %s", sym)
+        tp1_id = _place_tp("TP1", self._fp(signal.tp1, info), q_tp1)
+        tp2_id = _place_tp("TP2", self._fp(signal.tp2, info), q_tp2)
+        # TP3: skip when using staged 70/30 entry — 30% limit not yet filled
+        # Placing reduceOnly for full qty when only 70% filled = -2022 error
+        # TP3 is placed later by protect loop after limit fills
+        tp3_id = ""
+        if qty_limit < info.min_qty:   # no staged entry = safe to place TP3
+            if q_tp3 >= info.min_qty:
+                tp3_id = _place_tp("TP3", self._fp(signal.tp3, info), q_tp3)
         else:
-            # SL uses standard /fapi/v1/order with STOP type (NOT algoOrder)
-            # This avoids -4045 "Reach max stop order limit" on algo orders
-            sl_qty_val = self._fmt_qty(qty, info)
-            sl_lim_p   = self._fp(sl_p * (1.005 if not is_long else 0.995), info)
-            for sl_type, sl_params in [
-                ("STOP_qty", {           # Standard STOP with explicit qty + reduceOnly
-                    "symbol":      sym,
-                    "side":        close_side,
-                    "type":        "STOP",
-                    "stopPrice":   sl_p,
-                    "price":       sl_lim_p,
-                    "quantity":    sl_qty_val,
-                    "timeInForce": "GTC",
-                    "reduceOnly":  "true",
-                }),
-                ("LIMIT_sl", {           # Last resort: limit order at SL price
-                    "symbol":      sym,
-                    "side":        close_side,
-                    "type":        "LIMIT",
-                    "price":       sl_p,
-                    "quantity":    sl_qty_val,
-                    "timeInForce": "GTC",
-                    "reduceOnly":  "true",
-                }),
-            ]:
-                sl_r = self._order(sl_params)
-                if isinstance(sl_r, dict) and "orderId" in sl_r:
-                    sl_id = str(sl_r["orderId"])
-                    log.info("Futures SL (%s) @ %.6g id=%s ✅", sl_type, sl_p, sl_id)
-                    break
-                code = sl_r.get("code", 0) if isinstance(sl_r, dict) else 0
-                if code in (-4120, -1104, -4045):
-                    log.warning("Futures SL: %s rejected (code %d) → next", sl_type, code)
-                    continue
-                log.error("Futures SL FAILED (%s) @ %.6g: code=%d ⚠️", sl_type, sl_p, code)
-                try:
-                    from dashboard.views import push_trade_alert
-                    push_trade_alert("error", f"⚠️ NO SL on {sym} code={code}")
-                except Exception: pass
-                break
+            log.debug("TP3 deferred (staged entry pending — protect loop will add later)")
 
-        # ── Trailing Stop-Loss: 25% of position, activates at TP1 ──
-        # Protects the runner portion. No qty conflict since SL uses closePosition.
-        trailing_id = ""
-        if q_tsl >= info.min_qty:
-            trail_r = self._order({
+        sl_id = ""
+        # Enforce SL hard cap: never more than 1.2% from entry (prevents -5% losses)
+        raw_sl_p = self._fp(signal.sl, info)
+        max_sl   = fill_price * (0.988 if is_long else 1.012)  # 1.2% max
+        sl_p     = max(raw_sl_p, max_sl) if is_long else min(raw_sl_p, max_sl)
+        sl_p     = self._fp(sl_p, info)
+        if raw_sl_p != sl_p:
+            log.info("SL capped: %.5g → %.5g (1.2%% max from %.5g)", raw_sl_p, sl_p, fill_price)
+        if sl_p > 0:
+            sl_qty = self._fmt_qty(qty, info)
+            if sl_qty >= info.min_qty:
+                # Try algoOrder first (avoids -4120) then fallback to STOP_MARKET
+                sl_ap = self._algo_params({
+                    "symbol": sym, "side": close_side,
+                    "type": "STOP_MARKET",
+                    "stopPrice": sl_p,
+                    "quantity": sl_qty,
+                    "workingType": "MARK_PRICE",
+                    "reduceOnly": "true",
+                })
+                sl_r = self._req("POST", "/fapi/v1/algoOrder", sl_ap) or {}
+                sl_id_key = sl_r.get("algoId") or sl_r.get("orderId") if isinstance(sl_r, dict) else None
+                if sl_id_key:
+                    sl_id = str(sl_id_key)
+                    log.info("Futures SL (algoOrder STOP_MARKET) @ %.6g id=%s ✅", sl_p, sl_id)
+                else:
+                    # Fallback: standard STOP_MARKET
+                    sl_r2 = self._req("POST", "/fapi/v1/order", {
+                        "symbol": sym, "side": close_side,
+                        "type": "STOP_MARKET", "stopPrice": sl_p,
+                        "quantity": sl_qty,
+                        "workingType": "MARK_PRICE", "reduceOnly": "true",
+                    })
+                    if isinstance(sl_r2, dict) and "orderId" in sl_r2:
+                        sl_id = str(sl_r2["orderId"])
+                        log.info("Futures SL (STOP_MARKET fallback) @ %.6g id=%s ✅", sl_p, sl_id)
+                    else:
+                        code = sl_r2.get("code", 0) if isinstance(sl_r2, dict) else 0
+                        log.warning("Futures SL failed (code=%d) — position runs without SL ⚠️", code)
+
+        # ── Trailing Stop Loss — activates at TP1, trails with 1.0% callback ──
+        # Covers 60% of remaining position after TP1 fills
+        # Ensures we lock in profit and never give back more than 1%
+        tsl_id = ""
+        act_p  = self._fp(signal.tp1, info)
+        tsl_qty = self._fmt_qty(qty * 0.6, info)
+        if act_p > 0 and tsl_qty >= info.min_qty:
+            tsl_ap = self._algo_params({
                 "symbol":          sym,
                 "side":            close_side,
                 "type":            "TRAILING_STOP_MARKET",
-                "quantity":        q_tsl,
-                "callbackRate":    1.5,
-                "activationPrice": tp1_p,
+                "quantity":        tsl_qty,
+                "activatePrice":   act_p,     # activates when price hits TP1
+                "callbackRate":    1.0,        # trail 1.0% — tight enough to lock profit
                 "workingType":     "MARK_PRICE",
                 "reduceOnly":      "true",
             })
-            if isinstance(trail_r, dict) and "orderId" in trail_r:
-                trailing_id = str(trail_r["orderId"])
-                log.info("Futures TSL activation=%.6g callback=1.5%% id=%s ✅", tp1_p, trailing_id)
+            tsl_r  = self._req("POST", "/fapi/v1/algoOrder", tsl_ap) or {}
+            tsl_key = tsl_r.get("algoId") or tsl_r.get("orderId") if isinstance(tsl_r, dict) else None
+            if tsl_key:
+                tsl_id = str(tsl_key)
+                log.info("Futures TSL @ activation=%.6g callback=1.0%% id=%s ✅", act_p, tsl_id)
             else:
-                log.warning("Futures TSL failed (non-critical): %s", trail_r)
+                code = tsl_r.get("code",0) if isinstance(tsl_r,dict) else 0
+                log.debug("TSL not placed (code=%d) — trade still protected by TPs+SL", code)
 
-        log.info(
-            "Futures orders placed: entry=%s tp1=%s tp2=%s sl=%s tsl=%s",
-            entry_id, tp1_id or "FAIL", tp2_id or "FAIL",
-            sl_id or "FAIL⚠️", trailing_id or "skip"
-        )
+        log.info("Futures %s %s: qty=%.4f @ %.6g lev=%dx id=%s",
+                 side, sym, qty, fill_price, lev, entry_id)
+        log.info("Futures orders placed: entry=%s tp1=%s tp2=%s tp3=%s sl=%s tsl=%s",
+                 entry_id, tp1_id, tp2_id, tp3_id, sl_id, tsl_id)
+        return TradeResult(True, sym, side, qty, fill_price, mode="futures", leverage=lev,
+                           position_usdt=round(pos_usdt*lev,2), risk_usdt=round(risk_usdt,2),
+                           entry_order_id=entry_id, tp1_order_id=tp1_id,
+                           tp2_order_id=tp2_id, tp3_order_id=tp3_id, sl_order_id=sl_id)
 
-        return TradeResult(True, sym, side, qty, fill_price, mode="futures",
-                           leverage=lev,
-                           position_usdt=round(pos_usdt * lev, 2),
-                           risk_usdt=round(risk_usdt, 2),
-                           entry_order_id=entry_id,
-                           tp1_order_id=tp1_id, tp2_order_id=tp2_id,
-                           tp3_order_id=tp3_id, sl_order_id=sl_id)
-
-    # ── Safety ──────────────────────────────────────────────────
+    # ─── HELPERS ────────────────────────────────────────────────────────
 
     def _pre_flight(self, balance: float) -> tuple[bool, str]:
-        if not self._key or not self._secret:
-            return False, "No API keys in .env (BINANCE_API_KEY / BINANCE_API_SECRET)"
-        if balance <= 0:
-            return False, (f"Balance is $0.00 — possible causes:\n"
-                           f"  1. Futures wallet is empty (transfer USDT from spot wallet)\n"
-                           f"  2. API key does not have Futures Trading permission\n"
-                           f"  3. Using spot keys with futures mode — get futures testnet keys")
-        if balance < 5:
-            return False, f"Balance ${balance:.2f} is too low (minimum $5)"
-        if self._daily_loss >= self._loss_limit:
-            return False, f"Daily loss limit {self._loss_limit}% reached — paused until midnight"
-        if self._daily_trades >= self._max_trades:
-            return False, f"Daily trade limit ({self._max_trades}) reached"
-        if not self._live:
-            log.debug("TESTNET mode — orders sent to testnet, not live Binance")
+        if not self._key or not self._secret: return False, "No API keys"
+        if balance <= 0:    return False, "Balance is $0.00"
+        if balance < 5:     return False, f"Balance ${balance:.2f} too low"
+        if self._daily_loss >= self._loss_limit: return False, "Daily loss limit"
+        if self._daily_trades >= self._max_trades: return False, "Daily trade limit"
         return True, ""
 
-    # ── Symbol info ─────────────────────────────────────────────
+    def _algo_params(self, params: dict) -> dict:
+        """
+        Convert standard /fapi/v1/order params to /fapi/v1/algoOrder format.
+        Key differences per Binance API docs:
+          - algoType = "CONDITIONAL" is MANDATORY
+          - stopPrice  → triggerPrice
+          - activationPrice stays as-is (for TRAILING_STOP_MARKET)
+          - callbackRate stays as-is
+        """
+        p = dict(params)
+        p["algoType"] = "CONDITIONAL"   # MANDATORY — always CONDITIONAL
+        # Rename stopPrice → triggerPrice for algo endpoint
+        if "stopPrice" in p and "triggerPrice" not in p:
+            p["triggerPrice"] = p.pop("stopPrice")
+        # workingType defaults to MARK_PRICE for better accuracy
+        if "workingType" not in p:
+            p["workingType"] = "MARK_PRICE"
+        return p
+
+    def _order(self, params: dict) -> dict:
+        """
+        Smart order router for futures.
+
+        Routing logic (per Binance API docs):
+          TRAILING_STOP_MARKET → /fapi/v1/algoOrder (MANDATORY, algoType=CONDITIONAL)
+          TAKE_PROFIT_MARKET   → /fapi/v1/algoOrder (MANDATORY, algoType=CONDITIONAL)
+          STOP / STOP_MARKET   → try /fapi/v1/order first
+                                  -4120 → fallback to /fapi/v1/algoOrder
+                                  still fails → STOP_MARKET on /fapi/v1/order
+          SPOT                 → /api/v3/order
+
+        Error handling:
+          -1102 = missing algoType (fixed by _algo_params)
+          -4120 = wrong endpoint  → retry on algoOrder
+          -4045 = not supported   → skip (position protected by TPs)
+          -2022 = reduceOnly bad  → retry without reduceOnly
+        """
+        if self._mode != "futures":
+            return self._req("POST", "/api/v3/order", params) or {}
+
+        otype = params.get("type", "")
+
+        # ── Must-use-algo types ────────────────────────────────────────
+        if otype in ("TRAILING_STOP_MARKET", "TAKE_PROFIT_MARKET"):
+            ap = self._algo_params(params)
+            r  = self._req("POST", "/fapi/v1/algoOrder", ap) or {}
+            code = r.get("code", 0) if isinstance(r, dict) else 0
+            if code == -4045:
+                log.debug("%s not supported on this account — skipping", otype)
+                return {}
+            if code != 0 and "algoId" not in r:
+                log.warning("  algoOrder %s failed (code=%d) — position protected by other TPs", otype, code)
+                return {}
+            return r
+
+        # ── STOP / STOP_MARKET / TAKE_PROFIT ──────────────────────────
+        r = self._req("POST", "/fapi/v1/order", params) or {}
+        code = r.get("code", 0) if isinstance(r, dict) else 0
+
+        if code == -4120:
+            # Binance says use algo endpoint for this type
+            log.info("  -4120 on %s → retrying via /fapi/v1/algoOrder", otype)
+            ap  = self._algo_params(params)
+            r2  = self._req("POST", "/fapi/v1/algoOrder", ap) or {}
+            c2  = r2.get("code", 0) if isinstance(r2, dict) else 0
+            if "algoId" in r2 or "orderId" in r2:
+                log.info("  %s placed via algoOrder ✅", otype)
+                return r2
+            # Last resort: STOP_MARKET on normal endpoint (no price, just stop)
+            if otype in ("STOP", "STOP_LIMIT"):
+                p3 = {k: v for k, v in params.items()
+                      if k not in ("price", "timeInForce")}
+                p3["type"] = "STOP_MARKET"
+                r3 = self._req("POST", "/fapi/v1/order", p3) or {}
+                if isinstance(r3, dict) and "orderId" in r3:
+                    log.info("  SL placed as STOP_MARKET (last resort) ✅")
+                    return r3
+            log.warning("  %s failed all endpoints — position runs without SL", otype)
+            return {}
+
+        if code == -4045:
+            log.debug("%s not supported — skipping", otype)
+            return {}
+
+        if code == -2022:
+            log.info("  -2022 reduceOnly rejected → retrying without flag")
+            p2 = {k: v for k, v in params.items() if k != "reduceOnly"}
+            r2 = self._req("POST", "/fapi/v1/order", p2) or {}
+            if isinstance(r2, dict) and "orderId" in r2:
+                return r2
+
+        return r
+
+    def _server_ts(self) -> int:
+        try:
+            path = "/fapi/v1/time" if self._mode == "futures" else "/api/v3/time"
+            r = _requests.get(f"{self._base}{path}", timeout=8)
+            if r.ok: return int(r.json().get("serverTime", 0))
+        except Exception: pass
+        return int(time.time() * 1000)
+
+    def _req(self, method: str, path: str, params: dict) -> dict | None:
+        p = {k: v for k, v in params.items() if v is not None}
+        p["recvWindow"] = 20000
+        for attempt in range(2):
+            p["timestamp"] = int(time.time() * 1000) if attempt == 0 else self._server_ts()
+            query = urlencode(p)
+            sig   = hmac.new(self._secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+            url   = f"{self._base}{path}?{query}&signature={sig}"
+            try:
+                resp = _requests.request(method, url,
+                                         headers={"X-MBX-APIKEY": self._key}, timeout=20)
+            except _requests.exceptions.Timeout:
+                log.warning("Binance %s %s timeout (attempt %d/2)", method, path, attempt+1)
+                if attempt == 0: time.sleep(2); continue
+                return {"code": -1, "msg": "timeout"}
+            except _requests.exceptions.ConnectionError as e:
+                log.warning("Binance connection error %s: %s", path, e)
+                return {"code": -1, "msg": str(e)[:100]}
+            if resp.status_code not in (200, 201):
+                log.error("Binance %s %s → %d: %s",
+                          method, path, resp.status_code, resp.text[:400])
+                try:   body = resp.json()
+                except Exception: return {"code": resp.status_code, "msg": resp.text[:200]}
+                if body.get("code") == -1021 and attempt == 0:
+                    log.info("  -1021 clock drift → retrying with server time")
+                    time.sleep(1); continue
+                return body
+            return resp.json()
+        return {"code": -1, "msg": "max retries exceeded"}
+
+    def _pub(self, method: str, path: str, params: dict) -> dict | None:
+        try:
+            resp = _requests.request(method, f"{self._base}{path}",
+                                     params=params, timeout=20)
+            return resp.json() if resp.ok else None
+        except Exception:
+            return None
 
     def _get_symbol_info(self, sym: str) -> SymbolInfo:
-        if sym in self._sym_cache:
-            return self._sym_cache[sym]
-        info = SymbolInfo()
+        if sym in self._sym_cache: return self._sym_cache[sym]
+        info = SymbolInfo(symbol=sym)
         try:
             endpoint = "/fapi/v1/exchangeInfo" if self._mode == "futures" else "/api/v3/exchangeInfo"
             ex = self._pub("GET", endpoint, {} if self._mode == "futures" else {"symbol": sym})
             for item in (ex or {}).get("symbols", []):
                 if item.get("symbol") != sym:
                     continue
-                filters = {f["filterType"]: f for f in item.get("filters", [])}
-                pf   = filters.get("PRICE_FILTER", {})
-                lf   = filters.get("LOT_SIZE",     {})
-                nf   = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
-                tick = float(pf.get("tickSize",      "0.0001") or "0.0001")
-                info.symbol    = sym
-                info.tick_size = tick
-                step = float(lf.get("stepSize",      "0.001")  or "0.001")
-                mq   = float(lf.get("minQty",        "0.001")  or "0.001")
-                mn_raw = float(nf.get("minNotional", "5") or nf.get("notional","5") or "5")
-                mn   = max(mn_raw, 20.0) if self._mode == "futures" else mn_raw
+                qty_prec   = int(item.get("quantityPrecision", item.get("baseAssetPrecision", 2)))
+                price_prec = int(item.get("pricePrecision",    item.get("quotePrecision", 6)))
+                min_qty    = 0.001
+                min_notional = 5.0
+                tick_size    = 0.0001
+                step_size    = 0.001
 
-                def _prec(val: float) -> int:   # FIX: renamed from 's' to avoid loop var shadow
-                    txt = str(val)
-                    return len(txt.rstrip("0").split(".")[1]) if "." in txt else 0
+                for f in item.get("filters", []):
+                    ft = f.get("filterType", "")
+                    if ft == "LOT_SIZE":
+                        # step_size tells us precision: 1.0 → 0dp, 0.1 → 1dp, 0.01 → 2dp
+                        step = float(f.get("stepSize", "0.001"))
+                        step_size = step
+                        if step > 0:
+                            import math
+                            qty_prec = max(0, int(round(-math.log10(step))))
+                        min_qty = float(f.get("minQty", "0.001"))
+                    elif ft == "PRICE_FILTER":
+                        tick = float(f.get("tickSize", "0.0001"))
+                        tick_size = tick
+                        if tick > 0:
+                            import math
+                            price_prec = max(0, int(round(-math.log10(tick))))
+                    elif ft in ("MIN_NOTIONAL", "NOTIONAL"):
+                        min_notional = float(f.get("notional",
+                                               f.get("minNotional", "5.0")))
 
-                info = SymbolInfo(_prec(tick), _prec(step), mq, mn, tick, step)
+                info = SymbolInfo(
+                    symbol          = sym,
+                    price_precision = price_prec,
+                    qty_precision   = qty_prec,
+                    min_qty         = min_qty,
+                    min_notional    = min_notional,
+                    tick_size       = tick_size,
+                    step_size       = step_size,
+                )
+                log.debug("SymbolInfo %s: qty_prec=%d price_prec=%d step=%.6g tick=%.6g",
+                          sym, qty_prec, price_prec, step_size, tick_size)
                 break
         except Exception as e:
-            log.debug("Symbol info %s: %s — using defaults", sym, e)
+            log.debug("SymbolInfo error %s: %s", sym, e)
         self._sym_cache[sym] = info
         return info
 
-    # ── HTTP ────────────────────────────────────────────────────
-
-    def _req(self, method: str, path: str, params: dict) -> dict | None:
-        p = {k: v for k, v in params.items() if v is not None}
-        p["timestamp"]  = int(time.time() * 1000)
-        p["recvWindow"] = 10000   # allow ±10s clock drift — fixes -1021 timestamp error
-        query = urlencode(p)
-        sig   = hmac.new(self._secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-        url   = f"{self._base}{path}?{query}&signature={sig}"
-        resp  = requests.request(method, url,
-                                 headers={"X-MBX-APIKEY": self._key}, timeout=12)
-        if resp.status_code not in (200, 201):
-            log.error("Binance %s %s → %d: %s", method, path,
-                      resp.status_code, resp.text[:400])
-            # Return the error body so callers can inspect error code
-            try:
-                return resp.json()   # {"code": -4120, "msg": "..."}
-            except Exception:
-                return {"code": resp.status_code, "msg": resp.text[:200]}
-        return resp.json()
-
-    def _pub(self, method: str, path: str, params: dict) -> dict | None:
-        resp = requests.request(method, f"{self._base}{path}", params=params, timeout=12)
-        return resp.json() if resp.ok else None
-
     def _fp(self, price: float, info: SymbolInfo) -> float:
-        """Snap price to nearest valid tick size."""
-        if price <= 0:
-            return 0.0
-        tick = getattr(info, "tick_size", 0)
-        if tick and tick > 0:
-            snapped = round(price / tick) * tick
-            # Format to correct decimal places
-            if tick >= 1:
-                result = round(snapped, 0)
-            else:
-                tick_str = f"{tick:.10f}".rstrip("0")
-                dec = len(tick_str.split(".")[1]) if "." in tick_str else 0
-                result = round(snapped, dec)
-            # Safety: if result is 0 but price isn't, return price rounded to 4dp
-            if result == 0 and price > 0:
-                result = round(price, 4)
-            return result
-
-        import math
-        p = info.price_precision
-        result = round(price, p)
-        if result == 0 and price > 0:
-            p = max(p, -int(math.floor(math.log10(abs(price)))) + 4)
-            result = round(price, p)
-        return result
+        """Round price to valid tick size for this symbol."""
+        if price <= 0: return 0.0
+        tick = getattr(info, "tick_size", 0.0)
+        prec = getattr(info, "price_precision", 6)
+        if tick > 0:
+            import math
+            price = round(round(price / tick) * tick, 10)
+        return round(price, prec)
 
     def _fmt_qty(self, qty: float, info: SymbolInfo) -> float:
-        return round(qty, info.qty_precision)
+        """Round qty to valid step size for this symbol."""
+        step = getattr(info, "step_size", 0.0)
+        prec = getattr(info, "qty_precision", 2)
+        if step > 0:
+            import math
+            qty = math.floor(qty / step) * step   # floor to valid step
+        return round(qty, prec)
 
-
-    # ══════════════════════════════════════════════════════════
-    # PROTECT UNPROTECTED POSITIONS
-    # Call this every cycle to set TP/SL on positions that have none
-    # ══════════════════════════════════════════════════════════
-
-    def protect_open_positions(self, signal_lookup: dict) -> list:
-        """
-        Scan all open futures positions. For any that have no open orders
-        (no TP/SL), place TP1 + TP2 + SL + TSL immediately.
-
-        signal_lookup: dict mapping symbol → signal-like object with
-                       tp1, tp2, tp3, sl fields. Can come from DB records.
-        Returns list of symbols that were protected.
-        """
-        if self._mode != "futures":
-            return []
-
-        protected = []
+    def get_balance(self) -> dict:
+        result = {"wallet_balance": 0.0, "available_balance": 0.0,
+                  "unrealised_pnl": 0.0, "error": ""}
         try:
-            positions = self.get_positions()
-            open_orders = self.get_open_orders() or []
-            syms_with_orders = set(o.get("symbol","") for o in open_orders)
-
-            # Build per-symbol order type sets for smart checking
-            sym_orders = {}  # sym → list of orders
-            for o in open_orders:
-                s = o.get("symbol","")
-                sym_orders.setdefault(s, []).append(o)
-
-            SL_TYPES  = {"STOP_MARKET","STOP","STOP_LOSS","STOP_LOSS_LIMIT"}
-            TSL_TYPES = {"TRAILING_STOP_MARKET"}
-            TP_TYPES  = {"TAKE_PROFIT_MARKET","TAKE_PROFIT","LIMIT"}
-
-            total_orders = len(open_orders)
-            log.info("protect_open_positions: %d positions, %d open orders",
-                     len(positions), total_orders)
-
-            # Duplicate cleanup: if >5 orders per position, cancel all and re-protect
-            max_ok = max(len(positions) * 5, 10)
-            if total_orders > max_ok and positions:
-                log.warning("Duplicate orders (%d > %d) — cancelling all for clean reset",
-                            total_orders, max_ok)
-                for _p in positions:
-                    _s = _p.get("symbol","")
-                    if not _s:
-                        continue
-                    # Cancel standard orders
-                    self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _s})
-                    # Cancel algo orders individually (no bulk cancel endpoint)
-                    try:
-                        _algos = self._req("GET", "/fapi/v1/openAlgoOrders",
-                                           {"symbol": _s}) or {}
-                        _algo_list = _algos.get("algoOrders", []) if isinstance(_algos, dict) else []
-                        for _ao in _algo_list:
-                            _aid = _ao.get("algoId") or _ao.get("orderId")
-                            if _aid:
-                                self._req("DELETE", "/fapi/v1/algoOrder",
-                                          {"symbol": _s, "algoId": _aid})
-                    except Exception as _ace:
-                        log.debug("  Algo cancel %s: %s", _s, _ace)
-                    log.info("  Cancelled all orders for %s", _s)
-                open_orders = self.get_open_orders() or []
-                sym_orders  = {}
-                for o in open_orders:
-                    sym_orders.setdefault(o.get("symbol",""), []).append(o)
-                log.info("  After cleanup: %d orders", len(open_orders))
-
-            for pos in positions:
-                sym = pos.get("symbol","")
-                amt = float(pos.get("positionAmt", 0))
-                if amt == 0:
-                    continue
-
-                orders_for_sym = sym_orders.get(sym, [])
-                has_sl  = any(o.get("type") in SL_TYPES  for o in orders_for_sym)
-                has_tsl = any(o.get("type") in TSL_TYPES for o in orders_for_sym)
-                has_tp  = any(o.get("type") in TP_TYPES  for o in orders_for_sym)
-
-                log.info("  %s: amt=%.4f orders=%d has_tp=%s has_sl=%s has_tsl=%s",
-                         sym, amt, len(orders_for_sym),
-                         "✅" if has_tp else "❌",
-                         "✅" if has_sl else "❌",
-                         "✅" if has_tsl else "❌")
-
-                # Skip only if ALL protections are in place
-                if has_tp and has_sl:
-                    if not has_tsl:
-                        log.info("  %s: TP+SL ok — adding missing TSL", sym)
-                        # Fall through to add TSL only (handled below)
-                    else:
-                        log.info("  %s: fully protected ✅", sym)
-                        continue
-
-                # No orders — needs protection
-                is_long    = amt > 0
-                close_side = "SELL" if is_long else "BUY"
-                qty        = abs(amt)
-                entry      = float(pos.get("entryPrice", 0))
-
-                # Break-even check: after entry is known
-                # If ≤1 TP order remaining (TP1 filled) → move SL to entry+0.2%
-                _tp_orders = [o for o in orders_for_sym
-                              if isinstance(o, dict) and o.get("type","") in
-                              {"TAKE_PROFIT_MARKET","TAKE_PROFIT","LIMIT"}]
-                _be_set = any(
-                    isinstance(o, dict) and o.get("type","") in {"STOP","STOP_MARKET"}
-                    and entry > 0
-                    and abs(float(o.get("stopPrice","0") or 0) - entry) / max(entry, 1e-10) < 0.005
-                    for o in orders_for_sym
-                )
-                if len(_tp_orders) <= 1 and has_sl and not _be_set and entry > 0:
-                    _info_be = self._get_symbol_info(sym)
-                    _be_p    = self._fp(entry * (1.002 if is_long else 0.998), _info_be)
-                    _be_stop = self._fp(entry * (1.001 if is_long else 0.999), _info_be)
-                    _be_qty  = self._fmt_qty(qty * 0.6, _info_be)
-                    if _be_p > 0 and _be_qty >= _info_be.min_qty:
-                        _be_r = self._req("POST", "/fapi/v1/order", {
-                            "symbol": sym, "side": close_side, "type": "STOP",
-                            "stopPrice": _be_stop, "price": _be_p,
-                            "quantity": _be_qty,
-                            "timeInForce": "GTC", "reduceOnly": "true",
-                        })
-                        if isinstance(_be_r, dict) and "orderId" in _be_r:
-                            log.info("  %s: TP1 filled → break-even @ %.6g ✅", sym, _be_p)
-
-                info = self._get_symbol_info(sym)
-                sig  = signal_lookup.get(sym)
-
-                if sig and sig.tp1 > 0 and sig.sl > 0:
-                    tp1_p = self._fp(sig.tp1, info)
-                    tp2_p = self._fp(sig.tp2, info)
-                    tp3_p = self._fp(getattr(sig, "tp3", 0) or tp2_p * 1.02, info)
-                    sl_p  = self._fp(sig.sl,  info)
-                    log.info("Using signal levels for %s: TP1=%.6g TP2=%.6g TP3=%.6g SL=%.6g",
-                             sym, tp1_p, tp2_p, tp3_p, sl_p)
-                else:
-                    tp1_pct = 0.03
-                    tp2_pct = 0.06
-                    tp3_pct = 0.10
-                    sl_pct  = 0.04
-                    if is_long:
-                        tp1_p = self._fp(entry * (1 + tp1_pct), info)
-                        tp2_p = self._fp(entry * (1 + tp2_pct), info)
-                        tp3_p = self._fp(entry * (1 + tp3_pct), info)
-                        sl_p  = self._fp(entry * (1 - sl_pct),  info)
-                    else:
-                        tp1_p = self._fp(entry * (1 - tp1_pct), info)
-                        tp2_p = self._fp(entry * (1 - tp2_pct), info)
-                        tp3_p = self._fp(entry * (1 - tp3_pct), info)
-                        sl_p  = self._fp(entry * (1 + sl_pct),  info)
-                    log.warning("Default TP/SL for %s from entry=%.6g: TP1=%.6g TP2=%.6g TP3=%.6g SL=%.6g",
-                                sym, entry, tp1_p, tp2_p, tp3_p, sl_p)
-
-                if sl_p <= 0:
-                    log.error("Skipping %s — cannot calculate SL price", sym)
-                    continue
-
-                q_tp1 = self._fmt_qty(qty * 0.40, info)
-                q_tp2 = self._fmt_qty(qty * 0.35, info)
-                q_tsl = self._fmt_qty(qty * 0.25, info)
-
-                log.info("Protecting unprotected position: %s %s qty=%.4f entry=%.6g → TP1=%.6g TP2=%.6g SL=%.6g",
-                         "LONG" if is_long else "SHORT", sym, qty, entry, tp1_p, tp2_p, sl_p)
-
-                def _prot_tp(label, stop_p, qty_p):
-                    if stop_p <= 0 or qty_p < info.min_qty:
-                        return
-                    for name, params in [
-                        ("TAKE_PROFIT_MARKET", {
-                            "symbol": sym, "side": close_side,
-                            "type": "TAKE_PROFIT_MARKET",
-                            "stopPrice": stop_p, "quantity": qty_p,
-                            "workingType": "MARK_PRICE",
-                            "priceProtect": "true", "reduceOnly": "true",
-                        }),
-                        ("LIMIT", {
-                            "symbol": sym, "side": close_side, "type": "LIMIT",
-                            "price": stop_p, "quantity": qty_p,
-                            "timeInForce": "GTC", "reduceOnly": "true",
-                        }),
-                    ]:
-                        r = self._order(params)
-                        if isinstance(r, dict) and "orderId" in r:
-                            log.info("  %s (%s) @ %.6g id=%s ✅", label, name, stop_p, r["orderId"])
-                            return
-                        code = r.get("code", 0) if isinstance(r, dict) else 0
-                        if code in (-4120, -1104, -2015) and name != "LIMIT":
-                            log.warning("  %s: algo rejected (code %d) → LIMIT", label, code)
-                            continue
-                        log.error("  %s FAILED (%s): code=%d %s",
-                                  label, name, code, r.get("msg",""))
-                        return
-
-                # Only place TP orders if none exist yet
-                if not has_tp:
-                    _prot_tp("TP1", tp1_p, q_tp1)
-                    _prot_tp("TP2", tp2_p, q_tp2)
-                    _prot_tp("TP3", tp3_p, q_tsl)
-
-                # Only place SL if none exists yet
-                if not has_sl and sl_p > 0:
-                    _sl_qty  = self._fmt_qty(qty, info)
-                    _sl_limp = self._fp(sl_p * (1.005 if not is_long else 0.995), info)
-                    for sl_t, sl_p2 in [
-                        ("STOP_MARKET", {"stopPrice": sl_p, "quantity": _sl_qty,
-                                         "workingType": "MARK_PRICE", "priceProtect": "true",
-                                         "reduceOnly": "true"}),
-                        ("STOP", {"stopPrice": sl_p, "price": _sl_limp,
-                                  "quantity": _sl_qty,
-                                  "timeInForce": "GTC", "reduceOnly": "true"}),
-                    ]:
-                        sl_r = self._order({
-                            "symbol": sym, "side": close_side, "type": sl_t, **sl_p2})
-                        if isinstance(sl_r, dict) and "orderId" in sl_r:
-                            log.info("  SL (%s) @ %.6g id=%s ✅", sl_t, sl_p, sl_r["orderId"])
-                            break
-                        code = sl_r.get("code", 0) if isinstance(sl_r, dict) else 0
-                        if code in (-4120, -1104) and sl_t != "STOP":
-                            log.warning("  SL: %s rejected (code %d) — trying STOP", sl_t, code)
-                            continue
-                        log.error("  SL FAILED (%s): code=%d  ⚠️ STILL UNPROTECTED!", sl_t, code)
-                        try:
-                            from dashboard.views import push_trade_alert
-                            push_trade_alert("error", f"⚠️ {sym} still unprotected — SL failed (code {code})")
-                        except Exception: pass
-                        break
-                else:
-                    log.error("  SL skipped — price rounds to 0 for %s", sym)
-
-                # TSL — place if missing (always attempt regardless of TP/SL status)
-                if not has_tsl and q_tsl >= info.min_qty and tp1_p > 0:
-                    # Get current mark price to ensure activation is valid
-                    try:
-                        import requests as _rq
-                        _mp = _rq.get("https://fapi.binance.com/fapi/v1/premiumIndex",
-                                      params={"symbol": sym}, timeout=5)
-                        cur_mark = float(_mp.json().get("markPrice", 0)) if _mp.ok else 0
-                    except Exception:
-                        cur_mark = 0
-
-                    # activationPrice rules:
-                    #   LONG/BUY:  activation must be >= current (above current, will trail down)
-                    #   SHORT/SELL: activation must be <= current (below current, will trail up)
-                    # If TP1 already passed, use current mark as activation
-                    if cur_mark > 0:
-                        if is_long:
-                            act_p = tp1_p if tp1_p >= cur_mark else self._fp(cur_mark * 1.001, info)
-                        else:
-                            act_p = tp1_p if tp1_p <= cur_mark else self._fp(cur_mark * 0.999, info)
-                    else:
-                        act_p = tp1_p
-
-                    r = self._order({
-                        "symbol": sym, "side": close_side,
-                        "type": "TRAILING_STOP_MARKET",
-                        "quantity": q_tsl, "callbackRate": 1.5,
-                        "activationPrice": act_p,
-                        "workingType": "MARK_PRICE", "reduceOnly": "true",
-                    })
-                    if isinstance(r, dict) and "orderId" in r:
-                        log.info("  TSL set activation=%.6g callback=1.5%% id=%s ✅", act_p, r["orderId"])
-
-                protected.append(sym)
-
+            if self._mode == "futures":
+                for a in (self._req("GET", "/fapi/v2/balance", {}) or []):
+                    if a.get("asset") == "USDT":
+                        result["wallet_balance"]    = float(a.get("balance", 0))
+                        result["available_balance"] = float(a.get("availableBalance", 0))
+                        result["unrealised_pnl"]    = float(a.get("crossUnPnl", 0))
+                        log.info("Futures wallet=$%.2f available=$%.2f pnl=%+.2f",
+                                 result["wallet_balance"], result["available_balance"],
+                                 result["unrealised_pnl"])
+                        return result
+            else:
+                for a in (self._req("GET", "/api/v3/account", {}) or {}).get("balances", []):
+                    if a["asset"] == "USDT":
+                        result["wallet_balance"]    = float(a["free"]) + float(a["locked"])
+                        result["available_balance"] = float(a["free"])
+                        return result
         except Exception as e:
-            log.error("protect_open_positions error: %s", e, exc_info=True)
+            result["error"] = str(e)
+            log.error("Balance error: %s", e)
+        return result
 
-        return protected
+    def get_available_balance(self) -> float:
+        return float(self.get_balance().get("available_balance", 0) or 0)
+
+    def get_open_orders(self, symbol: str = None) -> list:
+        try:
+            params = {"symbol": symbol} if symbol else {}
+            path   = "/fapi/v1/openOrders" if self._mode=="futures" else "/api/v3/openOrders"
+            result = self._req("GET", path, params)
+            orders = result if isinstance(result, list) else []
+            if self._mode == "futures":
+                algo_resp = self._req("GET", "/fapi/v1/openAlgoOrders", params)
+                algo_list = algo_resp.get("algoOrders",[]) if isinstance(algo_resp,dict) else []
+                for o in algo_list:
+                    if "algoId" in o: o["orderId"] = o["algoId"]
+                orders += algo_list
+            return orders
+        except Exception as e:
+            log.error("Open orders error: %s", e); return []
+
+    def get_positions(self) -> list:
+        if self._mode != "futures": return []
+        try:
+            resp = self._req("GET", "/fapi/v2/positionRisk", {})
+            if not isinstance(resp, list): return []
+            return [p for p in resp if isinstance(p,dict) and float(p.get("positionAmt",0))!=0]
+        except Exception as e:
+            log.error("Positions error: %s", e); return []
+
+    def cancel_all_orders(self, symbol: str = None) -> dict:
+        cancelled, errors = [], []
+        try:
+            syms = [symbol] if symbol else list({o["symbol"] for o in self.get_open_orders() if "symbol" in o})
+            for s in syms:
+                try:
+                    path = "/fapi/v1/allOpenOrders" if self._mode=="futures" else "/api/v3/openOrders"
+                    self._req("DELETE", path, {"symbol": s})
+                    cancelled.append(s)
+                except Exception as e:
+                    errors.append(f"{s}: {e}")
+        except Exception as e:
+            errors.append(str(e))
+        return {"cancelled": cancelled, "errors": errors}
+
+    def reset_daily_counters(self) -> None:
+        self._daily_trades = 0; self._daily_loss = 0.0
+        log.info("Daily counters reset")

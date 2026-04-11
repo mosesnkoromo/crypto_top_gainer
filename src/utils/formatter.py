@@ -229,7 +229,7 @@ def fmt_digest(signals: list[Signal], btc: dict, risk: RiskConfig,
                 action   = "SELL / SHORT" if is_sell else "BUY / LONG"
                 rsi_4h   = getattr(s, "rsi_4h",   getattr(s, "rsi_1h", 0))
                 rsi_d    = getattr(s, "rsi_daily", 0)
-                hold     = getattr(s, "hold_days", "2-4 days")
+                hold     = getattr(s, "hold_time", "5-15 min")
                 strats   = getattr(s, "strategies_hit", [])
                 strat_str = " + ".join(strats) if strats else "Confluence"
                 reasons  = [f.replace("✅ ","").replace("⚠️ ","~ ") for f in s.factors if f.startswith("✅")][:4]
@@ -238,10 +238,16 @@ def fmt_digest(signals: list[Signal], btc: dict, risk: RiskConfig,
                 if isinstance(sent, dict): sent = sent.get("label","neutral")
                 sent_line = "  │  📰 Positive news" if sent=="positive" else ("  │  📰 Negative news" if sent=="negative" else "")
 
+                # Strategy type label
+                strategy = getattr(s, "strategy", "TREND")
+                strat_label = {"MEAN_REV": "📊 Mean Reversion",
+                               "BREAKOUT": "🚀 Breakout",
+                               "TREND":    "📈 Trend Follow"}.get(strategy, "📈 Trend Follow")
+
                 lines += [
                     f"  ┌─────────────────────────",
                     f"  │ {dir_icon} [{num}] {s.symbol}  ·  {s.confidence}% conf",
-                    f"  │ 📌 {strat_str}  ·  Hold {hold}",
+                    f"  │ {strat_label}  ·  Hold {hold}",
                     f"  ├─────────────────────────",
                     f"  │ 📍 {action}",
                     f"  │ 💰 Entry  {s.price}",

@@ -1,12 +1,7 @@
 """
-config.py — v4
-Central config loaded from .env. Fails fast with clear errors.
-
-Fixes vs v3:
-  - BinanceConfig API keys are optional — bot starts without them
-  - AutoTradeConfig keys also optional — auto-trade simply disabled if missing
-  - bool env vars handled correctly ("false" → False, "true" → True)
-  - AutoTradeConfig field names match what scanner.py expects (daily_loss_limit_pct)
+config.py — v5  (Production)
+Central configuration loaded from .env. Fails fast with clear errors.
+All scalping parameters tuned for 1H+15m strategy.
 """
 
 import os
@@ -20,17 +15,16 @@ load_dotenv(Path(__file__).parent / ".env")
 def _get(key, default=None, cast=str, required=False):
     val = os.environ.get(key, default)
     if required and val is None:
-        raise EnvironmentError(f"❌  Required env var '{key}' not set. Copy .env.example → .env")
+        raise EnvironmentError(f"Required env var '{key}' not set. Copy .env.example → .env")
     if val is None:
         return None
     try:
         return cast(val)
-    except:
-        raise EnvironmentError(f"❌  Invalid value for '{key}': '{val}' cannot be cast to {cast.__name__}")
+    except Exception:
+        raise EnvironmentError(f"Invalid value for '{key}': '{val}' cannot be cast to {cast.__name__}")
 
 
 def _get_bool(key, default: bool = False) -> bool:
-    """Correctly parse bool env vars: 'false'/'0'/'no' → False, else → True."""
     val = os.environ.get(key)
     if val is None:
         return default
@@ -39,20 +33,22 @@ def _get_bool(key, default: bool = False) -> bool:
 
 @dataclass(frozen=True)
 class WhatsAppConfig:
-    number:              str  = field(default_factory=lambda: _get("WHATSAPP_NUMBER", required=True))
-    api_key:             str  = field(default_factory=lambda: _get("WHAPI_TOKEN", required=True))
-    api_url:             str  = "https://gate.whapi.cloud/messages/text"
-    request_timeout:     int  = 15
-    retry_attempts:      int  = 3
-    retry_delay_seconds: int  = 5
+    number:              str = field(default_factory=lambda: _get("WHATSAPP_NUMBER", required=True))
+    api_key:             str = field(default_factory=lambda: _get("WHAPI_TOKEN", required=True))
+    api_url:             str = "https://gate.whapi.cloud/messages/text"
+    request_timeout:     int = 15
+    retry_attempts:      int = 3
+    retry_delay_seconds: int = 5
 
 
 @dataclass(frozen=True)
 class ScanConfig:
+    # Universe: top liquid pairs by volume
     top_gainers_count:     int   = field(default_factory=lambda: _get("TOP_GAINERS_COUNT", 40, int))
-    min_gain_percent:      float = field(default_factory=lambda: _get("MIN_GAIN_PERCENT", 5.0, float))
-    scan_interval_minutes: int   = field(default_factory=lambda: _get("SCAN_INTERVAL_MINUTES", 5, int))
-    timeframe:             str   = field(default_factory=lambda: _get("TIMEFRAME", "1h"))
+    min_gain_percent:      float = field(default_factory=lambda: _get("MIN_GAIN_PERCENT", 2.0, float))
+    # Scalp mode: scan every 5 minutes
+    scan_interval_minutes: int   = field(default_factory=lambda: _get("SCAN_INTERVAL_MINUTES", 2, int))
+    timeframe:             str   = field(default_factory=lambda: _get("TIMEFRAME", "5m"))
     candle_limit:          int   = field(default_factory=lambda: _get("CANDLE_LIMIT", 80, int))
     min_quote_volume:      float = 5_000_000.0
     stable_coins:          tuple = ("USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USDP", "UST", "USDD")
@@ -71,16 +67,19 @@ class SignalConfig:
     volume_climax:         float = field(default_factory=lambda: _get("VOLUME_CLIMAX", 3.0, float))
     volume_strong:         float = field(default_factory=lambda: _get("VOLUME_STRONG", 2.0, float))
     volume_buy_min:        float = field(default_factory=lambda: _get("VOLUME_BUY_MIN", 1.3, float))
+    # Dynamic threshold — base value; session/volatility adjusts at runtime
     min_sell_confluence:   float = field(default_factory=lambda: _get("MIN_SELL_CONFLUENCE", 4.0, float))
     min_buy_confluence:    float = field(default_factory=lambda: _get("MIN_BUY_CONFLUENCE", 4.0, float))
 
 
 @dataclass(frozen=True)
 class RiskConfig:
+    # Scalp TP targets: fast, tight, achievable
     tp1_pct:       float = field(default_factory=lambda: _get("TP1_PCT", 0.8, float))
-    tp2_pct:       float = field(default_factory=lambda: _get("TP2_PCT", 1.6, float))
-    tp3_pct:       float = field(default_factory=lambda: _get("TP3_PCT", 2.8, float))
-    sl_pct:        float = field(default_factory=lambda: _get("SL_PCT", 3.0, float))
+    tp2_pct:       float = field(default_factory=lambda: _get("TP2_PCT", 1.2, float))
+    tp3_pct:       float = field(default_factory=lambda: _get("TP3_PCT", 2.0, float))
+    sl_pct:        float = field(default_factory=lambda: _get("SL_PCT", 0.8, float))   # fallback only
+    # Position split percentages (must sum to 100)
     tp1_close_pct: int   = field(default_factory=lambda: _get("TP1_CLOSE", 40, int))
     tp2_close_pct: int   = field(default_factory=lambda: _get("TP2_CLOSE", 35, int))
     tp3_close_pct: int   = field(default_factory=lambda: _get("TP3_CLOSE", 25, int))
@@ -93,7 +92,7 @@ class RiskConfig:
 
 @dataclass(frozen=True)
 class AlertConfig:
-    cooldown_hours:              int   = field(default_factory=lambda: _get("COOLDOWN_HOURS", 24, int))
+    cooldown_hours:              float = field(default_factory=lambda: _get("COOLDOWN_HOURS", 0.05, float))
     btc_update_every_hours:      int   = field(default_factory=lambda: _get("BTC_UPDATE_EVERY_HOURS", 4, int))
     whatsapp_rate_limit_seconds: int   = 3
     binance_rate_limit_seconds:  float = 0.8
@@ -111,7 +110,6 @@ class LogConfig:
 @dataclass(frozen=True)
 class BinanceConfig:
     base_url:        str = "https://api.binance.com/api/v3"
-    # NOT required — bot works without API keys, auto-trade just stays disabled
     api_key:         str = field(default_factory=lambda: _get("BINANCE_API_KEY", ""))
     api_secret:      str = field(default_factory=lambda: _get("BINANCE_API_SECRET", ""))
     request_timeout: int = 12
@@ -121,17 +119,20 @@ class BinanceConfig:
 class AutoTradeConfig:
     """
     Auto-trade credentials and risk defaults.
-    Master on/off is in DB (AutoTradeState). Bot starts fine with no keys.
+    Master on/off toggle lives in DB (AutoTradeState).
+    Bot starts cleanly with no keys — auto-trade stays disabled.
     """
     api_key:    str  = field(default_factory=lambda: _get("BINANCE_API_KEY", ""))
     api_secret: str  = field(default_factory=lambda: _get("BINANCE_API_SECRET", ""))
-
-    # Testnet=True by default. Set BINANCE_TESTNET=false in .env to go live.
-    testnet: bool = field(default_factory=lambda: _get_bool("BINANCE_TESTNET", default=True))
-
-    # Risk — defaults used when DB value not available
+    # Set BINANCE_TESTNET=false in .env to go live
+    testnet:    bool = field(default_factory=lambda: _get_bool("BINANCE_TESTNET", default=True))
+    # Scalp risk: 1.5% per trade, 6% daily loss limit
     risk_pct_per_trade:   float = field(default_factory=lambda: _get("AUTO_RISK_PCT", 1.5, float))
     daily_loss_limit_pct: float = field(default_factory=lambda: _get("AUTO_LOSS_LIMIT", 6.0, float))
+    # Time-exit: close stale trades at 60min (if low profit) or 90min hard cap
+    max_hold_minutes:     int   = field(default_factory=lambda: _get("MAX_HOLD_MINUTES", 15, int))
+    # Max concurrent open futures positions
+    max_concurrent_pos:   int   = field(default_factory=lambda: _get("MAX_CONCURRENT_POS", 5, int))
 
     @property
     def has_keys(self) -> bool:
@@ -148,7 +149,7 @@ class AppConfig:
     auto:     AutoTradeConfig = field(default_factory=AutoTradeConfig)
     log:      LogConfig       = field(default_factory=LogConfig)
     binance:  BinanceConfig   = field(default_factory=BinanceConfig)
-    version:  str             = "4.0.0"
+    version:  str             = "4.1.0"
 
 
 def load_config() -> AppConfig:

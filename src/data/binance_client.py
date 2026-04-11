@@ -99,7 +99,11 @@ class BinanceClient:
                 log.debug("Binance error on %s: %s", base, e)
                 continue
         self._binance_ok = False
-        log.warning("All Binance endpoints geo-blocked — switching to CoinGecko fallback")
+        log.warning(
+            "All Binance endpoints geo-blocked — CoinGecko fallback active. "
+            "⚠️ CoinGecko has NO 5m/15m candles — signals will be 0 until Binance is reachable. "
+            "Fix: use a VPN or deploy to a cloud server (e.g. Railway/Render/VPS)."
+        )
         return None
 
     def _binance_klines(self, symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
@@ -206,3 +210,35 @@ class BinanceClient:
                 "current_price": price,
             })
         return result[:limit]
+
+    def get_orderbook_imbalance(self, symbol: str, limit: int = 20) -> dict:
+        """Real L2 orderbook imbalance for microstructure confirmation."""
+        empty = {"imbalance": 0.0, "bias": "NEUTRAL", "bid_vol": 0.0, "ask_vol": 0.0}
+        if not self._binance_ok:
+            return empty
+        try:
+            # Try futures depth first, then spot
+            for path in ["/depth"]:
+                r = self._binance_request(path, {"symbol": symbol, "limit": limit})
+                if r is None:
+                    continue
+                data = r.json()
+                bids = data.get("bids", [])
+                asks = data.get("asks", [])
+                if not bids and not asks:
+                    continue
+                bid_vol = sum(float(b[1]) for b in bids[:limit])
+                ask_vol = sum(float(a[1]) for a in asks[:limit])
+                total   = bid_vol + ask_vol + 1e-10
+                imb     = (bid_vol - ask_vol) / total
+                bias    = ("BULLISH" if imb > 0.15 else
+                           "BEARISH" if imb < -0.15 else "NEUTRAL")
+                return {
+                    "imbalance": round(imb, 4),
+                    "bid_vol":   round(bid_vol, 2),
+                    "ask_vol":   round(ask_vol, 2),
+                    "bias":      bias,
+                }
+        except Exception as e:
+            log.debug("Orderbook %s: %s", symbol, e)
+        return empty
