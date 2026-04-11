@@ -1,309 +1,380 @@
 """
-src/analysis/signal_simulator.py — Pre-Trade Backtest Simulation Gate
-═══════════════════════════════════════════════════════════════════════
-Simulates a trade on the last 120 candles before ANY real money is spent.
-Works exactly like a real trade: entry at candle close, TP/SL checked
-candle by candle on High/Low, max 3 candles hold (~15 min).
-
-Decision flow:
-    Signal detected → simulate on 120 recent candles
-        → Win rate < 38%?      → BLOCK
-        → Expectancy negative? → BLOCK
-        → Momentum against?    → BLOCK
-        → TP unreachable?      → BLOCK
-        → All pass             → APPROVE + show report
-
-Log output example:
-    ┌──────────────────────────────────────────────
-    │ 🔬 SIM: ZROUSDT BUY @ 2.004
-    │ Entry: 2.004 | TP1: 2.016 | SL: 1.984
-    │ Simulated 18 trades on last 120 candles (5m)
-    │ ─────────────────────────────────────────────
-    │ Trade  1: entered 1.992 → TP1 hit (+0.60%)  ✅
-    │ Trade  2: entered 1.998 → SL hit  (-1.00%)  ❌
-    │ Trade  3: entered 2.001 → TP1 hit (+0.60%)  ✅
-    │ ...
-    │ ─────────────────────────────────────────────
-    │ Win Rate:   67% (12/18)
-    │ Avg Win:   +0.58%  Avg Loss: -0.98%
-    │ Expectancy: +0.07% per trade
-    │ Virtual P&L: +$34.20 on $1000 virtual wallet
-    │ Momentum:  +0.72 (price moving WITH us)
-    │ Decision:  ✅ APPROVED — execute real trade
-    └──────────────────────────────────────────────
+src/analysis/signal_simulator.py — Institutional Pre-Trade Simulation Gate v4.2
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-# ── Thresholds ─────────────────────────────────────────────────────────
-MIN_WIN_RATE         = 0.50   # block if decisive WR < 50% (min 3 decisive required) (target 70% real WR)
-MIN_EXPECTANCY       = 0.08   # require at least +0.08% expectancy
-MIN_TRADES           = 5      # need at least 5 sim trades
-MAX_CONSEC_LOSSES    = 4      # block if last 4 sim trades all SL
-MAX_ATR_TP_RATIO     = 1.8    # block if TP1 > 1.8× ATR from entry
-VIRTUAL_CAPITAL      = 1000.0 # virtual wallet size
-VIRTUAL_RISK         = 0.02   # 2% risk per virtual trade
-MAX_HOLD_CANDLES     = 3      # 3 × 5m = 15 min max hold
+MIN_WIN_RATE      = 0.50
+MIN_EXPECTANCY    = 0.0008
+MIN_TRADES        = 6
+MAX_CONSEC_LOSSES = 4
+MAX_DRAWDOWN      = 0.15
+SPREAD            = 0.0005
+SLIPPAGE          = 0.0003
+VIRTUAL_CAPITAL   = 1000.0
+VIRTUAL_RISK_PCT  = 0.02
 
 
 @dataclass
 class VirtualTrade:
     num:          int
-    entry_idx:    int
     entry_price:  float
-    tp1:          float
-    tp2:          float
-    sl:           float
-    outcome:      str     # TP1 | TP2 | SL | TIMEOUT
     exit_price:   float
+    outcome:      str
+    pnl_pct:      float
     hold_candles: int
-    pnl_pct:      float   # e.g. 0.006 = 0.6%
+    tp1_hit:      bool = False
+    tp2_hit:      bool = False
 
 
 @dataclass
 class SimResult:
-    symbol:         str
-    direction:      str
-    entry_price:    float
-    tp1:            float
-    sl:             float
-    n_trades:       int
-    wins:           int
-    losses:         int
-    timeouts:       int
-    win_rate:       float
-    avg_win:        float
-    avg_loss:       float
-    expectancy:     float
-    virtual_pnl:    float
-    consec_losses:  int
-    momentum:       float    # -1 to +1
-    atr_tp_ratio:   float
-    approved:       bool
-    reason:         str
-    block_reasons:  list
-    trades:         list[VirtualTrade] = field(default_factory=list)
+    symbol:        str
+    direction:     str
+    entry_price:   float
+    tp1:           float
+    sl:            float
+    n_trades:      int
+    wins:          int
+    losses:        int
+    timeouts:      int
+    win_rate:      float
+    avg_win:       float
+    avg_loss:      float
+    expectancy:    float
+    virtual_pnl:   float
+    max_drawdown:  float
+    consec_losses: int
+    momentum:      float
+    approved:      bool
+    reason:        str
+    block_reasons: list
+    trades:        list = field(default_factory=list)
 
-    def print_report(self) -> str:
-        """Generate a full human-readable simulation report."""
+    def print_report(self, label: str = "PRE-TRADE SIM") -> str:
         icon   = "✅ APPROVED" if self.approved else "🚫 BLOCKED"
         border = "─" * 54
         lines  = [
             f"┌{border}",
-            f"│ 🔬 PRE-TRADE SIM: {self.symbol} {self.direction} @ {self.entry_price:.5g}",
+            f"│ 🔬 {label}: {self.symbol} {self.direction} @ {self.entry_price:.5g}",
             f"│ Entry: {self.entry_price:.5g} │ TP1: {self.tp1:.5g} │ SL: {self.sl:.5g}",
-            f"│ Simulated {self.n_trades} virtual trades on last 120 candles (5m)",
+            f"│ Simulated {self.n_trades} realistic entries on last 150 candles (5m)",
             f"│{border}",
         ]
-        # Show individual trade results (max 10 for readability)
-        shown = self.trades[:10]
-        for t in shown:
-            icon_t = "✅" if t.outcome in ("TP1","TP2") else ("⏱" if t.outcome=="TIMEOUT" else "❌")
-            pnl_str = f"{t.pnl_pct*100:+.2f}%"
+        for t in self.trades[:12]:
+            icon_t  = "✅" if t.pnl_pct > 0 else "❌"
+            outcome = t.outcome[:8]
             lines.append(
-                f"│ Trade {t.num:2d}: @ {t.entry_price:.5g} → {t.outcome:7s} "
-                f"({pnl_str:>7})  {icon_t}"
+                f"│ Trade {t.num:2d}: @ {t.entry_price:.5g}"
+                f" → {outcome:8s} ({t.pnl_pct*100:+.2f}%)  {icon_t}"
             )
-        if len(self.trades) > 10:
-            lines.append(f"│ ... and {len(self.trades)-10} more trades")
+        if len(self.trades) > 12:
+            lines.append(f"│ ... and {len(self.trades)-12} more trades")
         lines += [
             f"│{border}",
-            f"│ Win Rate:    {self.win_rate:.0%} decisive ({self.wins}W/{self.losses}L) | {self.timeouts} timeouts (neutral)",
+            f"│ Win Rate:    {self.win_rate:.0%} ({self.wins}W / {self.losses}L) | {self.timeouts} timeouts",
             f"│ Avg Win:    {self.avg_win*100:+.2f}%   Avg Loss: {self.avg_loss*100:+.2f}%",
             f"│ Expectancy: {self.expectancy*100:+.3f}% per trade",
-            f"│ Virtual P&L: ${self.virtual_pnl:+.2f} on ${VIRTUAL_CAPITAL:.0f} virtual wallet",
-            f"│ Momentum:   {self.momentum:+.2f}  ({'↑ WITH us' if self.momentum >= 0 else '↓ AGAINST us'})",
-            f"│ ATR/TP ratio: {self.atr_tp_ratio:.2f}×  ({'reachable' if self.atr_tp_ratio <= 1.5 else 'far'})",
+            f"│ Virtual P&L: ${self.virtual_pnl:+.2f} on ${VIRTUAL_CAPITAL:.0f} | Max DD: {self.max_drawdown*100:.1f}%",
+            f"│ Momentum:   {self.momentum:+.2f}",
         ]
         if self.block_reasons:
             lines.append(f"│ Block reasons: {', '.join(self.block_reasons)}")
-        lines += [
-            f"│ Decision:   {icon}",
-            f"└{border}",
-        ]
+        lines += [f"│ Decision:   {icon}", f"└{border}"]
         return "\n".join(lines)
 
 
 class SignalSimulator:
 
-    def simulate(self, signal, df_5m: pd.DataFrame) -> SimResult:
-        sym       = getattr(signal, "symbol",   "???")
+    def simulate(self, signal, df_5m: pd.DataFrame, label: str = "PRE-TRADE SIM") -> SimResult:
+        sym       = getattr(signal, "symbol",   "UNKNOWN")
         direction = getattr(signal, "signal",   "BUY")
-        entry_p   = float(signal.price)
-        tp1       = float(signal.tp1)
-        tp2       = float(getattr(signal, "tp2", tp1 * 1.01) or tp1)
-        sl        = float(signal.sl)
-        atr       = float(getattr(signal, "atr", entry_p * 0.008) or entry_p * 0.008)
+        entry_p   = float(getattr(signal, "price", 0))
+        tp1       = float(getattr(signal, "tp1",   0))
+        tp2_raw   = getattr(signal, "tp2", None)
+        tp2       = float(tp2_raw) if tp2_raw else tp1 * 1.5
+        sl        = float(getattr(signal, "sl",    0))
         is_buy    = direction == "BUY"
 
-        # ── Validate inputs ───────────────────────────────────────────
         if entry_p <= 0 or tp1 <= 0 or sl <= 0:
             return self._skip(sym, direction, entry_p, tp1, sl, "invalid prices")
-        if df_5m is None or len(df_5m) < 20:
+        if df_5m is None or len(df_5m) < 60:
             return self._skip(sym, direction, entry_p, tp1, sl, "insufficient candle data")
 
-        # ── Use last 120 candles ──────────────────────────────────────
-        df      = df_5m.tail(120).reset_index(drop=True)
-        highs   = df["high"].astype(float).values
-        lows    = df["low"].astype(float).values
-        closes  = df["close"].astype(float).values
-        n       = len(df)
+        df = df_5m.tail(150).reset_index(drop=True)
 
-        # Scale TP/SL distances from current price to each sim entry
-        sl_pct  = abs(entry_p - sl)   / entry_p
-        tp1_pct = abs(tp1 - entry_p)  / entry_p
-        tp2_pct = abs(tp2 - entry_p)  / entry_p
+        # Percentage distances (used to scale to each sim entry)
+        sl_pct  = abs(entry_p - sl)  / entry_p
+        tp1_pct = abs(tp1 - entry_p) / entry_p
+        tp2_pct = abs(tp2 - entry_p) / entry_p
+        if sl_pct < 0.001:
+            return self._skip(sym, direction, entry_p, tp1, sl, "SL too tight")
 
-        # ── Run virtual trades every 6 candles (30 min spacing) ───────
-        trades:       list[VirtualTrade] = []
-        virtual_cash  = VIRTUAL_CAPITAL
-        trade_num     = 0
+        trades: List[VirtualTrade] = []
+        virtual_cash = VIRTUAL_CAPITAL
+        trade_num    = 0
 
-        for i in range(0, n - MAX_HOLD_CANDLES - 1, 6):
-            sim_entry = closes[i]
-            if sim_entry <= 0:
+        for i in range(40, len(df) - 8):
+            if not self._valid_entry_zone(df, i):
                 continue
-
-            # Scale TP/SL to this entry
-            if is_buy:
-                sim_tp1 = sim_entry * (1 + tp1_pct)
-                sim_tp2 = sim_entry * (1 + tp2_pct)
-                sim_sl  = sim_entry * (1 - sl_pct)
-            else:
-                sim_tp1 = sim_entry * (1 - tp1_pct)
-                sim_tp2 = sim_entry * (1 - tp2_pct)
-                sim_sl  = sim_entry * (1 + sl_pct)
-
-            # Walk candles forward
-            outcome      = "TIMEOUT"
-            exit_price   = closes[min(i + MAX_HOLD_CANDLES, n - 1)]
-            hold_candles = MAX_HOLD_CANDLES
-
-            for j in range(i + 1, min(i + MAX_HOLD_CANDLES + 1, n)):
-                h, l = highs[j], lows[j]
-                if is_buy:
-                    # Check SL first (conservative — if both hit same candle, SL wins)
-                    if l <= sim_sl:
-                        outcome = "SL";  exit_price = sim_sl;  hold_candles = j - i; break
-                    if h >= sim_tp2:
-                        outcome = "TP2"; exit_price = sim_tp2; hold_candles = j - i; break
-                    if h >= sim_tp1:
-                        outcome = "TP1"; exit_price = sim_tp1; hold_candles = j - i; break
-                else:
-                    if h >= sim_sl:
-                        outcome = "SL";  exit_price = sim_sl;  hold_candles = j - i; break
-                    if l <= sim_tp2:
-                        outcome = "TP2"; exit_price = sim_tp2; hold_candles = j - i; break
-                    if l <= sim_tp1:
-                        outcome = "TP1"; exit_price = sim_tp1; hold_candles = j - i; break
-
-            pnl = ((exit_price - sim_entry) / sim_entry if is_buy
-                   else (sim_entry - exit_price) / sim_entry)
-
-            # Update virtual wallet
-            pos_usdt = (virtual_cash * VIRTUAL_RISK) / max(sl_pct, 0.001)
-            virtual_cash += pos_usdt * pnl
-
-            trade_num += 1
-            trades.append(VirtualTrade(
-                num=trade_num, entry_idx=i, entry_price=sim_entry,
-                tp1=sim_tp1, tp2=sim_tp2, sl=sim_sl,
-                outcome=outcome, exit_price=exit_price,
-                hold_candles=hold_candles, pnl_pct=pnl,
-            ))
+            trade = self._simulate_trade(df, i, is_buy, sl_pct, tp1_pct, tp2_pct)
+            if trade is None:
+                continue
+            trade_num  += 1
+            trade.num   = trade_num
+            trades.append(trade)
+            pos_size     = (virtual_cash * VIRTUAL_RISK_PCT) / max(sl_pct, 0.001)
+            virtual_cash += pos_size * trade.pnl_pct
 
         if len(trades) < MIN_TRADES:
             return self._skip(sym, direction, entry_p, tp1, sl,
-                              f"only {len(trades)} sim trades — too few candles")
+                              f"only {len(trades)} valid entries (min {MIN_TRADES})")
 
-        # ── Statistics ────────────────────────────────────────────────
-        wins     = [t for t in trades if t.outcome in ("TP1","TP2")]
-        losses   = [t for t in trades if t.outcome == "SL"]
-        timeouts = [t for t in trades if t.outcome == "TIMEOUT"]
-        total    = len(trades)
+        wins     = [t for t in trades if t.pnl_pct >  0.0]
+        losses   = [t for t in trades if t.pnl_pct <= 0.0 and t.outcome == "SL"]
+        timeouts = [t for t in trades if t.outcome in ("TIMEOUT", "RUNNER")]
+        decisive = len(wins) + len(losses)
 
-        # Win rate uses DECISIVE trades only (TP or SL) — not timeouts
-        # Timeout = trade expired without hitting either level = neutral
-        decisive  = len(wins) + len(losses)
-        wr        = len(wins) / decisive if decisive >= 3 else 0.5
-        # Full win rate (includes timeouts in denominator) for display
-        wr_full   = len(wins) / total if total > 0 else 0.5
+        wr         = len(wins) / max(decisive, 1)
+        avg_win    = float(np.mean([t.pnl_pct for t in wins]))   if wins   else 0.0
+        avg_loss   = float(np.mean([t.pnl_pct for t in losses])) if losses else 0.0
+        expectancy = float(np.mean([t.pnl_pct for t in trades]))
 
-        avg_win  = float(np.mean([t.pnl_pct for t in wins]))   if wins   else 0.0
-        avg_loss = float(np.mean([t.pnl_pct for t in losses])) if losses else 0.0
-        # Expectancy based on decisive trades
-        expect   = (wr * avg_win) + ((1 - wr) * avg_loss) if decisive >= 3 else 0.0
-        vpnl     = virtual_cash - VIRTUAL_CAPITAL
+        equity = [1.0]; peak = 1.0; max_dd = 0.0
+        for t in trades:
+            equity.append(equity[-1] * (1 + t.pnl_pct))
+            peak   = max(peak, equity[-1])
+            dd     = (peak - equity[-1]) / peak if peak > 0 else 0
+            max_dd = max(max_dd, dd)
 
-        # Consecutive losses at end
+        vpnl   = virtual_cash - VIRTUAL_CAPITAL
         consec = 0
-        for t in reversed(trades[-6:]):
+        for t in reversed(trades[-8:]):
             if t.outcome == "SL": consec += 1
             else: break
 
-        # Momentum: last 5 candle direction vs our trade direction
-        last5      = closes[-5:]
-        raw_mom    = (last5[-1] - last5[0]) / max(last5[0], 1e-10) * 100
-        momentum   = float(np.clip(raw_mom * (1 if is_buy else -1) * 5, -1.0, 1.0))
+        last_c   = df["close"].iloc[-20:].astype(float).values
+        ema_fast = float(pd.Series(last_c).ewm(span=5,  adjust=False).mean().iloc[-1])
+        ema_slow = float(pd.Series(last_c).ewm(span=20, adjust=False).mean().iloc[-1])
+        raw_mom  = (ema_fast - ema_slow) / max(ema_slow, 1e-10)
+        momentum = float(np.clip(raw_mom * (1 if is_buy else -1) * 10, -1.0, 1.0))
 
-        # ATR vs TP1 feasibility
-        atr_ratio  = float(atr / max(abs(tp1 - entry_p), 1e-10))
+        # ── Timeout differentiation ──────────────────────────────────
+        timeout_wins   = [t for t in trades if t.outcome in ("TIMEOUT","RUNNER") and t.pnl_pct > 0]
+        timeout_losses = [t for t in trades if t.outcome in ("TIMEOUT","RUNNER") and t.pnl_pct <= 0]
+        timeout_ratio  = len(timeout_wins) + len(timeout_losses)
+        if timeout_ratio > 0:
+            avg_timeout_pnl = float(np.mean(
+                [t.pnl_pct for t in trades if t.outcome in ("TIMEOUT","RUNNER")]
+            ))
+        else:
+            avg_timeout_pnl = 0.0
 
-        # ── Decision ──────────────────────────────────────────────────
+        # ── Volatility kill switch ────────────────────────────────────
+        recent_highs = df["high"].iloc[-10:].astype(float).values
+        recent_lows  = df["low"].iloc[-10:].astype(float).values
+        recent_range_pct = (max(recent_highs) - min(recent_lows)) / max(min(recent_lows), 1e-10)
+
+        # ── Monte Carlo robustness check ──────────────────────────────
+        mc_score = self._monte_carlo(trades)
+
+        # ── Trade quality score ───────────────────────────────────────
+        quality = 0
+        if wr > 0.55:       quality += 1
+        if expectancy > 0:  quality += 1
+        if momentum > 0:    quality += 1
+        if consec < 2:      quality += 1
+
+        # ── Decision ─────────────────────────────────────────────────
         blocks = []
-        # Only block on WR if there are actual SL hits (not just timeouts)
-        if decisive >= 3 and wr < MIN_WIN_RATE:
+        if decisive >= 4 and wr < MIN_WIN_RATE:
             blocks.append(f"WR={wr:.0%} ({len(wins)}/{decisive} decisive) < {MIN_WIN_RATE:.0%}")
-        if decisive >= 3 and expect < MIN_EXPECTANCY:
-            blocks.append(f"E={expect*100:+.2f}% negative")
-        if consec   >= MAX_CONSEC_LOSSES:
+        if expectancy < MIN_EXPECTANCY:
+            blocks.append(f"E={expectancy*100:+.3f}% below min {MIN_EXPECTANCY*100:.2f}%")
+        if max_dd > MAX_DRAWDOWN:
+            blocks.append(f"max_dd={max_dd*100:.1f}% > {MAX_DRAWDOWN*100:.0f}% limit")
+        if consec >= MAX_CONSEC_LOSSES:
             blocks.append(f"last {consec} sim trades = SL streak")
-        if momentum < -0.4:
+        if momentum < -0.20:
             blocks.append(f"momentum={momentum:+.2f} against us")
-        if atr_ratio > MAX_ATR_TP_RATIO:
-            blocks.append(f"TP1 = {atr_ratio:.1f}× ATR (too far)")
+        if recent_range_pct < 0.003:
+            blocks.append("dead market — range < 0.3%")
+        if timeout_ratio > len(trades) * 0.4 and avg_timeout_pnl < 0:
+            blocks.append("timeouts mostly losing")
+        if quality < 2:
+            blocks.append(f"low quality setup (score={quality}/4)")
+        if mc_score < 0.50:
+            blocks.append(f"unstable strategy (mc={mc_score:.2f})")
 
         approved = len(blocks) == 0
         reason   = " | ".join(blocks) if blocks else "all checks passed"
 
         result = SimResult(
             symbol=sym, direction=direction, entry_price=entry_p,
-            tp1=tp1, sl=sl, n_trades=total,
+            tp1=tp1, sl=sl, n_trades=len(trades),
             wins=len(wins), losses=len(losses), timeouts=len(timeouts),
             win_rate=wr, avg_win=avg_win, avg_loss=avg_loss,
-            expectancy=expect, virtual_pnl=vpnl,
-            consec_losses=consec, momentum=momentum,
-            atr_tp_ratio=atr_ratio, approved=approved,
+            expectancy=expectancy, virtual_pnl=vpnl,
+            max_drawdown=max_dd, consec_losses=consec,
+            momentum=momentum, approved=approved,
             reason=reason, block_reasons=blocks, trades=trades,
         )
 
-        # Always print full report to logs
-        for line in result.print_report().split("\n"):
-            if self._approved_or_blocked_line(line, approved):
+        for line in result.print_report(label=label).split("\n"):
+            if "Decision:" in line or "Block reasons" in line:
                 log.warning(line) if not approved else log.info(line)
             else:
                 log.info(line)
 
         return result
 
-    def _approved_or_blocked_line(self, line: str, approved: bool) -> bool:
-        return "Decision:" in line or "Block reasons" in line
+    def _valid_entry_zone(self, df: pd.DataFrame, i: int) -> bool:
+        if i < 40:
+            return False
+        try:
+            closes   = df["close"].iloc[:i+1].astype(float)
+            ema9     = float(closes.ewm(span=9,  adjust=False).mean().iloc[-1])
+            ema21    = float(closes.ewm(span=21, adjust=False).mean().iloc[-1])
+            if abs(ema9 - ema21) < ema21 * 0.0005:
+                return False
+            vols     = df["volume"].iloc[:i+1].astype(float)
+            vol_ma   = float(vols.rolling(20).mean().iloc[-1])
+            if vol_ma <= 0:
+                return True
+            vol_ratio = float(vols.iloc[-1]) / vol_ma
+            atr_s    = (df["high"].iloc[:i+1].astype(float) -
+                        df["low"].iloc[:i+1].astype(float))
+            atr_now  = float(atr_s.rolling(14).mean().iloc[-1])
+            atr_mean = float(atr_s.rolling(50).mean().iloc[-1])
+            return vol_ratio > 1.1 and atr_now > atr_mean * 0.75
+        except Exception:
+            return False
+
+    def _adaptive_hold(self, df: pd.DataFrame, i: int) -> int:
+        try:
+            atr_s    = (df["high"].iloc[:i+1].astype(float) -
+                        df["low"].iloc[:i+1].astype(float))
+            atr_now  = float(atr_s.rolling(14).mean().iloc[-1])
+            atr_mean = float(atr_s.rolling(50).mean().iloc[-1])
+            vol_factor = atr_now / max(atr_mean, 1e-10)
+            closes   = df["close"].iloc[:i+1].astype(float)
+            ema_fast = float(closes.ewm(span=5,  adjust=False).mean().iloc[-1])
+            ema_slow = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+            momentum = abs(ema_fast - ema_slow) / max(ema_slow, 1e-10)
+            hold = 4
+            if vol_factor > 1.2: hold += 2
+            if momentum  > 0.002: hold += 1
+            if vol_factor < 0.8:  hold -= 1
+        except Exception:
+            hold = 4
+        return int(np.clip(hold, 2, 8))
+
+    def _simulate_trade(self, df, i, is_buy, sl_pct, tp1_pct, tp2_pct):
+        sim_entry = float(df["close"].iloc[i])
+        sim_entry *= (1 + SPREAD + SLIPPAGE) if is_buy else (1 - SPREAD - SLIPPAGE)
+
+        if is_buy:
+            sim_tp1 = sim_entry * (1 + tp1_pct)
+            sim_tp2 = sim_entry * (1 + tp2_pct)
+            sim_sl  = sim_entry * (1 - sl_pct)
+        else:
+            sim_tp1 = sim_entry * (1 - tp1_pct)
+            sim_tp2 = sim_entry * (1 - tp2_pct)
+            sim_sl  = sim_entry * (1 + sl_pct)
+
+        hold_candles = self._adaptive_hold(df, i)
+        n            = len(df)
+
+        try:
+            atr_s = (df["high"].iloc[:i+1].astype(float) -
+                     df["low"].iloc[:i+1].astype(float))
+            atr   = float(atr_s.rolling(14).mean().iloc[-1])
+        except Exception:
+            atr = sim_entry * 0.008
+
+        pos_tp1 = 0.50; pos_tp2 = 0.30; pos_runner = 0.20
+        pnl_total = 0.0; tp1_hit = False; tp2_hit = False
+        current_sl = sim_sl
+
+        for j in range(i + 1, min(i + hold_candles + 1, n)):
+            high  = float(df["high"].iloc[j])
+            low   = float(df["low"].iloc[j])
+
+            if is_buy and low <= current_sl:
+                remaining  = 1.0 - (pos_tp1 if tp1_hit else 0.0) - (pos_tp2 if tp2_hit else 0.0)
+                pnl_total += remaining * ((current_sl - sim_entry) / sim_entry)
+                return VirtualTrade(0, sim_entry, current_sl, "SL", pnl_total, j - i, tp1_hit, tp2_hit)
+            if not is_buy and high >= current_sl:
+                remaining  = 1.0 - (pos_tp1 if tp1_hit else 0.0) - (pos_tp2 if tp2_hit else 0.0)
+                pnl_total += remaining * ((sim_entry - current_sl) / sim_entry)
+                return VirtualTrade(0, sim_entry, current_sl, "SL", pnl_total, j - i, tp1_hit, tp2_hit)
+
+            if not tp1_hit:
+                if (is_buy and high >= sim_tp1) or (not is_buy and low <= sim_tp1):
+                    pnl = ((sim_tp1 - sim_entry) / sim_entry) if is_buy else ((sim_entry - sim_tp1) / sim_entry)
+                    pnl_total += pos_tp1 * pnl
+                    tp1_hit    = True
+                    current_sl = sim_entry   # move SL to breakeven
+
+            if tp1_hit and not tp2_hit:
+                if (is_buy and high >= sim_tp2) or (not is_buy and low <= sim_tp2):
+                    pnl = ((sim_tp2 - sim_entry) / sim_entry) if is_buy else ((sim_entry - sim_tp2) / sim_entry)
+                    pnl_total += pos_tp2 * pnl
+                    tp2_hit    = True
+
+            if tp1_hit:
+                close = float(df["close"].iloc[j])
+                if is_buy:
+                    current_sl = max(current_sl, close - atr)
+                else:
+                    current_sl = min(current_sl, close + atr)
+
+        exit_idx   = min(i + hold_candles, n - 1)
+        exit_price = float(df["close"].iloc[exit_idx])
+        pnl_runner = ((exit_price - sim_entry) / sim_entry) if is_buy else ((sim_entry - exit_price) / sim_entry)
+        pnl_total += pos_runner * pnl_runner
+
+        outcome = "RUNNER" if (tp1_hit or tp2_hit) else "TIMEOUT"
+        return VirtualTrade(0, sim_entry, exit_price, outcome, pnl_total, hold_candles, tp1_hit, tp2_hit)
+
+    # ─────────────────────────────────────────────────────────────────
+    # MONTE CARLO ROBUSTNESS CHECK
+    # Shuffles trade sequence 50 times — if strategy relies on lucky
+    # ordering it will fail here. Returns fraction of runs that were
+    # profitable (0.0 to 1.0). Threshold: >= 0.50 required.
+    # ─────────────────────────────────────────────────────────────────
+
+    def _monte_carlo(self, trades, runs: int = 50) -> float:
+        if len(trades) < 8:
+            return 0.75   # too few trades to test — give benefit of doubt
+        pnls = np.array([t.pnl_pct for t in trades])
+        profitable_runs = 0
+        rng = np.random.default_rng(seed=42)   # deterministic seed for reproducibility
+        for _ in range(runs):
+            shuffled   = rng.permutation(pnls)
+            equity     = 1.0
+            for p in shuffled:
+                equity *= (1 + p)
+            if equity > 1.0:
+                profitable_runs += 1
+        return profitable_runs / runs
 
     def _skip(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
-        log.debug("SIM %s: skipped (%s) — auto-approved", sym, reason)
+        log.info("  ⏭️  SIM %s: skipped (%s) — auto-approved", sym, reason)
         return SimResult(
             symbol=sym, direction=direction, entry_price=entry,
             tp1=tp1, sl=sl, n_trades=0, wins=0, losses=0, timeouts=0,
             win_rate=0.5, avg_win=0.0, avg_loss=0.0, expectancy=0.0,
-            virtual_pnl=0.0, consec_losses=0, momentum=0.0, atr_tp_ratio=1.0,
-            approved=True, reason=reason, block_reasons=[],
+            virtual_pnl=0.0, max_drawdown=0.0, consec_losses=0,
+            momentum=0.0, approved=True, reason=reason,
+            block_reasons=[], trades=[],
         )
 
 

@@ -32,7 +32,7 @@ from config import AppConfig
 from src.alerts.whatsapp import WhatsAppSender
 from src.analysis.btc_strength import BtcStrengthEngine
 from src.analysis.news_engine import NewsEngine
-from src.analysis.signal_engine import Signal, SignalEngine
+from src.analysis.signal_engine import Signal, SignalEngine, get_signal_engine
 from src.analysis.spot_signal_engine import SpotSignalEngine, SpotSignal
 from src.trading.binance_trader import BinanceTrader, TradeResult
 from src.data.binance_client import BinanceClient
@@ -283,7 +283,7 @@ class Scanner:
         binance       = BinanceClient(cfg.binance, cfg.scan)
         self._btc     = BtcStrengthEngine(binance, cfg.scan)
         self._news    = NewsEngine(os.environ.get("CRYPTOPANIC_API_KEY", ""))
-        self._sig     = SignalEngine(binance, cfg.signal, cfg.risk, cfg.scan, self._news)
+        self._sig     = get_signal_engine(binance)
         self._spot   = SpotSignalEngine(binance)
         self._trader: "BinanceTrader | None" = None
         self._trader_mode: str = ""   # track current mode so we rebuild if mode changes
@@ -507,8 +507,9 @@ class Scanner:
                 # Simulate the trade on recent candle history before queuing.
                 # Blocks false signals like the ones that caused -5.46% losses.
                 try:
-                    df_5m_sim = self._bin.get_klines(sym, "5m", 120)
-                    sim_result = self._sim.simulate(signal, df_5m_sim)
+                    df_5m_sim = self._bin.get_klines(sym, "5m", 150)
+                    sim_result = self._sim.simulate(signal, df_5m_sim,
+                                                    label="PRE-TRADE SIM")
 
                     if not sim_result.approved:
                         log.warning(
@@ -1219,18 +1220,21 @@ class Scanner:
                                  sig.symbol, _rem)
                         continue
 
-                    # Double-check simulation before real execution
+                    # Double-check simulation before real execution (full report)
                     try:
-                        df_5m_exec = self._bin.get_klines(sig.symbol, "5m", 120)
-                        _exec_sim  = self._sim.simulate(sig, df_5m_exec)
+                        df_5m_exec = self._bin.get_klines(sig.symbol, "5m", 150)
+                        _exec_sim  = self._sim.simulate(sig, df_5m_exec,
+                                                        label="EXEC RE-SIM")
                         if not _exec_sim.approved:
                             log.warning(
-                                "🚫 EXEC SIM BLOCKED %s | %s",
-                                sig.symbol, _exec_sim.reason)
+                                "🚫 EXEC SIM BLOCKED %s | WR=%.0f%% E=%+.2f%% | %s",
+                                sig.symbol, _exec_sim.win_rate*100,
+                                _exec_sim.expectancy*100, _exec_sim.reason)
                             continue   # skip — don't execute
-                        log.info("✅ EXEC SIM OK %s WR=%.0f%% E=%+.2f%%",
+                        log.info("✅ EXEC SIM OK %s WR=%.0f%% E=%+.2f%% DD=%.1f%%",
                                  sig.symbol, _exec_sim.win_rate*100,
-                                 _exec_sim.expectancy*100)
+                                 _exec_sim.expectancy*100,
+                                 _exec_sim.max_drawdown*100)
                     except Exception as _es:
                         log.warning("Exec sim error %s: %s", sig.symbol, _es)
 

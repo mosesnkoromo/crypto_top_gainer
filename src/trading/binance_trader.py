@@ -89,8 +89,66 @@ class BinanceTrader:
                  mode.upper(), "LIVE" if live else "TESTNET",
                  risk_pct, daily_loss_limit_pct)
 
+
+    # ════════════════════════════════════════════════════════════════════
+    # FUTURES SYMBOL NORMALIZATION
+    # Some pairs on Binance Futures use a 1000x prefix because the
+    # token price is too small (e.g. LUNC, BONK, SHIB, FLOKI, PEPE, XEC).
+    # Spot ticker: LUNCUSDT → Futures: 1000LUNCUSDT
+    # ════════════════════════════════════════════════════════════════════
+
+    # Known static mapping: spot → futures symbol
+    _FUTURES_1000_SYMBOLS = {
+        "LUNCUSDT",   "BONKUSDT",   "SHIBUSDT",   "FLOKIUSDT",
+        "XECUSDT",    "PEPEUSDT",   "SATSUSDT",   "RATSUSDT",
+        "CATUSDT",    "BTTCUSDT",   "HOTUSDT",    "WINUSDT",
+        "NFTUSDT",    "DODOGIUSDT",
+    }
+    # Cache built at runtime from exchange info
+    _futures_sym_cache: dict = {}
+
+    def _normalize_futures_sym(self, sym: str) -> str:
+        """
+        Convert spot symbol to correct Binance Futures symbol.
+        - LUNCUSDT → 1000LUNCUSDT  (known 1000-prefix pairs)
+        - Others remain unchanged
+        Also validates against exchange info and caches result.
+        """
+        # Check cache first
+        if sym in self._futures_sym_cache:
+            return self._futures_sym_cache[sym]
+
+        # Known static mapping
+        if sym in self._FUTURES_1000_SYMBOLS:
+            mapped = "1000" + sym
+            self._futures_sym_cache[sym] = mapped
+            log.debug("Futures symbol mapped: %s → %s", sym, mapped)
+            return mapped
+
+        # Dynamic check: query exchange info to verify symbol exists
+        # If "SYM" doesn't exist but "1000SYM" does, use 1000 version
+        try:
+            info = self._req("GET", "/fapi/v1/exchangeInfo", {}) or {}
+            valid = {s["symbol"] for s in info.get("symbols", [])}
+            if valid:
+                if sym not in valid and ("1000" + sym) in valid:
+                    mapped = "1000" + sym
+                    self._futures_sym_cache[sym] = mapped
+                    # Also add to static set for future calls
+                    self._FUTURES_1000_SYMBOLS.add(sym)
+                    log.info("Futures symbol auto-detected: %s → %s", sym, mapped)
+                    return mapped
+                # Cache the valid result
+                self._futures_sym_cache[sym] = sym
+        except Exception:
+            pass
+
+        return sym
+
     def execute_signal(self, signal, balance_usdt: float) -> TradeResult:
         sym = signal.symbol
+        # Normalize to correct futures symbol (handles 1000LUNCUSDT etc.)
+        futures_sym = self._normalize_futures_sym(sym) if self._mode == "futures" else sym
         ok, reason = self._pre_flight(balance_usdt)
         if not ok:
             log.warning("Trade blocked [%s]: %s", sym, reason)
@@ -149,7 +207,7 @@ class BinanceTrader:
         try:
             r = (self._spot(sym, signal, qty, info, risk_usdt, pos_usdt)
                  if self._mode == "spot"
-                 else self._futures(sym, signal, qty, info, risk_usdt, pos_usdt))
+                 else self._futures(futures_sym, signal, qty, info, risk_usdt, pos_usdt))
             if r.success:
                 self._daily_trades += 1
             return r
@@ -579,6 +637,8 @@ class BinanceTrader:
     # ─── FUTURES ────────────────────────────────────────────────────────
 
     def _futures(self, sym, signal, qty, info, risk_usdt, pos_usdt) -> TradeResult:
+        # sym is already normalized by execute_signal, but normalize again for safety
+        sym = self._normalize_futures_sym(sym)
         is_long    = signal.signal == "BUY"
         side       = "BUY" if is_long else "SELL"
         close_side = "SELL" if is_long else "BUY"

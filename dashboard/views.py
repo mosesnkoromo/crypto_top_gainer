@@ -9,6 +9,7 @@ import logging
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
+import now
 from django.shortcuts import render
 from django.http import JsonResponse
 from django.utils import timezone
@@ -438,15 +439,17 @@ def sim_stats(request):
 
 
 def ml_insights(request):
-    """GET: ML model status, build progress, and top predictive features."""
-    try:
-        from src.analysis.ml_filter import MLSignalFilter
-        from src.analysis.ml_historical import _BUILD_PROGRESS
-        ml = MLSignalFilter()
-        insights = ml.get_insights()
-        return JsonResponse({"model": insights, "progress": _BUILD_PROGRESS})
-    except Exception as e:
-        return JsonResponse({"model": {"ready": False, "message": str(e)}, "progress": {}})
+    """GET: ML removed in v4.2 — returns disabled status for dashboard compatibility."""
+    return JsonResponse({
+        "model": {
+            "ready":    False,
+            "message":  "ML removed — rule-based strategy + HTF cascade v4.2",
+            "samples":  0,
+            "accuracy": 0,
+            "features": [],
+        },
+        "progress": {}
+    })
 
 
 @csrf_exempt
