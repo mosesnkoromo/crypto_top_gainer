@@ -115,6 +115,10 @@ class SignalSimulator:
         tp1_pct = abs(tp1 - entry_p) / entry_p
         tp2_pct = abs(tp2 - entry_p) / entry_p
         if sl_pct < 0.001:
+            # SL too tight for simulation — signal_engine already enforces min 0.3%
+            # so if we reach here it's a rounding edge case — skip sim, allow trade
+            log.info("  ⏭️  SIM %s: SL too tight (%.4f%%) — skipping sim, auto-approved",
+                     sym, sl_pct * 100)
             return self._skip(sym, direction, entry_p, tp1, sl, "SL too tight")
 
         trades: List[VirtualTrade] = []

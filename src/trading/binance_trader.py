@@ -290,9 +290,9 @@ class BinanceTrader:
                 if algo_all:
                     log.debug("Merged %d algo orders into protect map", len(algo_all))
             except Exception as _ae:
-                log.debug("Algo orders fetch: %s", _ae)
+                log.warning("Algo orders fetch FAILED (SL may be missed): %s", _ae)
 
-            SL_TYPES  = {"STOP_MARKET", "STOP", "STOP_LOSS", "STOP_LOSS_LIMIT"}
+            SL_TYPES  = {"STOP_MARKET", "STOP", "STOP_LOSS", "STOP_LOSS_LIMIT", "STOP_MARKET_TRAILING", "CONDITIONAL"}
             TSL_TYPES = {"TRAILING_STOP_MARKET"}
             TP_TYPES  = {"TAKE_PROFIT_MARKET", "TAKE_PROFIT", "LIMIT"}
 
@@ -480,6 +480,18 @@ class BinanceTrader:
                             log.info("  %s: TSL placed (%s × %.1f) ✅", sym, regime, atr_mult)
 
                 # Place SL if missing
+                # Extra duplicate guard: check if any existing order IS a stop near SL price
+                if not has_sl:
+                    # Check raw orders for any stop-like order regardless of type name
+                    _stop_keywords = ("STOP", "stop", "CONDITIONAL", "conditional")
+                    _has_any_stop  = any(
+                        any(kw in str(o.get("type","")) for kw in _stop_keywords)
+                        for o in orders_sym
+                    )
+                    if _has_any_stop:
+                        log.debug("  %s: stop-like order found in orders — treating as SL present", sym)
+                        has_sl = True
+
                 if not has_sl:
                     # Calculate SL from entry if no signal available
                     if sig:

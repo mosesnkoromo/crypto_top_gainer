@@ -77,6 +77,7 @@ class SignalEngine:
             df_1m  = self._get_df(sym, "1m",   50)
 
             if df_5m is None or len(df_5m) < 100:
+                log.debug("  ⏭️  %s: insufficient candle data — skip", sym)
                 return None
 
             price = float(df_5m["close"].astype(float).iloc[-1])
@@ -89,6 +90,7 @@ class SignalEngine:
 
             tqi_min = {"Strong_Trend_Impulse": 0.15, "Trending": 0.20, "Choppy_Range": 0.30}
             if tqi_val < tqi_min[regime]:
+                log.info("  ⏭️  %s: TQI=%.2f too choppy for %s — skip", sym, tqi_val, regime)
                 return None
 
             # Step 2: HTF cascade
@@ -114,7 +116,9 @@ class SignalEngine:
             elif macd_h < 0 and (wt1 < wt2 or wt_dn):  direction = "SELL"
             elif macd_h > 0:                             direction = "BUY"
             elif macd_h < 0:                             direction = "SELL"
-            else:                                        return None
+            else:
+                log.info("  ⏭️  %s: MACD flat (hist=%.4f) — no direction → skip", sym, macd_h)
+                return None
 
             is_buy = direction == "BUY"
 
@@ -152,26 +156,38 @@ class SignalEngine:
                 if rsi_5m < 25:
                     conflicts += 1; conflict_detail.append(f"RSI={rsi_5m:.0f}↓oversold")
 
-            if conflicts >= 2:
-                log.info("  ❌ %s %s | %d indicator conflicts (%s) → skip",
+            # Conflicts now penalise score instead of blocking
+            # Hard block only on 4+ conflicts (truly contradictory signal)
+            conflict_penalty = conflicts * 4   # -4 pts per conflict
+            if conflicts >= 4:
+                log.info("  ❌ %s %s | %d indicator conflicts (%s) — too contradictory → skip",
                          sym, direction, conflicts, " ".join(conflict_detail))
                 return None
+            elif conflicts > 0:
+                log.info("  ⚠️  %s %s | %d indicator conflict(s) (%s) → score penalty -%d",
+                         sym, direction, conflicts, " ".join(conflict_detail), conflict_penalty)
 
-            # Step 5: HTF hard gate
+            # Step 5: HTF gate — hard block only when ALL major TFs strongly against
+            # (1W+1D+4H all bearish = true bear market, no BUY; vice versa for SELL)
+            # Softer misalignment converts to score penalty instead of hard block
+            htf_penalty = 0
             if is_buy:
-                if is_major_bear:
-                    log.info("  ❌ %s BUY | MAJOR TFs BEARISH (1D↓+4H↓) — %s → blocked", sym, htf_str)
+                # Only hard block if 1W+1D+4H all bearish (total ≤ -9)
+                if htf_score <= -9:
+                    log.info("  ❌ %s BUY | ALL major TFs bearish (score=%+d) — %s → blocked",
+                             sym, htf_score, htf_str)
                     return None
-                if htf_score <= -4:
-                    log.info("  ❌ %s BUY | HTF score=%+d too negative → blocked", sym, htf_score)
-                    return None
+                # Soft: penalise for each bearish major TF
+                if is_major_bear:  htf_penalty += 10  # 1D+4H both bearish
+                elif htf_score < 0: htf_penalty += abs(htf_score) * 1.5
             else:
-                if is_major_bull:
-                    log.info("  ❌ %s SELL | MAJOR TFs BULLISH (1D↑+4H↑) — %s → blocked", sym, htf_str)
+                # Only hard block if 1W+1D+4H all bullish (total ≥ +9)
+                if htf_score >= 9:
+                    log.info("  ❌ %s SELL | ALL major TFs bullish (score=%+d) — %s → blocked",
+                             sym, htf_score, htf_str)
                     return None
-                if htf_score >= 4:
-                    log.info("  ❌ %s SELL | HTF score=%+d too positive → blocked", sym, htf_score)
-                    return None
+                if is_major_bull:  htf_penalty += 10
+                elif htf_score > 0: htf_penalty += htf_score * 1.5
 
             # Step 6: BTC filter
             if is_buy  and btc_score < 30:
@@ -181,13 +197,26 @@ class SignalEngine:
                 log.info("  ❌ %s SELL blocked | BTC=%d (bull market)", sym, btc_score)
                 return None
 
-            # Step 7: RSI hard blocks
-            if is_buy  and (rsi_5m > 80 or rsi_1h > 82):
-                log.info("  ❌ %s BUY | RSI overbought (5m=%.0f 1h=%.0f) → skip", sym, rsi_5m, rsi_1h)
-                return None
-            if not is_buy and (rsi_5m < 20 or rsi_1h < 18):
-                log.info("  ❌ %s SELL | RSI oversold (5m=%.0f 1h=%.0f) → skip", sym, rsi_5m, rsi_1h)
-                return None
+            # Step 7: RSI extreme blocks — hard block only at truly extreme levels
+            # Strong_Trend_Impulse: allow overbought continuation (BTC/SOL breakouts)
+            # Other regimes: penalise but don't fully block until extreme
+            rsi_penalty = 0
+            if is_buy:
+                if rsi_5m > 90 or rsi_1h > 88:   # truly extreme — block
+                    log.info("  ❌ %s BUY | RSI extreme (5m=%.0f 1h=%.0f) → skip", sym, rsi_5m, rsi_1h)
+                    return None
+                elif rsi_5m > 78 and regime != "Strong_Trend_Impulse":
+                    rsi_penalty = (rsi_5m - 78) * 1.5   # e.g. RSI=82 → -6 pts
+                elif rsi_5m > 82:   # strong trend but still very high
+                    rsi_penalty = (rsi_5m - 82) * 1.0
+            else:
+                if rsi_5m < 10 or rsi_1h < 12:   # truly extreme — block
+                    log.info("  ❌ %s SELL | RSI extreme (5m=%.0f 1h=%.0f) → skip", sym, rsi_5m, rsi_1h)
+                    return None
+                elif rsi_5m < 22 and regime != "Strong_Trend_Impulse":
+                    rsi_penalty = (22 - rsi_5m) * 1.5
+                elif rsi_5m < 18:
+                    rsi_penalty = (18 - rsi_5m) * 1.0
 
             # Step 8: Confluence score
             score = 40.0
@@ -219,7 +248,14 @@ class SignalEngine:
             score += htf_bonus
             score  = min(100.0, score)
 
-            threshold = {"Strong_Trend_Impulse": 62, "Trending": 68, "Choppy_Range": 80}[regime]
+            # Apply accumulated gate penalties before threshold check
+            score -= htf_penalty      # HTF misalignment penalty (0–15)
+            score -= rsi_penalty      # RSI extreme penalty (0–12)
+            score -= conflict_penalty # Indicator conflict penalty (0–12)
+            score = max(0.0, min(100.0, score))
+
+            # Relaxed thresholds — 60/65/72 (was: 62/68/80)
+            threshold = {"Strong_Trend_Impulse": 60, "Trending": 65, "Choppy_Range": 72}[regime]
             if score < threshold:
                 log.info("  ❌ %s %s | score=%.0f/%.0f | regime=%s | rsi=%.0f | 🚫 weak setup",
                          sym, direction, score, threshold, regime, rsi_5m)
@@ -227,7 +263,8 @@ class SignalEngine:
 
             # Step 9: Sniper
             sniper = self._sniper_1m(df_1m, is_buy)
-            if sniper < 0.40:
+            sniper_min = 0.35   # relaxed from 0.40 — allow more entries
+            if sniper < sniper_min:
                 log.info("  ❌ %s %s | sniper=%.0f%% too weak → skip", sym, direction, sniper*100)
                 return None
 
@@ -239,6 +276,9 @@ class SignalEngine:
             # Step 11: TP/SL
             sl_mult = {"Strong_Trend_Impulse": 1.2, "Trending": 1.5, "Choppy_Range": 1.8}[regime]
             sl_dist = atr_val * sl_mult
+            # Minimum SL distance: 0.3% of price (prevents "SL too tight" on low-vol pairs)
+            min_sl_dist = price * 0.003
+            sl_dist = max(sl_dist, min_sl_dist)
             if is_buy:
                 sl  = price - sl_dist
                 tp1 = price + sl_dist * 0.8
@@ -255,9 +295,17 @@ class SignalEngine:
             elif score >= 62: _rating = "🟢 GOOD"
             else:             _rating = "🟡 MARGINAL"
 
-            log.info("  ✅ %s %s | score=%.0f/100 %s | regime=%s | rsi=%.0f | atr=%.2f%% | HTF:%s(%+d) ADX4H=%.0f",
-                     sym, direction, score, _rating, regime, rsi_5m,
-                     atr_val / price * 100, htf_str, htf_score, adx_4h)
+            # Strategy type label for log clarity
+            _strategy = ("TREND CONTINUATION" if regime == "Strong_Trend_Impulse" else
+                         "SWING"              if regime == "Trending" else
+                         "MEAN REVERSION")
+
+            log.info(
+                "  ✅ %s %s | score=%.0f/100 %s | %s | regime=%s | rsi=%.0f | atr=%.2f%% | "
+                "HTF:%s(%+d) ADX4H=%.0f | penalties: htf=%.0f rsi=%.0f conf=%.0f",
+                sym, direction, score, _rating, _strategy, regime, rsi_5m,
+                atr_val / price * 100, htf_str, htf_score, adx_4h,
+                htf_penalty, rsi_penalty, conflict_penalty)
 
             self.signals_this_cycle += 1
             return Signal(
