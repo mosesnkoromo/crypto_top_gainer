@@ -73,6 +73,7 @@ class BinanceTrader:
         self._secret     = api_secret
         self._mode       = mode
         self._live       = live
+        self._recently_placed: dict = {}   # {symbol: timestamp} for SL grace period
         self._risk       = risk_pct
         self._loss_limit = daily_loss_limit_pct
         self._max_trades = max_trades_per_day
@@ -172,9 +173,12 @@ class BinanceTrader:
             _open_count = len(self.get_positions()) if self._mode == "futures" else 0
         except Exception:
             _open_count = 0
-        if _open_count >= 3:   _cap = 0.50
-        elif _open_count == 2: _cap = 0.65
-        elif _open_count == 1: _cap = 0.80
+        if   _open_count >= 6: _cap = 0.40   # 6 positions — reduce risk per trade
+        elif _open_count == 5: _cap = 0.45
+        elif _open_count == 4: _cap = 0.50
+        elif _open_count == 3: _cap = 0.60
+        elif _open_count == 2: _cap = 0.70
+        elif _open_count == 1: _cap = 0.85
         else:                  _cap = 1.00
         # ML confidence scaling
         if _ml_p >= 0.75 or _sn_p >= 0.90: _conf = 1.2
@@ -246,7 +250,7 @@ class BinanceTrader:
             total_orders = len(open_orders)
 
             # Duplicate cleanup — each position can have up to 8 orders legitimately
-            max_ok = max(len(positions) * 8, 20)
+            max_ok = max(len(positions) * 8, 50)   # 6 positions × ~8 orders each = 48
             if total_orders > max_ok and positions:
                 log.warning("Duplicate orders (%d > %d) — cancelling all to reset",
                             total_orders, max_ok)
@@ -271,24 +275,28 @@ class BinanceTrader:
             for o in open_orders:
                 sym_orders.setdefault(o.get("symbol", ""), []).append(o)
 
-            # Fetch algo orders and merge — SL/TSL placed via algoOrder
-            # live in /fapi/v1/openAlgoOrders, NOT in standard openOrders
+            # Fetch algo orders per-symbol (more reliable than global fetch)
+            # Also do global fetch as backup
             try:
-                algo_resp = self._req("GET", "/fapi/v1/openAlgoOrders", {}) or {}
-                algo_all  = algo_resp.get("algoOrders", []) if isinstance(algo_resp, dict) else []
-                for ao in algo_all:
-                    _sym  = ao.get("symbol", "")
-                    _type = ao.get("orderType") or ao.get("type", "")
-                    if _sym:
-                        # Normalise to standard order shape for type detection
-                        sym_orders.setdefault(_sym, []).append({
-                            "type":      _type,
-                            "orderId":   ao.get("algoId", ""),
-                            "symbol":    _sym,
-                            "_is_algo":  True,
-                        })
-                if algo_all:
-                    log.debug("Merged %d algo orders into protect map", len(algo_all))
+                # Per-symbol fetch for each open position (avoids global propagation lag)
+                for _pos_sym in {p.get("symbol","") for p in positions if p.get("symbol")}:
+                    try:
+                        _sym_algo = self._req("GET", "/fapi/v1/openAlgoOrders",
+                                              {"symbol": _pos_sym}) or {}
+                        _sym_algo_list = (_sym_algo.get("algoOrders", [])
+                                         if isinstance(_sym_algo, dict) else [])
+                        for ao in _sym_algo_list:
+                            _type = ao.get("orderType") or ao.get("type", "")
+                            sym_orders.setdefault(_pos_sym, []).append({
+                                "type":    _type,
+                                "orderId": ao.get("algoId", ""),
+                                "symbol":  _pos_sym,
+                                "_is_algo": True,
+                            })
+                        if _sym_algo_list:
+                            log.debug("  %s: %d algo orders merged", _pos_sym, len(_sym_algo_list))
+                    except Exception:
+                        pass
             except Exception as _ae:
                 log.warning("Algo orders fetch FAILED (SL may be missed): %s", _ae)
 
@@ -298,6 +306,25 @@ class BinanceTrader:
 
             log.info("protect_open_positions: %d positions, %d open orders",
                      len(positions), len(open_orders))
+
+            # ── Cleanup orphaned orders (orders with no matching position) ──
+            active_syms = {p.get("symbol","") for p in positions
+                          if abs(float(p.get("positionAmt", 0))) >= 0.0001}
+            for _osym, _oorders in sym_orders.items():
+                if _osym and _oorders and _osym not in active_syms:
+                    log.info("  %s: orphaned orders (no position) — cancelling %d orders",
+                             _osym, len(_oorders))
+                    try:
+                        self._req("DELETE", "/fapi/v1/allOpenOrders", {"symbol": _osym})
+                        _a = self._req("GET", "/fapi/v1/openAlgoOrders", {"symbol": _osym}) or {}
+                        for _ao in (_a.get("algoOrders",[]) if isinstance(_a,dict) else []):
+                            _aid = _ao.get("algoId") or _ao.get("orderId")
+                            if _aid:
+                                self._req("DELETE", "/fapi/v1/algoOrder",
+                                          {"symbol": _osym, "algoId": _aid})
+                        log.info("  %s: orphaned orders cancelled ✅", _osym)
+                    except Exception as _oe:
+                        log.warning("  %s: orphan cleanup failed: %s", _osym, _oe)
 
             for pos in positions:
                 sym = pos.get("symbol", "")
@@ -491,6 +518,16 @@ class BinanceTrader:
                     if _has_any_stop:
                         log.debug("  %s: stop-like order found in orders — treating as SL present", sym)
                         has_sl = True
+
+                # Grace period: if position was placed in last 120s, SL was just placed
+                # Binance algo orders have 3-10s propagation delay → false has_sl=❌
+                if not has_sl:
+                    import time as _time_gp
+                    _placed_at = self._recently_placed.get(sym, 0)
+                    if _time_gp.time() - _placed_at < 120:
+                        log.info("  %s: SL grace period (placed %.0fs ago) — skipping duplicate SL",
+                                 sym, _time_gp.time() - _placed_at)
+                        has_sl = True   # assume SL is there, just not propagated yet
 
                 if not has_sl:
                     # Calculate SL from entry if no signal available
@@ -791,6 +828,9 @@ class BinanceTrader:
                  side, sym, qty, fill_price, lev, entry_id)
         log.info("Futures orders placed: entry=%s tp1=%s tp2=%s tp3=%s sl=%s tsl=%s",
                  entry_id, tp1_id, tp2_id, tp3_id, sl_id, tsl_id)
+        # Mark symbol as recently placed — protect loop skips duplicate SL for 120s
+        import time as _time_rp
+        self._recently_placed[sym] = _time_rp.time()
         return TradeResult(True, sym, side, qty, fill_price, mode="futures", leverage=lev,
                            position_usdt=round(pos_usdt*lev,2), risk_usdt=round(risk_usdt,2),
                            entry_order_id=entry_id, tp1_order_id=tp1_id,

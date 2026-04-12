@@ -44,6 +44,7 @@ class Signal:
     tqi:            float = 0.5
     displacement_ratio: float = 0.0
     position_size:  float = 1.0
+    tag:            str   = "STANDARD"   # STANDARD | CONFIRMATION | CAPITULATION
 
 
 class SignalEngine:
@@ -111,14 +112,80 @@ class SignalEngine:
                                df_5m["low"].astype(float)).rolling(14).mean().iloc[-1])
             cci_val  = self._cci(df_5m, 20)
 
-            # Step 4: Direction
-            if   macd_h > 0 and (wt1 > wt2 or wt_up):  direction = "BUY"
-            elif macd_h < 0 and (wt1 < wt2 or wt_dn):  direction = "SELL"
-            elif macd_h > 0:                             direction = "BUY"
-            elif macd_h < 0:                             direction = "SELL"
+            # ── Volume Analysis ──────────────────────────────────────
+            vol_ratio, obv_rising, vol_spike = self._volume_analysis(df_5m, df_1h)
+
+            # Step 4: Direction — HTF decides WHAT to trade, LTF decides WHEN
+            # ─────────────────────────────────────────────────────────
+            # Derive bias from HTF cascade (already computed above)
+            if   htf_score >= 3:   htf_direction = "BUY"    # 1D+4H or more aligned up
+            elif htf_score <= -3:  htf_direction = "SELL"   # 1D+4H or more aligned down
+            else:                  htf_direction = "NEUTRAL" # mixed/sideways
+
+            # LTF readiness: 5m MACD + WaveTrend confirm timing
+            ltf_buy  = macd_h > 0 and (wt1 > wt2 or wt_up)
+            ltf_sell = macd_h < 0 and (wt1 < wt2 or wt_dn)
+            ltf_buy_weak  = macd_h > 0   # MACD only, no WT confirmation
+            ltf_sell_weak = macd_h < 0
+
+            if htf_direction == "BUY":
+                # HTF says BUY — only look for BUY entries
+                if ltf_buy:
+                    direction = "BUY"     # strong: MACD + WT aligned
+                elif ltf_buy_weak:
+                    direction = "BUY"     # weak: MACD only (WT lagging)
+                else:
+                    # LTF is bearish in a bullish HTF — pullback in progress, wait
+                    log.info("  ⏭️  %s: HTF bullish (score=%+d) but LTF bearish — pullback, skip",
+                             sym, htf_score)
+                    return None
+
+            elif htf_direction == "SELL":
+                # HTF says SELL — only look for SELL entries
+                if ltf_sell:
+                    direction = "SELL"
+                elif ltf_sell_weak:
+                    direction = "SELL"
+                else:
+                    log.info("  ⏭️  %s: HTF bearish (score=%+d) but LTF bullish — pullback, skip",
+                             sym, htf_score)
+                    return None
+
             else:
-                log.info("  ⏭️  %s: MACD flat (hist=%.4f) — no direction → skip", sym, macd_h)
+                # HTF NEUTRAL (range/mixed) — allow both directions based on LTF only
+                # This handles Choppy_Range regime mean-reversion trades
+                if   ltf_buy  or ltf_buy_weak:   direction = "BUY"
+                elif ltf_sell or ltf_sell_weak:  direction = "SELL"
+                else:
+                    log.info("  ⏭️  %s: MACD flat (hist=%.4f) — no direction → skip", sym, macd_h)
+                    return None
+
+            # ── CAPITULATION OVERRIDE ──────────────────────────────
+            # BTC RSI < 25 (extreme oversold) = market panic/capitulation
+            # These are the HIGHEST edge mean-reversion BUY setups
+            # Allow BUY signals on oversold pairs even during pullback
+            btc_rsi = btc.rsi if hasattr(btc, "rsi") else 50
+            if btc_rsi < 25 and direction == "SELL" and rsi_5m < 25:
+                # Don't SELL into extreme oversold during capitulation
+                log.info("  ⏭️  %s: Capitulation mode (BTC RSI=%.0f) — skip SELL at oversold RSI=%.0f",
+                         sym, btc_rsi, rsi_5m)
                 return None
+
+            # Velocity check: only enter capitulation BUY when RSI is RISING (panic ending)
+            # RSI=12 dropping = still dangerous; RSI=12→24 rising = momentum shift = buy edge
+            btc_rsi_prev = getattr(btc, "rsi_prev", btc_rsi)  # fallback to current if unavailable
+            btc_rsi_rising = btc_rsi > btc_rsi_prev or btc_rsi > 20   # rising or recovered above 20
+
+            if btc_rsi < 25 and htf_direction == "BUY" and not (ltf_buy or ltf_buy_weak):
+                # Allow BUY only when: pair oversold AND BTC RSI rising (velocity confirms)
+                if rsi_5m < 30 and btc_rsi_rising:
+                    log.info("  📍 %s: Capitulation BUY (BTC RSI=%.0f↑, pair RSI=%.0f) — override pullback",
+                             sym, btc_rsi, rsi_5m)
+                    direction = "BUY"
+                elif rsi_5m < 30 and not btc_rsi_rising:
+                    log.info("  ⏭️  %s: Capitulation — BTC RSI still falling (%.0f), wait",
+                             sym, btc_rsi)
+                    return None
 
             is_buy = direction == "BUY"
 
@@ -235,6 +302,29 @@ class SignalEngine:
 
             if abs(macd_h) > 0.05: score += 8
 
+            # Volume confirmation scoring
+            if vol_spike:
+                # Volume spike (3×+ average) — confirms breakout move
+                score += 8 if is_buy else 8
+                log.debug("  %s: volume spike %.1f× avg → +8", sym, vol_ratio)
+            elif vol_ratio >= 1.5:
+                # Above-average volume confirms direction
+                score += 5
+            elif vol_ratio < 0.7:
+                # Very low volume = weak move, likely to reverse
+                score -= 5
+                log.debug("  %s: thin volume %.1f× avg → -5", sym, vol_ratio)
+
+            # OBV trend — money flow direction
+            if is_buy and obv_rising:
+                score += 6   # buyers accumulating = confirms BUY
+            elif not is_buy and not obv_rising:
+                score += 6   # sellers distributing = confirms SELL
+            elif is_buy and not obv_rising:
+                score -= 4   # selling pressure on BUY signal = caution
+            elif not is_buy and obv_rising:
+                score -= 4   # buying pressure on SELL signal = caution
+
             if is_buy  and 35 < rsi_5m < 68: score += 8
             if not is_buy and 32 < rsi_5m < 65: score += 8
 
@@ -263,9 +353,12 @@ class SignalEngine:
 
             # Step 9: Sniper
             sniper = self._sniper_1m(df_1m, is_buy)
-            sniper_min = 0.35   # relaxed from 0.40 — allow more entries
+            # Relax sniper during capitulation — recovery moves start weak then gain momentum
+            _btc_rsi_snap = getattr(btc, "rsi", 50)
+            sniper_min = 0.20 if _btc_rsi_snap < 32 else 0.35
             if sniper < sniper_min:
-                log.info("  ❌ %s %s | sniper=%.0f%% too weak → skip", sym, direction, sniper*100)
+                log.info("  ❌ %s %s | sniper=%.0f%% too weak (min=%.0f%%) → skip",
+                         sym, direction, sniper*100, sniper_min*100)
                 return None
 
             # Step 10: Grade (MUST match scanner's ULTRA/STRONG/STANDARD)
@@ -279,21 +372,33 @@ class SignalEngine:
             # Minimum SL distance: 0.3% of price (prevents "SL too tight" on low-vol pairs)
             min_sl_dist = price * 0.003
             sl_dist = max(sl_dist, min_sl_dist)
+            # R:R enforcement: TP1 must be ≥ 1.5× SL to ensure positive expectancy
+            # Old: TP1=0.8×SL (R:R<1 → negative E even at 70% WR)
+            # New: TP1=1.5×SL (R:R=1.5 → positive E at just 40% WR)
             if is_buy:
                 sl  = price - sl_dist
-                tp1 = price + sl_dist * 0.8
-                tp2 = price + sl_dist * 1.8
-                tp3 = price + sl_dist * 3.0
+                tp1 = price + sl_dist * 1.5   # was 0.8 — enforces min R:R 1.5
+                tp2 = price + sl_dist * 2.5   # was 1.8
+                tp3 = price + sl_dist * 4.0   # was 3.0 — runner
             else:
                 sl  = price + sl_dist
-                tp1 = price - sl_dist * 0.8
-                tp2 = price - sl_dist * 1.8
-                tp3 = price - sl_dist * 3.0
+                tp1 = price - sl_dist * 1.5
+                tp2 = price - sl_dist * 2.5
+                tp3 = price - sl_dist * 4.0
 
             if   score >= 88: _rating = "🟢🟢🟢 EXCELLENT"
             elif score >= 75: _rating = "🟢🟢 STRONG"
             elif score >= 62: _rating = "🟢 GOOD"
             else:             _rating = "🟡 MARGINAL"
+
+            # Dynamic risk tag
+            btc_rsi_chk = getattr(btc, "rsi", 50)
+            if btc_rsi_chk < 25:
+                signal_tag = "CAPITULATION"
+            elif grade in ("ULTRA", "STRONG"):
+                signal_tag = "CONFIRMATION"
+            else:
+                signal_tag = "STANDARD"
 
             # Strategy type label for log clarity
             _strategy = ("TREND CONTINUATION" if regime == "Strong_Trend_Impulse" else
@@ -302,14 +407,16 @@ class SignalEngine:
 
             log.info(
                 "  ✅ %s %s | score=%.0f/100 %s | %s | regime=%s | rsi=%.0f | atr=%.2f%% | "
-                "HTF:%s(%+d) ADX4H=%.0f | penalties: htf=%.0f rsi=%.0f conf=%.0f",
+                "vol=%.1f× %s | HTF:%s(%+d) ADX4H=%.0f | penalties: htf=%.0f rsi=%.0f conf=%.0f",
                 sym, direction, score, _rating, _strategy, regime, rsi_5m,
-                atr_val / price * 100, htf_str, htf_score, adx_4h,
+                atr_val / price * 100,
+                vol_ratio, "📈OBV↑" if obv_rising else "📉OBV↓",
+                htf_str, htf_score, adx_4h,
                 htf_penalty, rsi_penalty, conflict_penalty)
 
             self.signals_this_cycle += 1
             return Signal(
-                symbol=sym, signal=direction, grade=grade,
+                symbol=sym, signal=direction, grade=grade, tag=signal_tag,
                 confidence=int(score),
                 action="ENTER_LONG" if is_buy else "ENTER_SHORT",
                 price=price, rsi_1h=rsi_1h, rsi_4h=rsi_1h, rsi_daily=rsi_1h,
@@ -442,6 +549,42 @@ class SignalEngine:
             return float((line - line.ewm(span=9, adjust=False).mean()).iloc[-1])
         except Exception:
             return 0.0
+
+    def _volume_analysis(self, df_5m: pd.DataFrame,
+                          df_1h: pd.DataFrame | None = None):
+        """
+        Returns (vol_ratio, obv_rising, vol_spike)
+        vol_ratio:   current 5m volume / 20-bar moving average (e.g. 1.8 = 80% above avg)
+        obv_rising:  On-Balance-Volume trend is up (money flowing in)
+        vol_spike:   volume is ≥ 3× average (major institutional move or news)
+        """
+        try:
+            vols  = df_5m["volume"].astype(float)
+            close = df_5m["close"].astype(float)
+            vol_ma = float(vols.rolling(20).mean().iloc[-1])
+            vol_now = float(vols.iloc[-1])
+            vol_ratio = vol_now / max(vol_ma, 1e-10)
+            vol_spike = vol_ratio >= 3.0   # 3× avg = significant
+
+            # OBV: +volume when close > prev_close, -volume when down
+            direction_5m = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+            obv = (vols * direction_5m).cumsum()
+            obv_ema_fast = float(obv.ewm(span=5,  adjust=False).mean().iloc[-1])
+            obv_ema_slow = float(obv.ewm(span=20, adjust=False).mean().iloc[-1])
+            obv_rising = obv_ema_fast > obv_ema_slow
+
+            # 1H volume confirmation (is higher TF participating?)
+            if df_1h is not None and len(df_1h) >= 20:
+                vols_1h  = df_1h["volume"].astype(float)
+                vol_1h_ratio = float(vols_1h.iloc[-1]) / max(
+                    float(vols_1h.rolling(20).mean().iloc[-1]), 1e-10)
+                # If 1H volume is below average but 5m spike = fake breakout risk
+                if vol_1h_ratio < 0.6 and vol_ratio > 2.0:
+                    vol_spike = False   # 1H not confirming 5m spike
+
+            return round(vol_ratio, 2), obv_rising, vol_spike
+        except Exception:
+            return 1.0, True, False   # neutral defaults on error
 
     def _cci(self, df, period=20) -> float:
         """Commodity Channel Index — measures deviation from typical price mean."""

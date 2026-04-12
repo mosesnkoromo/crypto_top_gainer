@@ -197,14 +197,49 @@ class SignalSimulator:
         if consec < 2:      quality += 1
 
         # ── Decision ─────────────────────────────────────────────────
+        # Dynamic min expectancy — lower bar during capitulation (50-candle mode)
+        _in_cap_mode = len(df_5m) <= 55
+        _min_e = -0.0002 if _in_cap_mode else MIN_EXPECTANCY   # cap mode nearly anything passes
+
+        # ── HIGH-EDGE OVERRIDE ────────────────────────────────────────
+        # If WR ≥ 70% AND Expectancy > +0.5% — this is a strong edge.
+        # Never block a genuinely good setup over heuristic checks (DD, streak).
+        # Safety guard: E > +1.5% with WR < 50% = likely outlier, still block.
+        _high_edge = (wr >= 0.70 and expectancy > 0.005)     # WR≥70%, E>+0.5%
+        _is_outlier = (expectancy > 0.015 and wr < 0.50)     # fake edge from lucky trades
+        if _high_edge and not _is_outlier:
+            approved = True
+            reason   = f"HIGH_EDGE_OVERRIDE (WR={wr:.0%} E={expectancy*100:+.2f}%)"
+            result = SimResult(
+                symbol=sym, direction=direction, entry_price=entry_p,
+                tp1=tp1, sl=sl, n_trades=len(trades),
+                wins=len(wins), losses=len(losses), timeouts=len(timeouts),
+                win_rate=wr, avg_win=avg_win, avg_loss=avg_loss,
+                expectancy=expectancy, virtual_pnl=vpnl,
+                max_drawdown=max_dd, consec_losses=consec,
+                momentum=momentum, approved=True, reason=reason,
+                block_reasons=[], trades=trades,
+            )
+            for line in result.print_report(label=label).split("\n"):
+                if "Decision:" in line:
+                    log.info(line)
+                else:
+                    log.info(line)
+            return result
+
         blocks = []
+        # Safety guard: suspiciously high E with low WR = outlier trade skewing stats
+        if _is_outlier:
+            blocks.append(f"outlier edge (E={expectancy*100:+.1f}% but WR={wr:.0%})")
         if decisive >= 4 and wr < MIN_WIN_RATE:
             blocks.append(f"WR={wr:.0%} ({len(wins)}/{decisive} decisive) < {MIN_WIN_RATE:.0%}")
-        if expectancy < MIN_EXPECTANCY:
-            blocks.append(f"E={expectancy*100:+.3f}% below min {MIN_EXPECTANCY*100:.2f}%")
-        if max_dd > MAX_DRAWDOWN:
-            blocks.append(f"max_dd={max_dd*100:.1f}% > {MAX_DRAWDOWN*100:.0f}% limit")
-        if consec >= MAX_CONSEC_LOSSES:
+        if expectancy < _min_e:
+            blocks.append(f"E={expectancy*100:+.3f}% below min {_min_e*100:.2f}%")
+        _dd_limit = 0.25 if _in_cap_mode else MAX_DRAWDOWN
+        if max_dd > _dd_limit:
+            blocks.append(f"max_dd={max_dd*100:.1f}% > {_dd_limit*100:.0f}% limit")
+        if consec >= MAX_CONSEC_LOSSES and not _in_cap_mode:
+            # Skip SL streak check in capitulation — crash causes natural SL streaks
             blocks.append(f"last {consec} sim trades = SL streak")
         if momentum < -0.20:
             blocks.append(f"momentum={momentum:+.2f} against us")

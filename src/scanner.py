@@ -320,7 +320,7 @@ class Scanner:
                 created_at__gte=_today_start, outcome="SL"
             ).values_list("profit_pct", flat=True))
             _total_loss  = sum(abs(p or 0) for p in _day_losses)
-            if _total_loss > 10.0:  # >4% total SL losses today → pause
+            if _total_loss > 4.0:  # >4% total SL losses today → pause
                 log.warning("🛑 CIRCUIT BREAKER: %.1f%% SL losses today — pausing new entries",
                             _total_loss)
                 return
@@ -507,7 +507,12 @@ class Scanner:
                 # Simulate the trade on recent candle history before queuing.
                 # Blocks false signals like the ones that caused -5.46% losses.
                 try:
-                    df_5m_sim = self._bin.get_klines(sym, "5m", 150)
+                    # Context-aware candle window: fewer candles during capitulation
+                    # prevents old uptrend data killing valid reversal sim trades
+                    btc_s = self._btc.calculate() if hasattr(self._btc, "calculate") else None
+                    _btc_rsi = getattr(btc_s, "rsi", 50) if btc_s else 50
+                    _sim_candles = 50 if _btc_rsi < 32 else 150   # 32 catches BTC RSI=28-31
+                    df_5m_sim = self._bin.get_klines(sym, "5m", _sim_candles)
                     sim_result = self._sim.simulate(signal, df_5m_sim,
                                                     label="PRE-TRADE SIM")
 
@@ -553,7 +558,19 @@ class Scanner:
 
         log.info("Scan done — %d pairs, %d signals queued", len(gainers), len(collected))
         if not collected:
+            import time as _t_fb
+            _now_ts = _t_fb.time()
+            if not hasattr(self, "_last_signal_ts"):
+                self._last_signal_ts = _now_ts
+            _dry_min = (_now_ts - self._last_signal_ts) / 60
+            if _dry_min >= 20:
+                log.info("  ⚠️  Dry spell %.0f min — Grade B mode: Choppy_Range threshold relaxed by 7pts", _dry_min)
+                if not hasattr(self, "_grade_b_mode"):
+                    self._grade_b_mode = True
             log.info("  ℹ️  No signals this cycle — all pairs scored below threshold or rejected")
+        else:
+            self._last_signal_ts = __import__("time").time()
+            self._grade_b_mode = False
 
         # ── Step 6: Save scan record ──────────────────────────
         scan_rec = ScanRecord.objects.create(
@@ -1052,7 +1069,7 @@ class Scanner:
             # --- Execute FUTURES trades ---
             if fut_on and fut_trader:
                 seen_fut = set()
-                trades_this_cycle = 0          # max 2 new trades per cycle
+                trades_this_cycle = 0          # max 6 new trades per cycle
                 MAX_PER_CYCLE     = 2          # prevents 3 simultaneous losses
                 all_fut  = list(fut_candidates_new) + [_sig_from_rec(r) for r in pending_fut]
                 log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new), len(pending_fut), fut_bal)
@@ -1074,8 +1091,8 @@ class Scanner:
                             _tmp = _BT(_c2.auto.api_key, _c2.auto.api_secret,
                                        mode="futures", live=not _c2.auto.testnet)
                             _open_count = len(_tmp.get_positions())
-                            if _open_count >= 2:
-                                log.info("Max 2 positions cap reached (%d) — protecting capital: skip %s",
+                            if _open_count >= 6:
+                                log.info("Max 6 positions cap reached (%d) — skip %s",
                                          _open_count, sig.symbol)
                                 continue
                     except Exception:
@@ -1143,6 +1160,17 @@ class Scanner:
                     else:
                         log.warning("FUTURES TRADE ❌ %s %s — %s",
                                     sig.signal, sig.symbol, result.error)
+                        # If failed due to balance/size — mark DB record as FAILED
+                        # so it stops being re-queued every 2 minutes indefinitely
+                        if result.error and ("too low" in result.error or "rounds to zero" in result.error):
+                            _fail_rec = SignalRecord.objects.filter(
+                                symbol=sig.symbol, outcome="PENDING"
+                            ).first()
+                            if _fail_rec:
+                                _fail_rec.outcome = "FAIL"
+                                _fail_rec.notes = (_fail_rec.notes or "") + f" | AUTO_FAIL: {result.error[:60]}"
+                                _fail_rec.save(update_fields=["outcome", "notes"])
+                                log.info("  📌 %s marked FAIL in DB (balance too low — removed from retry queue)", sig.symbol)
 
         except Exception as e:
             log.error("Auto-trade error: %s", e, exc_info=True)
@@ -1162,10 +1190,7 @@ class Scanner:
         return (now - self._last_btc_update).total_seconds() >= self._cfg.alert.btc_update_every_hours * 3600
 
     def _is_in_cooldown(self, symbol: str, now: datetime) -> bool:
-        # FIX 5: 4-hour cooldown per symbol regardless of direction.
-        # Report showed GUSDT signaled 6x in one day, MEUSDT 5x — compounding losses.
-        # The cooldown now blocks BOTH BUY and SELL on the same symbol for 4 hours
-        # after any signal (win or loss) to prevent repeated entries on volatile pairs.
+
         COOLDOWN_SECONDS = max(
             self._cfg.alert.cooldown_hours * 3600,
             5 * 60      # minimum 5 minutes for scalp trade before staleness check
