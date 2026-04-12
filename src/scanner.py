@@ -1072,8 +1072,24 @@ class Scanner:
                 seen_fut = set()
                 trades_this_cycle = 0          # max 6 new trades per cycle
                 MAX_PER_CYCLE     = 2          # prevents 3 simultaneous losses
-                all_fut  = list(fut_candidates_new) + [_sig_from_rec(r) for r in pending_fut]
-                log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new), len(pending_fut), fut_bal)
+                # Expire pending signals older than 30 minutes
+                import datetime as _dt_exp
+                _now_exp = _dt_exp.datetime.now(tz=_dt_exp.timezone.utc)
+                _fresh_pending_fut = []
+                for _r in pending_fut:
+                    _ca = _r.created_at
+                    if _ca.tzinfo is None:
+                        _ca = _ca.replace(tzinfo=_dt_exp.timezone.utc)
+                    _age_min = (_now_exp - _ca).total_seconds() / 60
+                    if _age_min > 30:
+                        _r.outcome = "EXPIRED"
+                        _r.save(update_fields=["outcome"])
+                        log.info("  ⏰ EXPIRED stale pending %s (%s) — age=%.0f min",
+                                 _r.symbol, _r.signal, _age_min)
+                    else:
+                        _fresh_pending_fut.append(_r)
+                all_fut  = list(fut_candidates_new) + [_sig_from_rec(r) for r in _fresh_pending_fut]
+                log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new), len(_fresh_pending_fut), fut_bal)
                 for sig in all_fut:
                     if sig is None: continue
                     grade_key = sig.grade.split()[0]
