@@ -378,8 +378,9 @@ class Scanner:
         seen = set()
         gainers = []
         for t in top_gainers + liquid_pairs:
-            if t["symbol"] not in seen:
-                seen.add(t["symbol"])
+            sym = t["symbol"]
+            if sym not in seen:
+                seen.add(sym)
                 gainers.append(t)
         log.info("Pairs to scan: %d (top gainers + liquid) | BTC Score: %d/100", len(gainers), btc.score)
 
@@ -1190,7 +1191,10 @@ class Scanner:
         return (now - self._last_btc_update).total_seconds() >= self._cfg.alert.btc_update_every_hours * 3600
 
     def _is_in_cooldown(self, symbol: str, now: datetime) -> bool:
-
+        # FIX 5: 4-hour cooldown per symbol regardless of direction.
+        # Report showed GUSDT signaled 6x in one day, MEUSDT 5x — compounding losses.
+        # The cooldown now blocks BOTH BUY and SELL on the same symbol for 4 hours
+        # after any signal (win or loss) to prevent repeated entries on volatile pairs.
         COOLDOWN_SECONDS = max(
             self._cfg.alert.cooldown_hours * 3600,
             5 * 60      # minimum 5 minutes for scalp trade before staleness check

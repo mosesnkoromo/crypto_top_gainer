@@ -187,6 +187,13 @@ class BinanceTrader:
         dyn_risk = max(min(self._risk * _cap * _conf, 2.5), 0.5)
         log.debug("Risk: ML=%.0f%% sniper=%.0f%% open=%d cap=%.0f%% → %.1f%%",
                   _ml_p*100, _sn_p*100, _open_count, _cap*100, dyn_risk)
+        # REDUCED_RISK signals (no candle history) use 0.5× position size
+        # These are high-momentum tokens like 币安人生USDT — real edge but unknown history
+        _is_reduced = getattr(signal, "tag", "") == "REDUCED_RISK" or                       "REDUCED_RISK" in getattr(signal, "action", "")
+        if _is_reduced:
+            dyn_risk = dyn_risk * 0.5
+            log.info("  ⚡ REDUCED RISK mode — using %.1f%% risk (0.5× normal)", dyn_risk)
+
         risk_usdt = balance_usdt * (dyn_risk / 100)
         pos_usdt  = min(risk_usdt / sl_dist, balance_usdt * 0.25)
 

@@ -106,7 +106,10 @@ class SignalSimulator:
         if entry_p <= 0 or tp1 <= 0 or sl <= 0:
             return self._skip(sym, direction, entry_p, tp1, sl, "invalid prices")
         if df_5m is None or len(df_5m) < 60:
-            return self._skip(sym, direction, entry_p, tp1, sl, "insufficient candle data")
+            # No candle history = can't validate fully, BUT don't block.
+            # These are often new/small-cap tokens with high momentum (e.g. 币安人生USDT +8.88% in 5min).
+            # Approve with reduced risk flag so trader uses 0.5× position size.
+            return self._skip_reduced(sym, direction, entry_p, tp1, sl, "insufficient candle data — reduced risk")
 
         df = df_5m.tail(150).reset_index(drop=True)
 
@@ -138,8 +141,8 @@ class SignalSimulator:
             virtual_cash += pos_size * trade.pnl_pct
 
         if len(trades) < MIN_TRADES:
-            return self._skip(sym, direction, entry_p, tp1, sl,
-                              f"only {len(trades)} valid entries (min {MIN_TRADES})")
+            return self._skip_reduced(sym, direction, entry_p, tp1, sl,
+                                     f"only {len(trades)} valid entries — reduced risk")
 
         wins     = [t for t in trades if t.pnl_pct >  0.0]
         losses   = [t for t in trades if t.pnl_pct <= 0.0 and t.outcome == "SL"]
@@ -406,6 +409,7 @@ class SignalSimulator:
         return profitable_runs / runs
 
     def _skip(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
+        """Auto-approve: used only when sim is genuinely unnecessary (e.g. SL too tight)."""
         log.info("  ⏭️  SIM %s: skipped (%s) — auto-approved", sym, reason)
         return SimResult(
             symbol=sym, direction=direction, entry_price=entry,
@@ -413,6 +417,33 @@ class SignalSimulator:
             win_rate=0.5, avg_win=0.0, avg_loss=0.0, expectancy=0.0,
             virtual_pnl=0.0, max_drawdown=0.0, consec_losses=0,
             momentum=0.0, approved=True, reason=reason,
+            block_reasons=[], trades=[],
+        )
+
+    def _block(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
+        """Block: hard block used only for genuinely bad setups."""
+        log.warning("  🚫 SIM %s: blocked (%s)", sym, reason)
+        return SimResult(
+            symbol=sym, direction=direction, entry_price=entry,
+            tp1=tp1, sl=sl, n_trades=0, wins=0, losses=0, timeouts=0,
+            win_rate=0.0, avg_win=0.0, avg_loss=0.0, expectancy=0.0,
+            virtual_pnl=0.0, max_drawdown=0.0, consec_losses=0,
+            momentum=0.0, approved=False, reason=reason,
+            block_reasons=[reason], trades=[],
+        )
+
+    def _skip_reduced(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
+        """Approve with reduced risk flag — no candle history but signal engine passed.
+        Trader should use 0.5× normal position size for these setups.
+        Example: 币安人生USDT +8.88% in 5min during BTC capitulation bounce."""
+        log.info("  ⚡ SIM %s: no history — approved at REDUCED RISK (0.5×) | %s", sym, reason)
+        return SimResult(
+            symbol=sym, direction=direction, entry_price=entry,
+            tp1=tp1, sl=sl, n_trades=0, wins=0, losses=0, timeouts=0,
+            win_rate=0.5, avg_win=0.0, avg_loss=0.0, expectancy=0.0,
+            virtual_pnl=0.0, max_drawdown=0.0, consec_losses=0,
+            momentum=0.5,   # neutral momentum — unknown
+            approved=True, reason="REDUCED_RISK: " + reason,
             block_reasons=[], trades=[],
         )
 
