@@ -315,8 +315,25 @@ class BinanceTrader:
                      len(positions), len(open_orders))
 
             # ── Cleanup orphaned orders (orders with no matching position) ──
+            # Includes global algo orders (TSL/SL) that outlive closed positions
             active_syms = {p.get("symbol","") for p in positions
                           if abs(float(p.get("positionAmt", 0))) >= 0.0001}
+            try:
+                _global_algo = self._req("GET", "/fapi/v1/openAlgoOrders", {}) or {}
+                _global_algo_list = (_global_algo.get("algoOrders", [])
+                                     if isinstance(_global_algo, dict) else [])
+                for _gao in _global_algo_list:
+                    _gsym = _gao.get("symbol", "")
+                    if _gsym and _gsym not in active_syms:
+                        _gaid = _gao.get("algoId") or _gao.get("orderId")
+                        if _gaid:
+                            self._req("DELETE", "/fapi/v1/algoOrder",
+                                     {"symbol": _gsym, "algoId": _gaid})
+                            log.info("  %s: cancelled orphaned algo order id=%s ✅",
+                                     _gsym, _gaid)
+            except Exception as _gae:
+                log.debug("Global algo order cleanup: %s", _gae)
+
             for _osym, _oorders in sym_orders.items():
                 if _osym and _oorders and _osym not in active_syms:
                     log.info("  %s: orphaned orders (no position) — cancelling %d orders",
@@ -414,25 +431,57 @@ class BinanceTrader:
                              sym, state, new_state, pnl_pct)
                     continue
 
-                # Break-even after TP1 fills
+                # ── Move SL to breakeven as soon as TP1 is hit ──────────────
+                # Detect TP1 hit by: fewer TPs than we started with, OR price
+                # is meaningfully in profit (≥0.5% above entry = TP1 territory)
                 tp_remaining = [o for o in orders_sym if o.get("type") in TP_TYPES]
-                be_set = any(
-                    o.get("type") in SL_TYPES and entry > 0 and
-                    abs(float(o.get("stopPrice") or 0) - entry) / max(entry, 1e-10) < 0.005
-                    for o in orders_sym
+                _tp_count = len(tp_remaining)
+                _tp1_hit = (
+                    _tp_count <= 1                    # TP1+TP2 both filled
+                    or (_tp_count <= 2 and pnl_pct >= 0.3)  # TP1 filled from 3-TP setup
+                    or pnl_pct >= 0.5                 # definitely in TP1 territory
                 )
-                if len(tp_remaining) <= 1 and has_sl and not be_set and entry > 0:
-                    be_p  = self._fp(entry*(1.002 if is_long else 0.998), info)
-                    be_st = self._fp(entry*(1.001 if is_long else 0.999), info)
-                    be_q  = self._fmt_qty(qty * 0.6, info)
-                    if be_p > 0 and be_q >= info.min_qty:
-                        r_ = self._req("POST", "/fapi/v1/order", {
-                            "symbol": sym, "side": close_side, "type": "STOP",
-                            "stopPrice": be_st, "price": be_p,
-                            "quantity": be_q, "timeInForce": "GTC", "reduceOnly": "true",
+                # Check if SL is already at or above entry (breakeven already set)
+                _existing_sl_p = next(
+                    (float(o.get("stopPrice") or o.get("triggerPrice") or 0)
+                     for o in orders_sym if o.get("type") in SL_TYPES), 0.0)
+                be_already_set = (
+                    _existing_sl_p > 0 and entry > 0 and
+                    ((_existing_sl_p >= entry * 0.999) if is_long
+                     else (_existing_sl_p <= entry * 1.001))
+                )
+                if _tp1_hit and not be_already_set and entry > 0 and not has_tsl:
+                    # Cancel existing SL orders (replace with breakeven stop)
+                    for _o in list(orders_sym):
+                        if _o.get("type") in SL_TYPES:
+                            _oid = _o.get("orderId") or _o.get("algoId")
+                            if _oid:
+                                try:
+                                    self._req("DELETE", "/fapi/v1/algoOrder",
+                                              {"symbol": sym, "algoId": _oid})
+                                except Exception:
+                                    try:
+                                        self._req("DELETE", "/fapi/v1/order",
+                                                  {"symbol": sym, "orderId": _oid})
+                                    except Exception:
+                                        pass
+                    # Place new SL exactly at entry (breakeven)
+                    be_sl_p = self._fp(entry, info)
+                    be_qty  = self._fmt_qty(qty, info)
+                    if be_sl_p > 0 and be_qty >= info.min_qty:
+                        _be_ap = self._algo_params({
+                            "symbol": sym, "side": close_side,
+                            "type": "STOP_MARKET", "stopPrice": be_sl_p,
+                            "quantity": be_qty,
+                            "workingType": "MARK_PRICE", "reduceOnly": "true",
                         })
-                        if isinstance(r_, dict) and "orderId" in r_:
-                            log.info("  %s: TP1 filled → break-even @ %.6g ✅", sym, be_p)
+                        _be_r = self._req("POST", "/fapi/v1/algoOrder", _be_ap) or {}
+                        if _be_r.get("algoId") or _be_r.get("orderId"):
+                            log.info("  %s: TP1 hit → SL moved to breakeven @ %.6g "
+                                     "(pnl=%.2f%%) ✅", sym, be_sl_p, pnl_pct)
+                        else:
+                            log.warning("  %s: breakeven SL placement failed: %s",
+                                        sym, _be_r)
 
                 # ── TRAILING TP: move SL to lock profit when trade running well ──
                 # When PnL > 0.4%: cancel existing SL + replace with tighter one
@@ -721,7 +770,10 @@ class BinanceTrader:
         fill_price = float(entry_resp.get("avgPrice", signal.price)) or signal.price
 
         # Place 30% limit at 0.1% better price
-        if qty_limit >= info.min_qty:
+        # Also check notional — Binance requires min $20 per order (LTCUSDT etc.)
+        _limit_notional = qty_limit * fill_price if fill_price > 0 else 0
+        _min_notional = max(info.min_notional, 20.0)  # Binance futures min $20
+        if qty_limit >= info.min_qty and _limit_notional >= _min_notional:
             limit_p = self._fp(fill_price * (0.999 if is_long else 1.001), info)
             lim_r = self._req("POST", "/fapi/v1/order", {
                 "symbol": sym, "side": side, "type": "LIMIT",
@@ -731,8 +783,12 @@ class BinanceTrader:
             if isinstance(lim_r, dict) and "orderId" in lim_r:
                 log.info("Futures limit entry (30%%) @ %.6g id=%s ✅", limit_p, lim_r["orderId"])
             else:
-                # Limit failed — add to market order qty
                 log.debug("Limit entry failed — using full market qty")
+        elif qty_limit >= info.min_qty:
+            # Notional too small for limit order — add to market qty instead
+            log.info("Futures limit entry skipped (notional $%.2f < $%.0f min) — all market",
+                     _limit_notional, _min_notional)
+            qty_limit = 0  # mark as no staged entry
 
         # TP distribution: 50/30/20 — secure 50% profit early (Improvement 3.3)
         q_tp1=self._fmt_qty(qty*0.50,info)

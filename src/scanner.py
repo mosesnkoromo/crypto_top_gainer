@@ -382,7 +382,13 @@ class Scanner:
             if sym not in seen:
                 seen.add(sym)
                 gainers.append(t)
-        log.info("Pairs to scan: %d (top gainers + liquid) | BTC Score: %d/100", len(gainers), btc.score)
+
+        # v4.3: Categorize pairs for logging and strategy awareness
+        _n_gainer  = sum(1 for t in gainers if float(t.get("priceChangePercent",0) or 0) >=  5.0)
+        _n_loser   = sum(1 for t in gainers if float(t.get("priceChangePercent",0) or 0) <= -5.0)
+        _n_neutral = len(gainers) - _n_gainer - _n_loser
+        log.info("Pairs to scan: %d [🚀%d gainers | 🔻%d losers | ➖%d neutral] | BTC Score: %d/100",
+                 len(gainers), _n_gainer, _n_loser, _n_neutral, btc.score)
 
         # ── CRASH PROTECTION: BTC < 15 → close all LONG positions ────
         if btc.score < 15:
@@ -597,17 +603,7 @@ class Scanner:
         # Sort by confluence — no hard cap, allow all quality signals
         collected = sorted(collected, key=lambda s: s.confluence, reverse=True)[:10]
 
-        # Always send combined report every scan — positions + new signals
-        if not collected:
-            import inspect as _ins
-            _fmt_p = _ins.signature(fmt_digest).parameters
-            _extra = {"closed_today": [], "open_positions": [], "scan_number": self._daily_scan_count} if "closed_today" in _fmt_p else {}
-            if "spot_signals" in _fmt_p:
-                _extra["spot_signals"] = spot_signals
-            msg = fmt_digest([], btc.to_dict(), self._cfg.risk, news_items, **_extra)
-            self._wa.send(msg)
-            log.info("Combined report sent (no new signals)")
-
+        # Only send WhatsApp when there are NEW signals — skip empty cycles
         if collected:
             # Save to DB
             for s in collected:

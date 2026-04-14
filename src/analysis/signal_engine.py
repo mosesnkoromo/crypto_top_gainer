@@ -1,5 +1,6 @@
 """
-src/analysis/signal_engine.py — Signal Engine v4.2
+src/analysis/signal_engine.py — Signal Engine v4.3
+Top Movers Integration + Adaptive Conflict + Dynamic Thresholds
 """
 from __future__ import annotations
 
@@ -45,6 +46,7 @@ class Signal:
     displacement_ratio: float = 0.0
     position_size:  float = 1.0
     tag:            str   = "STANDARD"   # STANDARD | CONFIRMATION | CAPITULATION
+    asset_category: str   = "NEUTRAL"    # GAINER | LOSER | NEUTRAL
 
 
 class SignalEngine:
@@ -69,6 +71,15 @@ class SignalEngine:
         if not sym:
             return None
         try:
+            # v4.3: Determine asset category from 24h price change
+            gain_24h = float(ticker.get("priceChangePercent", 0) or 0)
+            if gain_24h >= 5.0:
+                asset_category = "GAINER"    # Strong upward momentum
+            elif gain_24h <= -5.0:
+                asset_category = "LOSER"     # Potential mean-reversion / capitulation
+            else:
+                asset_category = "NEUTRAL"   # Neither extreme
+
             df_5m  = self._get_df(sym, "5m",  150)
             df_15m = self._get_df(sym, "15m",  80)
             df_1h  = self._get_df(sym, "1h",   80)
@@ -115,6 +126,12 @@ class SignalEngine:
             # ── Volume Analysis ──────────────────────────────────────
             vol_ratio, obv_rising, vol_spike = self._volume_analysis(df_5m, df_1h)
 
+            # ── Hard Volume Filter — dead thin market ──────────────────
+            # vol < 0.5× means barely anyone is trading — SL hunters win
+            if vol_ratio < 0.5:
+                log.info("  ⏭️  %s: vol=%.1f× too thin (< 0.5×) — skip", sym, vol_ratio)
+                return None
+
             # Step 4: Direction — HTF decides WHAT to trade, LTF decides WHEN
             # ─────────────────────────────────────────────────────────
             # Derive bias from HTF cascade (already computed above)
@@ -160,6 +177,20 @@ class SignalEngine:
                     log.info("  ⏭️  %s: MACD flat (hist=%.4f) — no direction → skip", sym, macd_h)
                     return None
 
+            # ── v4.3: STRATEGY-AWARE SIGNAL BIASING ───────────────
+            # GAINER: favor trend continuation (BUY aligned with HTF momentum)
+            # LOSER:  favor capitulation reversal BUY on extreme oversold
+            if asset_category == "GAINER" and direction == "SELL" and gain_24h > 8.0:
+                # Strong gainer — SELL signal is fighting the momentum, skip it
+                log.info("  ⏭️  %s: GAINER +%.1f%% — skip SELL (trend continuation bias)",
+                         sym, gain_24h)
+                return None
+            if asset_category == "LOSER" and direction == "SELL" and rsi_5m < 30:
+                # Oversold loser — selling more is low edge, skip
+                log.info("  ⏭️  %s: LOSER %.1f%% oversold RSI=%.0f — skip SELL (capitulation bias)",
+                         sym, gain_24h, rsi_5m)
+                return None
+
             # ── CAPITULATION OVERRIDE ──────────────────────────────
             # BTC RSI < 25 (extreme oversold) = market panic/capitulation
             # These are the HIGHEST edge mean-reversion BUY setups
@@ -188,6 +219,15 @@ class SignalEngine:
                     return None
 
             is_buy = direction == "BUY"
+
+            # ── Hard Volume Filter 2 — OBV against direction ────────────
+            # vol < 0.8× AND money flow (OBV) opposing your direction = no edge
+            # e.g. BUY signal but OBV falling = smart money selling into your buy
+            if vol_ratio < 0.8 and not vol_spike:
+                if (is_buy and not obv_rising) or (not is_buy and obv_rising):
+                    log.info("  ⏭️  %s: vol=%.1f× + OBV against %s direction — skip",
+                             sym, vol_ratio, direction)
+                    return None
 
             # Step 4b: INDICATOR CORRELATION GATE
             # Count how many indicators conflict with the trade direction.
@@ -223,9 +263,14 @@ class SignalEngine:
                 if rsi_5m < 25:
                     conflicts += 1; conflict_detail.append(f"RSI={rsi_5m:.0f}↓oversold")
 
-            # Conflicts now penalise score instead of blocking
-            # Hard block only on 4+ conflicts (truly contradictory signal)
-            conflict_penalty = conflicts * 4   # -4 pts per conflict
+            # v4.3: Adaptive conflict penalty — regime-aware
+            # Strong trend: tolerates more conflicts (momentum can override indicators)
+            # Choppy range: strict — conflicts are more meaningful in sideways markets
+            _conflict_mult = {"Strong_Trend_Impulse": 2,   # +2 pts per conflict
+                               "Trending":             4,   # +4 pts per conflict
+                               "Choppy_Range":         6}   # +6 pts per conflict
+            conflict_penalty = conflicts * _conflict_mult.get(regime, 4)
+            # Hard block at 4+ conflicts regardless of regime (too contradictory)
             if conflicts >= 4:
                 log.info("  ❌ %s %s | %d indicator conflicts (%s) — too contradictory → skip",
                          sym, direction, conflicts, " ".join(conflict_detail))
@@ -344,8 +389,17 @@ class SignalEngine:
             score -= conflict_penalty # Indicator conflict penalty (0–12)
             score = max(0.0, min(100.0, score))
 
-            # Relaxed thresholds — 60/65/72 (was: 62/68/80)
-            threshold = {"Strong_Trend_Impulse": 60, "Trending": 65, "Choppy_Range": 72}[regime]
+            # v4.3: Dynamic thresholds — regime × asset category
+            # GAINER: lower threshold (trend is already proven, easier entry)
+            # LOSER:  higher threshold (reversal is riskier, needs confirmation)
+            # NEUTRAL: standard thresholds
+            _base_thresh = {"Strong_Trend_Impulse": 60, "Trending": 65, "Choppy_Range": 72}[regime]
+            if asset_category == "GAINER":
+                threshold = _base_thresh - 5   # easier entry on confirmed momentum
+            elif asset_category == "LOSER":
+                threshold = _base_thresh + 3   # stricter for reversal — needs conviction
+            else:
+                threshold = _base_thresh
             if score < threshold:
                 log.info("  ❌ %s %s | score=%.0f/%.0f | regime=%s | rsi=%.0f | 🚫 weak setup",
                          sym, direction, score, threshold, regime, rsi_5m)
@@ -361,10 +415,17 @@ class SignalEngine:
                          sym, direction, sniper*100, sniper_min*100)
                 return None
 
-            # Step 10: Grade (MUST match scanner's ULTRA/STRONG/STANDARD)
+            # Step 10: Grade + v4.3 position size by asset category
+            # GAINER → slightly larger (proven momentum, confidence boost)
+            # LOSER  → smaller (reversal riskier even if setup looks good)
             if   score >= 88: grade = "ULTRA";    position_size = 1.0
             elif score >= 75: grade = "STRONG";   position_size = 0.75
             else:             grade = "STANDARD"; position_size = 0.50
+
+            if asset_category == "GAINER":
+                position_size = min(1.0, position_size * 1.20)  # +20% for momentum
+            elif asset_category == "LOSER":
+                position_size = position_size * 0.75            # -25% for reversal risk
 
             # Step 11: TP/SL
             sl_mult = {"Strong_Trend_Impulse": 1.2, "Trending": 1.5, "Choppy_Range": 1.8}[regime]
@@ -372,6 +433,17 @@ class SignalEngine:
             # Minimum SL distance: 0.3% of price (prevents "SL too tight" on low-vol pairs)
             min_sl_dist = price * 0.003
             sl_dist = max(sl_dist, min_sl_dist)
+
+            # Cap SL distance — prevents inflated ATR from BTC crash
+            # creating TP levels so far they never get hit
+            _max_sl_pct = {"Strong_Trend_Impulse": 0.025,
+                           "Trending":             0.020,
+                           "Choppy_Range":         0.015}[regime]
+            max_sl_dist = price * _max_sl_pct
+            if sl_dist > max_sl_dist:
+                log.debug("SL capped %.4f%% → %.4f%% (%s)",
+                          sl_dist/price*100, _max_sl_pct*100, regime)
+                sl_dist = max_sl_dist
             # R:R enforcement: TP1 must be ≥ 1.5× SL to ensure positive expectancy
             # Old: TP1=0.8×SL (R:R<1 → negative E even at 70% WR)
             # New: TP1=1.5×SL (R:R=1.5 → positive E at just 40% WR)
@@ -405,11 +477,14 @@ class SignalEngine:
                          "SWING"              if regime == "Trending" else
                          "MEAN REVERSION")
 
+            _cat_icon = {"GAINER": "🚀", "LOSER": "🔻", "NEUTRAL": "➖"}[asset_category]
             log.info(
-                "  ✅ %s %s | score=%.0f/100 %s | %s | regime=%s | rsi=%.0f | atr=%.2f%% | "
-                "vol=%.1f× %s | HTF:%s(%+d) ADX4H=%.0f | penalties: htf=%.0f rsi=%.0f conf=%.0f",
-                sym, direction, score, _rating, _strategy, regime, rsi_5m,
-                atr_val / price * 100,
+                "  ✅ %s %s | score=%.0f/100 %s | %s | %s%s(%.1f%%) | regime=%s | rsi=%.0f | "
+                "atr=%.2f%% | vol=%.1f× %s | HTF:%s(%+d) ADX4H=%.0f | "
+                "penalties: htf=%.0f rsi=%.0f conf=%.0f",
+                sym, direction, score, _rating, _strategy,
+                _cat_icon, asset_category, gain_24h,
+                regime, rsi_5m, atr_val / price * 100,
                 vol_ratio, "📈OBV↑" if obv_rising else "📉OBV↓",
                 htf_str, htf_score, adx_4h,
                 htf_penalty, rsi_penalty, conflict_penalty)
@@ -428,6 +503,7 @@ class SignalEngine:
                 confluence=score, hold_time="5-20min",
                 regime=regime, sniper_conf=sniper, tqi=tqi_val,
                 displacement_ratio=disp_ratio, position_size=position_size,
+                asset_category=asset_category,
             )
         except Exception as e:
             log.warning("SignalEngine error %s: %s", sym, e)
