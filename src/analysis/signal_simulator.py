@@ -12,10 +12,10 @@ from src.utils.logger import get_logger
 log = get_logger(__name__)
 
 MIN_WIN_RATE      = 0.40
-MIN_EXPECTANCY    = 0.0005
+MIN_EXPECTANCY    = 0.0001
 MIN_TRADES        = 6
 MAX_CONSEC_LOSSES = 4
-MAX_DRAWDOWN      = 0.25
+MAX_DRAWDOWN      = 0.30
 SPREAD            = 0.0005
 SLIPPAGE          = 0.0003
 VIRTUAL_CAPITAL   = 500.0
@@ -223,8 +223,8 @@ class SignalSimulator:
         _dd_limit = 0.25 if _in_cap_mode else MAX_DRAWDOWN
         if max_dd > _dd_limit:
             blocks.append(f"max_dd={max_dd*100:.1f}% > {_dd_limit*100:.0f}% limit")
-        if consec >= MAX_CONSEC_LOSSES and not _in_cap_mode:
-            blocks.append(f"last {consec} sim trades = SL streak")
+        # if consec >= MAX_CONSEC_LOSSES and not _in_cap_mode:
+        #     blocks.append(f"last {consec} sim trades = SL streak")
         if momentum < -0.20:
             blocks.append(f"momentum={momentum:+.2f} against us")
         if recent_range_pct < 0.003:
@@ -233,7 +233,7 @@ class SignalSimulator:
             blocks.append("timeouts mostly losing")
         if quality < 2:
             blocks.append(f"low quality setup (score={quality}/4)")
-        if mc_score < 0.30:
+        if mc_score < 0.05:
             blocks.append(f"unstable strategy (mc={mc_score:.2f})")
 
         approved = len(blocks) == 0

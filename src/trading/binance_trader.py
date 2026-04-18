@@ -20,11 +20,29 @@ from src.analysis.trade_state_machine import TradeStateMachine
 
 log = get_logger(__name__)
 
+# Replace these:
 _SPOT_BASE = "https://api.binance.com"
 _SPOT_TEST = "https://testnet.binance.vision"
 _FUT_BASE  = "https://fapi.binance.com"
 _FUT_TEST  = "https://testnet.binancefuture.com"
 
+# With these:
+_SPOT_BASE_FALLBACKS = [
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api4.binance.com",
+    "https://api-gcp.binance.com"
+]
+_SPOT_TEST = "https://testnet.binance.vision"
+
+_FUT_BASE_FALLBACKS = [
+    "https://fapi1.binance.com",
+    "https://fapi2.binance.com",
+    "https://fapi3.binance.com",
+    "https://fapi.binance.com"                   # Original as last resort
+]
+_FUT_TEST = "https://testnet.binancefuture.com"
 
 @dataclass
 class SymbolInfo:
@@ -82,10 +100,34 @@ class BinanceTrader:
         self._sym_cache: dict[str, SymbolInfo] = {}
         self._state_machine = TradeStateMachine()
 
-        self._base = (
-            (_FUT_BASE if live else _FUT_TEST) if mode == "futures"
-            else (_SPOT_BASE if live else _SPOT_TEST)
-        )
+        # ─────────────────────────────────────────────────────────────────
+        # Determine base URL with fallback testing (only when live)
+        # ─────────────────────────────────────────────────────────────────
+        if mode == "futures":
+            primary = _FUT_BASE if live else _FUT_TEST
+            fallbacks = _FUT_BASE_FALLBACKS if live else []
+        else:
+            primary = _SPOT_BASE if live else _SPOT_TEST
+            fallbacks = _SPOT_BASE_FALLBACKS if live else []
+
+        self._base = primary
+        if live:
+            if self._test_base_url(self._base):
+                log.info("BinanceTrader: connected to %s", self._base)
+            else:
+                log.warning("Primary Binance endpoint %s unreachable, trying fallbacks...", self._base)
+                connected = False
+                for fb in fallbacks:
+                    self._base = fb
+                    if self._test_base_url(self._base):
+                        log.info("BinanceTrader: connected to fallback %s", self._base)
+                        connected = True
+                        break
+                if not connected:
+                    log.error("All Binance endpoints unreachable. API calls will fail.")
+        else:
+            log.debug("BinanceTrader: using testnet %s", self._base)
+
         log.info("BinanceTrader: %s %s | risk=%.1f%% | loss_limit=%.1f%%",
                  mode.upper(), "LIVE" if live else "TESTNET",
                  risk_pct, daily_loss_limit_pct)
@@ -100,6 +142,16 @@ class BinanceTrader:
         "NFTUSDT", "DODOGIUSDT",
     }
     _futures_sym_cache: dict = {}
+
+    def _test_base_url(self, base_url: str) -> bool:
+        """Test if a base URL is reachable by calling the ping endpoint."""
+        try:
+            path = "/fapi/v1/ping" if self._mode == "futures" else "/api/v3/ping"
+            url = f"{base_url}{path}"
+            resp = _requests.get(url, timeout=5)
+            return resp.status_code == 200
+        except Exception:
+            return False
 
     def _normalize_futures_sym(self, sym: str) -> str:
         if sym in self._futures_sym_cache:

@@ -404,9 +404,9 @@ class Scanner:
             if self._is_in_cooldown(sym, now):
                 continue
             scalp_signal = self._scalp_engine.analyze(ticker)
-            if scalp_signal and scalp_signal.confidence >= 60:
+            if scalp_signal and scalp_signal.confidence >= 50:
                 scalp_signals.append(scalp_signal)
-                
+
         # ---------------------------------------------------------------------
         # v5 CANDIDATE COLLECTION WITH RANKING
         # ---------------------------------------------------------------------

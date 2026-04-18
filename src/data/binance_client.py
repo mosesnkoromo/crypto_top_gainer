@@ -21,6 +21,10 @@ _BINANCE_ENDPOINTS = [
     "https://api2.binance.com/api/v3",
     "https://api3.binance.com/api/v3",
     "https://api4.binance.com/api/v3",
+    "https://fapi.binance.com/fapi/v1",  
+    "https://fapi1.binance.com/fapi/v1",
+    "https://fapi2.binance.com/fapi/v1",
+    "https://fapi3.binance.com/fapi/v1",
 ]
 _COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
