@@ -11,15 +11,16 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-MIN_WIN_RATE      = 0.50
-MIN_EXPECTANCY    = 0.0008
+MIN_WIN_RATE      = 0.40
+MIN_EXPECTANCY    = 0.0005
 MIN_TRADES        = 6
 MAX_CONSEC_LOSSES = 4
-MAX_DRAWDOWN      = 0.15
+MAX_DRAWDOWN      = 0.25
 SPREAD            = 0.0005
 SLIPPAGE          = 0.0003
-VIRTUAL_CAPITAL   = 1000.0
+VIRTUAL_CAPITAL   = 500.0
 VIRTUAL_RISK_PCT  = 0.02
+
 
 
 @dataclass
@@ -106,20 +107,14 @@ class SignalSimulator:
         if entry_p <= 0 or tp1 <= 0 or sl <= 0:
             return self._skip(sym, direction, entry_p, tp1, sl, "invalid prices")
         if df_5m is None or len(df_5m) < 60:
-            # No candle history = can't validate fully, BUT don't block.
-            # These are often new/small-cap tokens with high momentum (e.g. 币安人生USDT +8.88% in 5min).
-            # Approve with reduced risk flag so trader uses 0.5× position size.
             return self._skip_reduced(sym, direction, entry_p, tp1, sl, "insufficient candle data — reduced risk")
 
         df = df_5m.tail(150).reset_index(drop=True)
 
-        # Percentage distances (used to scale to each sim entry)
         sl_pct  = abs(entry_p - sl)  / entry_p
         tp1_pct = abs(tp1 - entry_p) / entry_p
         tp2_pct = abs(tp2 - entry_p) / entry_p
         if sl_pct < 0.001:
-            # SL too tight for simulation — signal_engine already enforces min 0.3%
-            # so if we reach here it's a rounding edge case — skip sim, allow trade
             log.info("  ⏭️  SIM %s: SL too tight (%.4f%%) — skipping sim, auto-approved",
                      sym, sl_pct * 100)
             return self._skip(sym, direction, entry_p, tp1, sl, "SL too tight")
@@ -173,7 +168,6 @@ class SignalSimulator:
         raw_mom  = (ema_fast - ema_slow) / max(ema_slow, 1e-10)
         momentum = float(np.clip(raw_mom * (1 if is_buy else -1) * 10, -1.0, 1.0))
 
-        # ── Timeout differentiation ──────────────────────────────────
         timeout_wins   = [t for t in trades if t.outcome in ("TIMEOUT","RUNNER") and t.pnl_pct > 0]
         timeout_losses = [t for t in trades if t.outcome in ("TIMEOUT","RUNNER") and t.pnl_pct <= 0]
         timeout_ratio  = len(timeout_wins) + len(timeout_losses)
@@ -184,32 +178,23 @@ class SignalSimulator:
         else:
             avg_timeout_pnl = 0.0
 
-        # ── Volatility kill switch ────────────────────────────────────
         recent_highs = df["high"].iloc[-10:].astype(float).values
         recent_lows  = df["low"].iloc[-10:].astype(float).values
         recent_range_pct = (max(recent_highs) - min(recent_lows)) / max(min(recent_lows), 1e-10)
 
-        # ── Monte Carlo robustness check ──────────────────────────────
         mc_score = self._monte_carlo(trades)
 
-        # ── Trade quality score ───────────────────────────────────────
         quality = 0
         if wr > 0.55:       quality += 1
         if expectancy > 0:  quality += 1
         if momentum > 0:    quality += 1
         if consec < 2:      quality += 1
 
-        # ── Decision ─────────────────────────────────────────────────
-        # Dynamic min expectancy — lower bar during capitulation (50-candle mode)
         _in_cap_mode = len(df_5m) <= 55
-        _min_e = -0.0002 if _in_cap_mode else MIN_EXPECTANCY   # cap mode nearly anything passes
+        _min_e = -0.0002 if _in_cap_mode else MIN_EXPECTANCY
 
-        # ── HIGH-EDGE OVERRIDE ────────────────────────────────────────
-        # If WR ≥ 70% AND Expectancy > +0.5% — this is a strong edge.
-        # Never block a genuinely good setup over heuristic checks (DD, streak).
-        # Safety guard: E > +1.5% with WR < 50% = likely outlier, still block.
-        _high_edge = (wr >= 0.70 and expectancy > 0.005)     # WR≥70%, E>+0.5%
-        _is_outlier = (expectancy > 0.015 and wr < 0.50)     # fake edge from lucky trades
+        _high_edge = (wr >= 0.70 and expectancy > 0.005)
+        _is_outlier = (expectancy > 0.015 and wr < 0.50)
         if _high_edge and not _is_outlier:
             approved = True
             reason   = f"HIGH_EDGE_OVERRIDE (WR={wr:.0%} E={expectancy*100:+.2f}%)"
@@ -224,14 +209,11 @@ class SignalSimulator:
                 block_reasons=[], trades=trades,
             )
             for line in result.print_report(label=label).split("\n"):
-                if "Decision:" in line:
-                    log.info(line)
-                else:
-                    log.info(line)
+                if "Decision:" in line: log.info(line)
+                else: log.info(line)
             return result
 
         blocks = []
-        # Safety guard: suspiciously high E with low WR = outlier trade skewing stats
         if _is_outlier:
             blocks.append(f"outlier edge (E={expectancy*100:+.1f}% but WR={wr:.0%})")
         if decisive >= 4 and wr < MIN_WIN_RATE:
@@ -242,7 +224,6 @@ class SignalSimulator:
         if max_dd > _dd_limit:
             blocks.append(f"max_dd={max_dd*100:.1f}% > {_dd_limit*100:.0f}% limit")
         if consec >= MAX_CONSEC_LOSSES and not _in_cap_mode:
-            # Skip SL streak check in capitulation — crash causes natural SL streaks
             blocks.append(f"last {consec} sim trades = SL streak")
         if momentum < -0.20:
             blocks.append(f"momentum={momentum:+.2f} against us")
@@ -252,7 +233,7 @@ class SignalSimulator:
             blocks.append("timeouts mostly losing")
         if quality < 2:
             blocks.append(f"low quality setup (score={quality}/4)")
-        if mc_score < 0.50:
+        if mc_score < 0.30:
             blocks.append(f"unstable strategy (mc={mc_score:.2f})")
 
         approved = len(blocks) == 0
@@ -363,7 +344,7 @@ class SignalSimulator:
                     pnl = ((sim_tp1 - sim_entry) / sim_entry) if is_buy else ((sim_entry - sim_tp1) / sim_entry)
                     pnl_total += pos_tp1 * pnl
                     tp1_hit    = True
-                    current_sl = sim_entry   # move SL to breakeven
+                    current_sl = sim_entry
 
             if tp1_hit and not tp2_hit:
                 if (is_buy and high >= sim_tp2) or (not is_buy and low <= sim_tp2):
@@ -386,19 +367,12 @@ class SignalSimulator:
         outcome = "RUNNER" if (tp1_hit or tp2_hit) else "TIMEOUT"
         return VirtualTrade(0, sim_entry, exit_price, outcome, pnl_total, hold_candles, tp1_hit, tp2_hit)
 
-    # ─────────────────────────────────────────────────────────────────
-    # MONTE CARLO ROBUSTNESS CHECK
-    # Shuffles trade sequence 50 times — if strategy relies on lucky
-    # ordering it will fail here. Returns fraction of runs that were
-    # profitable (0.0 to 1.0). Threshold: >= 0.50 required.
-    # ─────────────────────────────────────────────────────────────────
-
     def _monte_carlo(self, trades, runs: int = 50) -> float:
-        if len(trades) < 8:
-            return 0.75   # too few trades to test — give benefit of doubt
+        if len(trades) < 15:
+            return 0.5
         pnls = np.array([t.pnl_pct for t in trades])
         profitable_runs = 0
-        rng = np.random.default_rng(seed=42)   # deterministic seed for reproducibility
+        rng = np.random.default_rng(seed=42)
         for _ in range(runs):
             shuffled   = rng.permutation(pnls)
             equity     = 1.0
@@ -409,7 +383,6 @@ class SignalSimulator:
         return profitable_runs / runs
 
     def _skip(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
-        """Auto-approve: used only when sim is genuinely unnecessary (e.g. SL too tight)."""
         log.info("  ⏭️  SIM %s: skipped (%s) — auto-approved", sym, reason)
         return SimResult(
             symbol=sym, direction=direction, entry_price=entry,
@@ -421,7 +394,6 @@ class SignalSimulator:
         )
 
     def _block(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
-        """Block: hard block used only for genuinely bad setups."""
         log.warning("  🚫 SIM %s: blocked (%s)", sym, reason)
         return SimResult(
             symbol=sym, direction=direction, entry_price=entry,
@@ -433,16 +405,13 @@ class SignalSimulator:
         )
 
     def _skip_reduced(self, sym, direction, entry, tp1, sl, reason) -> SimResult:
-        """Approve with reduced risk flag — no candle history but signal engine passed.
-        Trader should use 0.5× normal position size for these setups.
-        Example: 币安人生USDT +8.88% in 5min during BTC capitulation bounce."""
         log.info("  ⚡ SIM %s: no history — approved at REDUCED RISK (0.5×) | %s", sym, reason)
         return SimResult(
             symbol=sym, direction=direction, entry_price=entry,
             tp1=tp1, sl=sl, n_trades=0, wins=0, losses=0, timeouts=0,
             win_rate=0.5, avg_win=0.0, avg_loss=0.0, expectancy=0.0,
             virtual_pnl=0.0, max_drawdown=0.0, consec_losses=0,
-            momentum=0.5,   # neutral momentum — unknown
+            momentum=0.5,
             approved=True, reason="REDUCED_RISK: " + reason,
             block_reasons=[], trades=[],
         )

@@ -1,13 +1,13 @@
 """
-src/analysis/signal_engine.py — Signal Engine v4.3
-Top Movers Integration + Adaptive Conflict + Dynamic Thresholds
+src/analysis/signal_engine.py — Signal Engine v5.1 (Production)
+Structure‑First + Sniper Pullback + Adaptive Scoring
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, Any
 
 from src.utils.logger import get_logger
 
@@ -18,549 +18,444 @@ SignalType = Literal["BUY", "SELL"]
 
 @dataclass
 class Signal:
-    symbol:         str
-    signal:         SignalType
-    grade:          str
-    confidence:     int
-    action:         str
-    price:          float
-    gain_24h:       float = 0.0
-    rsi_1h:         float = 0.0
-    rsi_4h:         float = 0.0
-    rsi_daily:      float = 0.0
-    tp1:            float = 0.0
-    tp2:            float = 0.0
-    tp3:            float = 0.0
-    sl:             float = 0.0
-    atr:            float = 0.0
-    factors:        list  = field(default_factory=list)
-    strategies_hit: list  = field(default_factory=list)
-    btc_score:      int   = 50
-    btc_trend:      str   = ""
-    confluence:     float = 0.0
-    hold_time:      str   = ""
-    news_sentiment: str   = "neutral"
-    regime:         str   = "Trending"
-    sniper_conf:    float = 1.0
-    tqi:            float = 0.5
+    symbol: str
+    signal: SignalType
+    grade: str
+    confidence: int
+    action: str
+    price: float
+    gain_24h: float = 0.0
+    rsi_1h: float = 0.0
+    rsi_4h: float = 0.0
+    rsi_daily: float = 0.0
+    tp1: float = 0.0
+    tp2: float = 0.0
+    tp3: float = 0.0
+    sl: float = 0.0
+    atr: float = 0.0
+    factors: list = field(default_factory=list)
+    strategies_hit: list = field(default_factory=list)
+    btc_score: int = 50
+    btc_trend: str = ""
+    confluence: float = 0.0
+    hold_time: str = ""
+    news_sentiment: str = "neutral"
+    regime: str = "Trending"
+    sniper_conf: float = 1.0
+    tqi: float = 0.5
     displacement_ratio: float = 0.0
-    position_size:  float = 1.0
-    tag:            str   = "STANDARD"   # STANDARD | CONFIRMATION | CAPITULATION
-    asset_category: str   = "NEUTRAL"    # GAINER | LOSER | NEUTRAL
+    position_size: float = 1.0
+    tag: str = "STANDARD"
+    asset_category: str = "NEUTRAL"
+    trigger_type: str = ""
+    score_breakdown: Dict[str, float] = field(default_factory=dict)
 
 
 class SignalEngine:
     """
-    Production-grade Signal Engine v4.2
+    Signal Engine v5.1 – Structure‑First + Sniper Pullback
+
     Pipeline:
-      1. Fetch candles (5m, 15m, 1h, 4h, 1d, 1w, 1m)
-      2. Regime via TQI
-      3. Top-down HTF cascade 1W→1D→4H→1H→15m (hard gate)
-      4. BTC + RSI hard filters
-      5. Confluence scoring (WaveTrend + MACD + RSI + BTC + HTF bonus)
-      6. 1m Sniper gate
-      7. Grade: ULTRA / STRONG / STANDARD (scanner-compatible)
+      1. Fetch candles (5m, 15m, 1h, 4h, 1d)
+      2. Detect structure: Sweep + Reclaim, or Breakout
+      3. Wait for pullback to 20 EMA / swing level (sniper entry)
+      4. Confirm with engulfing/pinbar candle
+      5. Base score + confirmations (HTF, Volume, RSI, BTC, Gainer)
+      6. Apply minimal penalties
+      7. Final score must exceed adaptive threshold
     """
 
-    def __init__(self, binance_client):
-        self._b                 = binance_client
+    def __init__(self, binance_client, initial_threshold: int = 52):
+        self._b = binance_client
+        self.threshold = initial_threshold  # will be updated by scanner
         self.signals_this_cycle = 0
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
     def analyze(self, ticker: dict, btc) -> Signal | None:
         sym = ticker.get("symbol")
         if not sym:
             return None
+
         try:
-            # v4.3: Determine asset category from 24h price change
-            gain_24h = float(ticker.get("priceChangePercent", 0) or 0)
-            if gain_24h >= 5.0:
-                asset_category = "GAINER"    # Strong upward momentum
-            elif gain_24h <= -5.0:
-                asset_category = "LOSER"     # Potential mean-reversion / capitulation
-            else:
-                asset_category = "NEUTRAL"   # Neither extreme
-
-            df_5m  = self._get_df(sym, "5m",  150)
-            df_15m = self._get_df(sym, "15m",  80)
-            df_1h  = self._get_df(sym, "1h",   80)
-            df_4h  = self._get_df(sym, "4h",   60)
-            df_1d  = self._get_df(sym, "1d",   60)
-            df_1w  = self._get_df(sym, "1w",   20)
-            df_1m  = self._get_df(sym, "1m",   50)
-
+            # Fetch data
+            df_5m = self._get_df(sym, "5m", 150)
             if df_5m is None or len(df_5m) < 100:
-                log.debug("  ⏭️  %s: insufficient candle data — skip", sym)
                 return None
+
+            df_15m = self._get_df(sym, "15m", 80)
+            df_1h  = self._get_df(sym, "1h",  80)
+            df_4h  = self._get_df(sym, "4h",  60)
+            df_1d  = self._get_df(sym, "1d",  60)
 
             price = float(df_5m["close"].astype(float).iloc[-1])
+            gain_24h = float(ticker.get("priceChangePercent", 0) or 0)
 
-            # Step 1: Regime
-            tqi_val = self._tqi(df_5m)
-            if   tqi_val > 0.75: regime = "Strong_Trend_Impulse"
-            elif tqi_val > 0.50: regime = "Trending"
-            else:                regime = "Choppy_Range"
-
-            tqi_min = {"Strong_Trend_Impulse": 0.15, "Trending": 0.20, "Choppy_Range": 0.30}
-            if tqi_val < tqi_min[regime]:
-                log.info("  ⏭️  %s: TQI=%.2f too choppy for %s — skip", sym, tqi_val, regime)
-                return None
-
-            # Step 2: HTF cascade
-            htf_score, htf_labels, is_major_bull, is_major_bear, adx_4h = \
-                self._top_down(df_1w, df_1d, df_4h, df_1h, df_15m)
-            htf_str = " ".join(htf_labels)
-            log.info("  📊 %s HTF: %s | score=%+d | ADX4H=%.0f | major_bull=%s major_bear=%s",
-                     sym, htf_str, htf_score, adx_4h, is_major_bull, is_major_bear)
-
-            # Step 3: Indicators
-            disp_ratio, strong_disp = self._displacement(df_5m)
-            wt1, wt2, wt_up, wt_dn  = self._wavetrend(df_5m)
-            rsi_5m   = self._rsi(df_5m, 14)
-            rsi_1h   = self._rsi(df_1h, 14)
-            macd_h   = self._macd_hist(df_5m)
-            btc_score = int(getattr(btc, "score", 50))
-            atr_val  = float((df_5m["high"].astype(float) -
-                               df_5m["low"].astype(float)).rolling(14).mean().iloc[-1])
-            cci_val  = self._cci(df_5m, 20)
-
-            # ── Volume Analysis ──────────────────────────────────────
-            vol_ratio, obv_rising, vol_spike = self._volume_analysis(df_5m, df_1h)
-
-            # ── Hard Volume Filter — dead thin market ──────────────────
-            # vol < 0.5× means barely anyone is trading — SL hunters win
-            if vol_ratio < 0.5:
-                log.info("  ⏭️  %s: vol=%.1f× too thin (< 0.5×) — skip", sym, vol_ratio)
-                return None
-
-            # Step 4: Direction — HTF decides WHAT to trade, LTF decides WHEN
-            # ─────────────────────────────────────────────────────────
-            # Derive bias from HTF cascade (already computed above)
-            if   htf_score >= 3:   htf_direction = "BUY"    # 1D+4H or more aligned up
-            elif htf_score <= -3:  htf_direction = "SELL"   # 1D+4H or more aligned down
-            else:                  htf_direction = "NEUTRAL" # mixed/sideways
-
-            # LTF readiness: 5m MACD + WaveTrend confirm timing
-            ltf_buy  = macd_h > 0 and (wt1 > wt2 or wt_up)
-            ltf_sell = macd_h < 0 and (wt1 < wt2 or wt_dn)
-            ltf_buy_weak  = macd_h > 0   # MACD only, no WT confirmation
-            ltf_sell_weak = macd_h < 0
-
-            if htf_direction == "BUY":
-                # HTF says BUY — only look for BUY entries
-                if ltf_buy:
-                    direction = "BUY"     # strong: MACD + WT aligned
-                elif ltf_buy_weak:
-                    direction = "BUY"     # weak: MACD only (WT lagging)
-                else:
-                    # LTF is bearish in a bullish HTF — pullback in progress, wait
-                    log.info("  ⏭️  %s: HTF bullish (score=%+d) but LTF bearish — pullback, skip",
-                             sym, htf_score)
-                    return None
-
-            elif htf_direction == "SELL":
-                # HTF says SELL — only look for SELL entries
-                if ltf_sell:
-                    direction = "SELL"
-                elif ltf_sell_weak:
-                    direction = "SELL"
-                else:
-                    log.info("  ⏭️  %s: HTF bearish (score=%+d) but LTF bullish — pullback, skip",
-                             sym, htf_score)
-                    return None
-
+            # Asset category
+            if gain_24h >= 5.0:
+                asset_category = "GAINER"
+            elif gain_24h <= -5.0:
+                asset_category = "LOSER"
             else:
-                # HTF NEUTRAL (range/mixed) — allow both directions based on LTF only
-                # This handles Choppy_Range regime mean-reversion trades
-                if   ltf_buy  or ltf_buy_weak:   direction = "BUY"
-                elif ltf_sell or ltf_sell_weak:  direction = "SELL"
-                else:
-                    log.info("  ⏭️  %s: MACD flat (hist=%.4f) — no direction → skip", sym, macd_h)
-                    return None
+                asset_category = "NEUTRAL"
 
-            # ── v4.3: STRATEGY-AWARE SIGNAL BIASING ───────────────
-            # GAINER: favor trend continuation (BUY aligned with HTF momentum)
-            # LOSER:  favor capitulation reversal BUY on extreme oversold
-            if asset_category == "GAINER" and direction == "SELL" and gain_24h > 8.0:
-                # Strong gainer — SELL signal is fighting the momentum, skip it
-                log.info("  ⏭️  %s: GAINER +%.1f%% — skip SELL (trend continuation bias)",
-                         sym, gain_24h)
+            # ------------------------------------------------------------------
+            # STEP 1: STRUCTURE TRIGGER
+            # ------------------------------------------------------------------
+            sweep_low, sweep_high = self._detect_sweep(df_5m)
+            reclaim_buy, reclaim_sell = self._reclaim_confirm(df_5m, sweep_low, sweep_high)
+            bos_up, bos_down = self._break_of_structure(df_5m)
+
+            structure_event = None
+            trigger_type = ""
+            base_score = 0.0
+
+            if sweep_low and reclaim_buy:
+                structure_event = "BUY"
+                trigger_type = "Sweep"
+                base_score = 55.0
+            elif sweep_high and reclaim_sell:
+                structure_event = "SELL"
+                trigger_type = "Sweep"
+                base_score = 55.0
+            elif bos_up:
+                structure_event = "BUY"
+                trigger_type = "Breakout"
+                base_score = 48.0
+            elif bos_down:
+                structure_event = "SELL"
+                trigger_type = "Breakout"
+                base_score = 48.0
+            else:
                 return None
-            if asset_category == "LOSER" and direction == "SELL" and rsi_5m < 30:
-                # Oversold loser — selling more is low edge, skip
-                log.info("  ⏭️  %s: LOSER %.1f%% oversold RSI=%.0f — skip SELL (capitulation bias)",
-                         sym, gain_24h, rsi_5m)
-                return None
 
-            # ── CAPITULATION OVERRIDE ──────────────────────────────
-            # BTC RSI < 25 (extreme oversold) = market panic/capitulation
-            # These are the HIGHEST edge mean-reversion BUY setups
-            # Allow BUY signals on oversold pairs even during pullback
-            btc_rsi = btc.rsi if hasattr(btc, "rsi") else 50
-            if btc_rsi < 25 and direction == "SELL" and rsi_5m < 25:
-                # Don't SELL into extreme oversold during capitulation
-                log.info("  ⏭️  %s: Capitulation mode (BTC RSI=%.0f) — skip SELL at oversold RSI=%.0f",
-                         sym, btc_rsi, rsi_5m)
-                return None
+            # ------------------------------------------------------------------
+            # STEP 2: SNIPER PULLBACK (refine entry)
+            # ------------------------------------------------------------------
+            direction = None
+            is_pullback = False
+            retrace_pct = 0.0
 
-            # Velocity check: only enter capitulation BUY when RSI is RISING (panic ending)
-            # RSI=12 dropping = still dangerous; RSI=12→24 rising = momentum shift = buy edge
-            btc_rsi_prev = getattr(btc, "rsi_prev", btc_rsi)  # fallback to current if unavailable
-            btc_rsi_rising = btc_rsi > btc_rsi_prev or btc_rsi > 20   # rising or recovered above 20
-
-            if btc_rsi < 25 and htf_direction == "BUY" and not (ltf_buy or ltf_buy_weak):
-                # Allow BUY only when: pair oversold AND BTC RSI rising (velocity confirms)
-                if rsi_5m < 30 and btc_rsi_rising:
-                    log.info("  📍 %s: Capitulation BUY (BTC RSI=%.0f↑, pair RSI=%.0f) — override pullback",
-                             sym, btc_rsi, rsi_5m)
+            if structure_event == "BUY":
+                is_pullback, retrace_pct = self._detect_pullback(df_5m, "BUY")
+                if is_pullback and self._confirm_pullback_entry(df_5m, "BUY"):
                     direction = "BUY"
-                elif rsi_5m < 30 and not btc_rsi_rising:
-                    log.info("  ⏭️  %s: Capitulation — BTC RSI still falling (%.0f), wait",
-                             sym, btc_rsi)
-                    return None
+                    base_score += 10   # sniper precision bonus
+                    trigger_type = f"Sniper Pullback ({retrace_pct:.1f}%)"
+                    log.debug("  🎯 %s pullback entry at %.1f%% retrace", sym, retrace_pct)
+                else:
+                    # Still allow entry but with lower base score (no pullback penalty)
+                    direction = "BUY"
+                    base_score -= 5
+                    trigger_type = f"{trigger_type} (no pullback)"
+            else:  # SELL
+                is_pullback, retrace_pct = self._detect_pullback(df_5m, "SELL")
+                if is_pullback and self._confirm_pullback_entry(df_5m, "SELL"):
+                    direction = "SELL"
+                    base_score += 10
+                    trigger_type = f"Sniper Pullback ({retrace_pct:.1f}%)"
+                    log.debug("  🎯 %s pullback entry at %.1f%% retrace", sym, retrace_pct)
+                else:
+                    direction = "SELL"
+                    base_score -= 5
+                    trigger_type = f"{trigger_type} (no pullback)"
 
             is_buy = direction == "BUY"
+            score = base_score
+            breakdown = {"base": base_score}
 
-            # ── Hard Volume Filter 2 — OBV against direction ────────────
-            # vol < 0.8× AND money flow (OBV) opposing your direction = no edge
-            # e.g. BUY signal but OBV falling = smart money selling into your buy
-            if vol_ratio < 0.8 and not vol_spike:
-                if (is_buy and not obv_rising) or (not is_buy and obv_rising):
-                    log.info("  ⏭️  %s: vol=%.1f× + OBV against %s direction — skip",
-                             sym, vol_ratio, direction)
-                    return None
-
-            # Step 4b: INDICATOR CORRELATION GATE
-            # Count how many indicators conflict with the trade direction.
-            # If ≥2 indicators disagree, the setup is contradictory — skip.
-            #
-            # Conflict rules:
-            #   BUY:  WT overbought (>50)            → conflict
-            #         TQI choppy (<0.30) + no WT gold → conflict
-            #         CCI overbought (>85)            → conflict
-            #         RSI overbought (>75)            → conflict
-            #   SELL: WT oversold (<-50)              → conflict
-            #         TQI choppy (<0.30) + no WT gold → conflict
-            #         CCI oversold (<-85)             → conflict
-            #         RSI oversold (<25)              → conflict
-            conflicts = 0
-            conflict_detail = []
+            # ------------------------------------------------------------------
+            # STEP 3: CONFIRMATIONS (BOOSTS)
+            # ------------------------------------------------------------------
+            # HTF Cascade
+            htf_score, htf_labels, is_major_bull, is_major_bear, adx_4h = self._top_down(
+                df_1d, df_4h, df_1h, df_15m
+            )
             if is_buy:
-                if wt1 > 50:
-                    conflicts += 1; conflict_detail.append(f"WT={wt1:.0f}↑overbought")
-                if tqi_val < 0.30 and not wt_up:
-                    conflicts += 1; conflict_detail.append(f"TQI={tqi_val:.2f}↓choppy+noGold")
-                if cci_val > 85:
-                    conflicts += 1; conflict_detail.append(f"CCI={cci_val:.0f}↑overbought")
-                if rsi_5m > 75:
-                    conflicts += 1; conflict_detail.append(f"RSI={rsi_5m:.0f}↑overbought")
+                htf_bonus = min(25, htf_score * 3)
             else:
-                if wt1 < -50:
-                    conflicts += 1; conflict_detail.append(f"WT={wt1:.0f}↓oversold")
-                if tqi_val < 0.30 and not wt_dn:
-                    conflicts += 1; conflict_detail.append(f"TQI={tqi_val:.2f}↓choppy+noGold")
-                if cci_val < -85:
-                    conflicts += 1; conflict_detail.append(f"CCI={cci_val:.0f}↓oversold")
-                if rsi_5m < 25:
-                    conflicts += 1; conflict_detail.append(f"RSI={rsi_5m:.0f}↓oversold")
-
-            # v4.3: Adaptive conflict penalty — regime-aware
-            # Strong trend: tolerates more conflicts (momentum can override indicators)
-            # Choppy range: strict — conflicts are more meaningful in sideways markets
-            _conflict_mult = {"Strong_Trend_Impulse": 2,   # +2 pts per conflict
-                               "Trending":             4,   # +4 pts per conflict
-                               "Choppy_Range":         6}   # +6 pts per conflict
-            conflict_penalty = conflicts * _conflict_mult.get(regime, 4)
-            # Hard block at 4+ conflicts regardless of regime (too contradictory)
-            if conflicts >= 4:
-                log.info("  ❌ %s %s | %d indicator conflicts (%s) — too contradictory → skip",
-                         sym, direction, conflicts, " ".join(conflict_detail))
-                return None
-            elif conflicts > 0:
-                log.info("  ⚠️  %s %s | %d indicator conflict(s) (%s) → score penalty -%d",
-                         sym, direction, conflicts, " ".join(conflict_detail), conflict_penalty)
-
-            # Step 5: HTF gate — hard block only when ALL major TFs strongly against
-            # (1W+1D+4H all bearish = true bear market, no BUY; vice versa for SELL)
-            # Softer misalignment converts to score penalty instead of hard block
-            htf_penalty = 0
-            if is_buy:
-                # Only hard block if 1W+1D+4H all bearish (total ≤ -9)
-                if htf_score <= -9:
-                    log.info("  ❌ %s BUY | ALL major TFs bearish (score=%+d) — %s → blocked",
-                             sym, htf_score, htf_str)
-                    return None
-                # Soft: penalise for each bearish major TF
-                if is_major_bear:  htf_penalty += 10  # 1D+4H both bearish
-                elif htf_score < 0: htf_penalty += abs(htf_score) * 1.5
-            else:
-                # Only hard block if 1W+1D+4H all bullish (total ≥ +9)
-                if htf_score >= 9:
-                    log.info("  ❌ %s SELL | ALL major TFs bullish (score=%+d) — %s → blocked",
-                             sym, htf_score, htf_str)
-                    return None
-                if is_major_bull:  htf_penalty += 10
-                elif htf_score > 0: htf_penalty += htf_score * 1.5
-
-            # Step 6: BTC filter
-            if is_buy  and btc_score < 30:
-                log.info("  ❌ %s BUY blocked | BTC=%d (bear market)", sym, btc_score)
-                return None
-            if not is_buy and btc_score > 70:
-                log.info("  ❌ %s SELL blocked | BTC=%d (bull market)", sym, btc_score)
-                return None
-
-            # Step 7: RSI extreme blocks — hard block only at truly extreme levels
-            # Strong_Trend_Impulse: allow overbought continuation (BTC/SOL breakouts)
-            # Other regimes: penalise but don't fully block until extreme
-            rsi_penalty = 0
-            if is_buy:
-                if rsi_5m > 90 or rsi_1h > 88:   # truly extreme — block
-                    log.info("  ❌ %s BUY | RSI extreme (5m=%.0f 1h=%.0f) → skip", sym, rsi_5m, rsi_1h)
-                    return None
-                elif rsi_5m > 78 and regime != "Strong_Trend_Impulse":
-                    rsi_penalty = (rsi_5m - 78) * 1.5   # e.g. RSI=82 → -6 pts
-                elif rsi_5m > 82:   # strong trend but still very high
-                    rsi_penalty = (rsi_5m - 82) * 1.0
-            else:
-                if rsi_5m < 10 or rsi_1h < 12:   # truly extreme — block
-                    log.info("  ❌ %s SELL | RSI extreme (5m=%.0f 1h=%.0f) → skip", sym, rsi_5m, rsi_1h)
-                    return None
-                elif rsi_5m < 22 and regime != "Strong_Trend_Impulse":
-                    rsi_penalty = (22 - rsi_5m) * 1.5
-                elif rsi_5m < 18:
-                    rsi_penalty = (18 - rsi_5m) * 1.0
-
-            # Step 8: Confluence score
-            score = 40.0
-            if   regime == "Strong_Trend_Impulse": score += 15
-            elif regime == "Trending":             score += 10
-            else:                                  score +=  5
-
-            if strong_disp: score += 12
-
-            if is_buy  and wt_up:    score += 15
-            if not is_buy and wt_dn: score += 15
-            if is_buy  and wt1 > wt2: score += 5
-            if not is_buy and wt1 < wt2: score += 5
-            if is_buy  and wt1 > 50:  score -= 8
-            if not is_buy and wt1 < -50: score -= 8
-
-            if abs(macd_h) > 0.05: score += 8
-
-            # Volume confirmation scoring
-            if vol_spike:
-                # Volume spike (3×+ average) — confirms breakout move
-                score += 8 if is_buy else 8
-                log.debug("  %s: volume spike %.1f× avg → +8", sym, vol_ratio)
-            elif vol_ratio >= 1.5:
-                # Above-average volume confirms direction
-                score += 5
-            elif vol_ratio < 0.7:
-                # Very low volume = weak move, likely to reverse
-                score -= 5
-                log.debug("  %s: thin volume %.1f× avg → -5", sym, vol_ratio)
-
-            # OBV trend — money flow direction
-            if is_buy and obv_rising:
-                score += 6   # buyers accumulating = confirms BUY
-            elif not is_buy and not obv_rising:
-                score += 6   # sellers distributing = confirms SELL
-            elif is_buy and not obv_rising:
-                score -= 4   # selling pressure on BUY signal = caution
-            elif not is_buy and obv_rising:
-                score -= 4   # buying pressure on SELL signal = caution
-
-            if is_buy  and 35 < rsi_5m < 68: score += 8
-            if not is_buy and 32 < rsi_5m < 65: score += 8
-
-            if is_buy  and btc_score >= 60: score += 6
-            if not is_buy and btc_score <= 40: score += 6
-
-            if is_buy:
-                htf_bonus = max(0, min(20, int(htf_score * 1.5)))
-            else:
-                htf_bonus = max(0, min(20, int(-htf_score * 1.5)))
+                htf_bonus = min(25, -htf_score * 3)
             score += htf_bonus
-            score  = min(100.0, score)
+            breakdown["htf"] = htf_bonus
 
-            # Apply accumulated gate penalties before threshold check
-            score -= htf_penalty      # HTF misalignment penalty (0–15)
-            score -= rsi_penalty      # RSI extreme penalty (0–12)
-            score -= conflict_penalty # Indicator conflict penalty (0–12)
-            score = max(0.0, min(100.0, score))
+            # Volume
+            vol_ratio, obv_rising, vol_spike = self._volume_analysis(df_5m, df_1h)
+            if vol_spike:
+                score += 15
+                breakdown["vol_spike"] = 15
+            elif vol_ratio >= 1.5:
+                score += 12
+                breakdown["vol_strong"] = 12
+            elif vol_ratio < 0.7:
+                score -= 2
+                breakdown["vol_weak"] = -2
 
-            # v4.3: Dynamic thresholds — regime × asset category
-            # GAINER: lower threshold (trend is already proven, easier entry)
-            # LOSER:  higher threshold (reversal is riskier, needs confirmation)
-            # NEUTRAL: standard thresholds
-            _base_thresh = {"Strong_Trend_Impulse": 60, "Trending": 65, "Choppy_Range": 72}[regime]
-            if asset_category == "GAINER":
-                threshold = _base_thresh - 5   # easier entry on confirmed momentum
-            elif asset_category == "LOSER":
-                threshold = _base_thresh + 3   # stricter for reversal — needs conviction
-            else:
-                threshold = _base_thresh
-            if score < threshold:
-                log.info("  ❌ %s %s | score=%.0f/%.0f | regime=%s | rsi=%.0f | 🚫 weak setup",
-                         sym, direction, score, threshold, regime, rsi_5m)
+            # OBV alignment
+            if is_buy and obv_rising:
+                score += 10
+                breakdown["obv"] = 10
+            elif not is_buy and not obv_rising:
+                score += 10
+                breakdown["obv"] = 10
+            elif is_buy and not obv_rising:
+                score -= 1
+                breakdown["obv_against"] = -1
+            elif not is_buy and obv_rising:
+                score -= 1
+                breakdown["obv_against"] = -1
+
+            # RSI (5m)
+            rsi_5m = self._rsi(df_5m, 14)
+            if is_buy and 30 < rsi_5m < 65:
+                score += 12
+                breakdown["rsi"] = 12
+            elif not is_buy and 35 < rsi_5m < 70:
+                score += 12
+                breakdown["rsi"] = 12
+
+            # BTC Bias
+            btc_score_val = int(getattr(btc, "score", 50))
+            if is_buy and btc_score_val >= 60:
+                score += 15
+                breakdown["btc"] = 15
+            elif not is_buy and btc_score_val <= 40:
+                score += 15
+                breakdown["btc"] = 15
+
+            # Gainer/Loser Boost
+            if asset_category == "GAINER" and is_buy:
+                if gain_24h < 15.0:
+                    score += 10
+                    breakdown["gainer"] = 10
+                else:
+                    score -= 3
+                    breakdown["gainer_overextended"] = -3
+            elif asset_category == "LOSER" and not is_buy:
+                if gain_24h > -15.0:
+                    score += 10
+                    breakdown["loser"] = 10
+                else:
+                    score -= 3
+                    breakdown["loser_overextended"] = -3
+            elif asset_category == "LOSER" and is_buy:
+                score += 6
+                breakdown["capitulation"] = 6
+
+            # ------------------------------------------------------------------
+            # STEP 4: PENALTIES (minimal)
+            # ------------------------------------------------------------------
+            # Reversal detection for gainers
+            is_reversing, _ = self._detect_gainer_reversal(df_5m, df_1h)
+            if asset_category == "GAINER" and is_buy and is_reversing:
+                score -= 2
+                breakdown["gainer_reversing"] = -2
+
+            # RSI extreme
+            if is_buy and rsi_5m > 80:
+                score -= 3
+                breakdown["rsi_overbought"] = -3
+            elif not is_buy and rsi_5m < 20:
+                score -= 3
+                breakdown["rsi_oversold"] = -3
+
+            cci_val = self._cci(df_5m, 20)
+            if (is_buy and cci_val > 200) or (not is_buy and cci_val < -200):
+                score -= 2
+                breakdown["cci_extreme"] = -2
+
+            tqi_val = self._tqi(df_5m)
+            if tqi_val < 0.25:
+                score -= 2
+                breakdown["tqi_low"] = -2
+
+            # Hard block ONLY for extreme RSI
+            if (is_buy and rsi_5m > 92) or (not is_buy and rsi_5m < 8):
                 return None
 
-            # Step 9: Sniper
-            sniper = self._sniper_1m(df_1m, is_buy)
-            # Relax sniper during capitulation — recovery moves start weak then gain momentum
-            _btc_rsi_snap = getattr(btc, "rsi", 50)
-            sniper_min = 0.20 if _btc_rsi_snap < 32 else 0.35
-            if sniper < sniper_min:
-                log.info("  ❌ %s %s | sniper=%.0f%% too weak (min=%.0f%%) → skip",
-                         sym, direction, sniper*100, sniper_min*100)
+            # ------------------------------------------------------------------
+            # STEP 5: THRESHOLD CHECK
+            # ------------------------------------------------------------------
+            if score < self.threshold:
+                log.info("  ❌ %s %s | score %.0f < threshold %d", sym, direction, score, self.threshold)
                 return None
 
-            # Step 10: Grade + v4.3 position size by asset category
-            # GAINER → slightly larger (proven momentum, confidence boost)
-            # LOSER  → smaller (reversal riskier even if setup looks good)
-            if   score >= 88: grade = "ULTRA";    position_size = 1.0
-            elif score >= 75: grade = "STRONG";   position_size = 0.75
-            else:             grade = "STANDARD"; position_size = 0.50
+            # ------------------------------------------------------------------
+            # STEP 6: TP/SL & Signal Creation
+            # ------------------------------------------------------------------
 
-            if asset_category == "GAINER":
-                position_size = min(1.0, position_size * 1.20)  # +20% for momentum
-            elif asset_category == "LOSER":
-                position_size = position_size * 0.75            # -25% for reversal risk
+            atr_val = float((df_5m["high"].astype(float) - df_5m["low"].astype(float)).rolling(14).mean().iloc[-1])
 
-            # Step 11: TP/SL
-            sl_mult = {"Strong_Trend_Impulse": 1.2, "Trending": 1.5, "Choppy_Range": 1.8}[regime]
+            sl_mult = 0.05
             sl_dist = atr_val * sl_mult
-            # Minimum SL distance: 0.3% of price (prevents "SL too tight" on low-vol pairs)
             min_sl_dist = price * 0.003
             sl_dist = max(sl_dist, min_sl_dist)
 
-            # Cap SL distance — prevents inflated ATR from BTC crash
-            # creating TP levels so far they never get hit
-            _max_sl_pct = {"Strong_Trend_Impulse": 0.025,
-                           "Trending":             0.020,
-                           "Choppy_Range":         0.015}[regime]
-            max_sl_dist = price * _max_sl_pct
-            if sl_dist > max_sl_dist:
-                log.debug("SL capped %.4f%% → %.4f%% (%s)",
-                          sl_dist/price*100, _max_sl_pct*100, regime)
-                sl_dist = max_sl_dist
-            # R:R enforcement: TP1 must be ≥ 1.5× SL to ensure positive expectancy
-            # Old: TP1=0.8×SL (R:R<1 → negative E even at 70% WR)
-            # New: TP1=1.5×SL (R:R=1.5 → positive E at just 40% WR)
             if is_buy:
                 sl  = price - sl_dist
-                tp1 = price + sl_dist * 1.5   # was 0.8 — enforces min R:R 1.5
-                tp2 = price + sl_dist * 2.5   # was 1.8
-                tp3 = price + sl_dist * 4.0   # was 3.0 — runner
+                tp1 = price + sl_dist * 1.5
+                tp2 = price + sl_dist * 2.5
+                tp3 = price + sl_dist * 4.0
             else:
                 sl  = price + sl_dist
                 tp1 = price - sl_dist * 1.5
                 tp2 = price - sl_dist * 2.5
                 tp3 = price - sl_dist * 4.0
 
-            if   score >= 88: _rating = "🟢🟢🟢 EXCELLENT"
-            elif score >= 75: _rating = "🟢🟢 STRONG"
-            elif score >= 62: _rating = "🟢 GOOD"
-            else:             _rating = "🟡 MARGINAL"
-
-            # Dynamic risk tag
-            btc_rsi_chk = getattr(btc, "rsi", 50)
-            if btc_rsi_chk < 25:
-                signal_tag = "CAPITULATION"
-            elif grade in ("ULTRA", "STRONG"):
-                signal_tag = "CONFIRMATION"
+            # Grade
+            if score >= 90:
+                grade = "ULTRA"
+                position_size = 1.0
+            elif score >= 75:
+                grade = "STRONG"
+                position_size = 0.75
             else:
-                signal_tag = "STANDARD"
+                grade = "STANDARD"
+                position_size = 0.50
 
-            # Strategy type label for log clarity
-            _strategy = ("TREND CONTINUATION" if regime == "Strong_Trend_Impulse" else
-                         "SWING"              if regime == "Trending" else
-                         "MEAN REVERSION")
-
-            _cat_icon = {"GAINER": "🚀", "LOSER": "🔻", "NEUTRAL": "➖"}[asset_category]
-            log.info(
-                "  ✅ %s %s | score=%.0f/100 %s | %s | %s%s(%.1f%%) | regime=%s | rsi=%.0f | "
-                "atr=%.2f%% | vol=%.1f× %s | HTF:%s(%+d) ADX4H=%.0f | "
-                "penalties: htf=%.0f rsi=%.0f conf=%.0f",
-                sym, direction, score, _rating, _strategy,
-                _cat_icon, asset_category, gain_24h,
-                regime, rsi_5m, atr_val / price * 100,
-                vol_ratio, "📈OBV↑" if obv_rising else "📉OBV↓",
-                htf_str, htf_score, adx_4h,
-                htf_penalty, rsi_penalty, conflict_penalty)
+            confidence = int(min(100, score))
 
             self.signals_this_cycle += 1
             return Signal(
-                symbol=sym, signal=direction, grade=grade, tag=signal_tag,
-                confidence=int(score),
+                symbol=sym,
+                signal=direction,
+                grade=grade,
+                confidence=confidence,
                 action="ENTER_LONG" if is_buy else "ENTER_SHORT",
-                price=price, rsi_1h=rsi_1h, rsi_4h=rsi_1h, rsi_daily=rsi_1h,
-                tp1=tp1, tp2=tp2, tp3=tp3, sl=sl, atr=atr_val,
-                factors=(["HTF_CASCADE", "REGIME"] +
-                         (["DISPLACEMENT"] if strong_disp else [])),
-                strategies_hit=["TQI_REGIME", "WAVETREND"],
-                btc_score=btc_score, btc_trend=getattr(btc, "trend", ""),
-                confluence=score, hold_time="5-20min",
-                regime=regime, sniper_conf=sniper, tqi=tqi_val,
-                displacement_ratio=disp_ratio, position_size=position_size,
+                price=price,
+                gain_24h=gain_24h,
+                rsi_1h=self._rsi(df_1h, 14) if df_1h is not None else 50,
+                tp1=tp1,
+                tp2=tp2,
+                tp3=tp3,
+                sl=sl,
+                atr=atr_val,
+                btc_score=btc_score_val,
+                btc_trend=getattr(btc, "trend", ""),
+                confluence=score,
+                regime="Trending",
+                tqi=tqi_val,
+                position_size=position_size,
                 asset_category=asset_category,
+                trigger_type=trigger_type,
+                score_breakdown=breakdown,
+                factors=[f"v5.1 trigger: {trigger_type}"],
             )
+
         except Exception as e:
             log.warning("SignalEngine error %s: %s", sym, e)
             return None
 
-    # ── TOP-DOWN HTF CASCADE ────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Structure Detection
+    # ------------------------------------------------------------------
+    def _detect_sweep(self, df: pd.DataFrame) -> tuple[bool, bool]:
+        high = df["high"].astype(float).values
+        low  = df["low"].astype(float).values
+        close = df["close"].astype(float).values
+        if len(high) < 21:
+            return False, False
+        prev_high_20 = np.max(high[-21:-1])
+        prev_low_20  = np.min(low[-21:-1])
+        last_high = high[-1]
+        last_low  = low[-1]
+        last_close = close[-1]
+        sweep_high = last_high > prev_high_20 and last_close < prev_high_20
+        sweep_low  = last_low  < prev_low_20  and last_close > prev_low_20
+        return sweep_low, sweep_high
 
-    def _top_down(self, df_1w, df_1d, df_4h, df_1h, df_15m):
-        def vote(df, label, w):
-            try:
-                if df is None or len(df) < 52: return 0, f"{label}~"
-                c   = df["close"].astype(float)
-                e21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
-                e50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
-                pr  = float(c.iloc[-1])
-                if   pr > e50 and e21 > e50: return +w, f"{label}↑"
-                elif pr < e50 and e21 < e50: return -w, f"{label}↓"
-                else:                        return  0,  f"{label}~"
-            except Exception:
-                return 0, f"{label}~"
+    def _reclaim_confirm(self, df: pd.DataFrame, sweep_low: bool, sweep_high: bool) -> tuple[bool, bool]:
+        close = df["close"].astype(float).values
+        if len(close) < 3:
+            return False, False
+        reclaim_buy = False
+        reclaim_sell = False
+        if sweep_low:
+            support = np.min(df["low"].astype(float).values[-21:-1])
+            reclaim_buy = close[-1] > support and close[-2] <= support
+        if sweep_high:
+            resistance = np.max(df["high"].astype(float).values[-21:-1])
+            reclaim_sell = close[-1] < resistance and close[-2] >= resistance
+        return reclaim_buy, reclaim_sell
 
-        s1w,  l1w  = vote(df_1w,  "1W",  3)
-        s1d,  l1d  = vote(df_1d,  "1D",  3)
-        s4h,  l4h  = vote(df_4h,  "4H",  3)
-        s1h,  l1h  = vote(df_1h,  "1H",  2)
-        s15m, l15m = vote(df_15m, "15m", 1)
+    def _break_of_structure(self, df: pd.DataFrame) -> tuple[bool, bool]:
+        high = df["high"].astype(float).values
+        low  = df["low"].astype(float).values
+        if len(high) < 3:
+            return False, False
+        bos_up = high[-1] > high[-3]
+        bos_down = low[-1] < low[-3]
+        return bos_up, bos_down
 
-        htf_score     = s1w + s1d + s4h + s1h + s15m
-        is_major_bull = (s1d > 0 and s4h > 0)
-        is_major_bear = (s1d < 0 and s4h < 0)
+    def _detect_pullback(self, df: pd.DataFrame, direction: str) -> tuple[bool, float]:
+        if df is None or len(df) < 30:
+            return False, 0.0
+        close = df["close"].astype(float).values
+        high = df["high"].astype(float).values
+        low  = df["low"].astype(float).values
+        ema20 = pd.Series(close).ewm(span=20, adjust=False).mean().values
+        current_close = close[-1]
+        current_ema = ema20[-1]
+        recent_high = np.max(high[-21:-1])
+        recent_low  = np.min(low[-21:-1])
+        if direction == "BUY":
+            near_ema = abs(current_close - current_ema) / current_ema <= 0.005
+            near_support = abs(current_close - recent_low) / recent_low <= 0.008
+            if not (near_ema or near_support):
+                return False, 0.0
+            pullback_depth = (recent_high - current_close) / recent_high * 100
+            if 0.5 <= pullback_depth <= 3.0:
+                return True, pullback_depth
+        else:
+            near_ema = abs(current_close - current_ema) / current_ema <= 0.005
+            near_resistance = abs(current_close - recent_high) / recent_high <= 0.008
+            if not (near_ema or near_resistance):
+                return False, 0.0
+            pullback_depth = (current_close - recent_low) / recent_low * 100
+            if 0.5 <= pullback_depth <= 3.0:
+                return True, pullback_depth
+        return False, 0.0
 
-        adx_4h = 20.0
-        try:
-            if df_4h is not None and len(df_4h) >= 28:
-                h  = df_4h["high"].astype(float)
-                l  = df_4h["low"].astype(float)
-                c4 = df_4h["close"].astype(float)
-                tr = ((h - l).combine((h - c4.shift(1)).abs(), max)
-                             .combine((l - c4.shift(1)).abs(), max))
-                atr14   = tr.rolling(14).mean()
-                dm_up   = (h - h.shift(1)).clip(lower=0)
-                dm_dn   = (l.shift(1) - l).clip(lower=0)
-                di_up   = (dm_up.rolling(14).mean() / atr14.replace(0, 1e-10)) * 100
-                di_dn   = (dm_dn.rolling(14).mean() / atr14.replace(0, 1e-10)) * 100
-                dx      = (abs(di_up - di_dn) / (di_up + di_dn + 1e-10)) * 100
-                adx_4h  = float(dx.rolling(14).mean().iloc[-1])
-        except Exception:
-            pass
+    def _confirm_pullback_entry(self, df: pd.DataFrame, direction: str) -> bool:
+        if len(df) < 3:
+            return False
+        o = df["open"].astype(float).values
+        h = df["high"].astype(float).values
+        l = df["low"].astype(float).values
+        c = df["close"].astype(float).values
+        body = abs(c[-1] - o[-1])
+        lower_wick = min(o[-1], c[-1]) - l[-1] if direction == "BUY" else h[-1] - max(o[-1], c[-1])
+        upper_wick = h[-1] - max(o[-1], c[-1]) if direction == "BUY" else min(o[-1], c[-1]) - l[-1]
+        if direction == "BUY":
+            is_engulfing = c[-1] > o[-1] and c[-2] < o[-2] and c[-1] > o[-2] and o[-1] < c[-2]
+            is_pinbar = lower_wick >= body * 1.5 and upper_wick <= body * 0.5
+            return is_engulfing or is_pinbar
+        else:
+            is_engulfing = c[-1] < o[-1] and c[-2] > o[-2] and c[-1] < o[-2] and o[-1] > c[-2]
+            is_pinbar = upper_wick >= body * 1.5 and lower_wick <= body * 0.5
+            return is_engulfing or is_pinbar
 
-        return htf_score, [l1w, l1d, l4h, l1h, l15m], is_major_bull, is_major_bear, round(adx_4h, 1)
+    def _detect_gainer_reversal(self, df_5m: pd.DataFrame, df_1h: pd.DataFrame | None = None) -> tuple[bool, str]:
+        if df_5m is None or len(df_5m) < 20:
+            return False, ""
+        close = df_5m["close"].astype(float).values
+        volume = df_5m["volume"].astype(float).values
+        recent_low = np.min(df_5m["low"].astype(float).values[-11:-1])
+        if close[-1] < recent_low:
+            return True, "support_break"
+        vol_ma = np.mean(volume[-21:-1]) if len(volume) >= 21 else np.mean(volume)
+        if volume[-1] > vol_ma * 2.0 and close[-1] < close[-2]:
+            return True, "volume_spike_down"
+        return False, ""
 
-    # ── INDICATORS ─────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Indicator Helpers (unchanged except where noted)
+    # ------------------------------------------------------------------
     def _get_df(self, sym, interval, limit):
         try:
             df = self._b.get_klines(sym, interval, limit)
-            if df is None or df.empty: return None
+            if df is None or df.empty:
+                return None
             for col in ("open", "high", "low", "close", "volume"):
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -568,151 +463,138 @@ class SignalEngine:
         except Exception:
             return None
 
+    def _top_down(self, df_1d, df_4h, df_1h, df_15m):
+        def vote(df, label, w):
+            try:
+                if df is None or len(df) < 52:
+                    return 0, f"{label}~"
+                c = df["close"].astype(float)
+                e21 = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
+                e50 = float(c.ewm(span=50, adjust=False).mean().iloc[-1])
+                pr = float(c.iloc[-1])
+                if pr > e50 and e21 > e50:
+                    return +w, f"{label}↑"
+                elif pr < e50 and e21 < e50:
+                    return -w, f"{label}↓"
+                else:
+                    return 0, f"{label}~"
+            except Exception:
+                return 0, f"{label}~"
+
+        s1d,  l1d  = vote(df_1d,  "1D",  3)
+        s4h,  l4h  = vote(df_4h,  "4H",  3)
+        s1h,  l1h  = vote(df_1h,  "1H",  2)
+        s15m, l15m = vote(df_15m, "15m", 1)
+
+        htf_score = s1d + s4h + s1h + s15m
+        is_major_bull = (s1d > 0 and s4h > 0)
+        is_major_bear = (s1d < 0 and s4h < 0)
+
+        adx_4h = 20.0
+        try:
+            if df_4h is not None and len(df_4h) >= 28:
+                h = df_4h["high"].astype(float)
+                l = df_4h["low"].astype(float)
+                c4 = df_4h["close"].astype(float)
+                tr = ((h - l).combine((h - c4.shift(1)).abs(), max)
+                             .combine((l - c4.shift(1)).abs(), max))
+                atr14 = tr.rolling(14).mean()
+                dm_up = (h - h.shift(1)).clip(lower=0)
+                dm_dn = (l.shift(1) - l).clip(lower=0)
+                di_up = (dm_up.rolling(14).mean() / atr14.replace(0, 1e-10)) * 100
+                di_dn = (dm_dn.rolling(14).mean() / atr14.replace(0, 1e-10)) * 100
+                dx = (abs(di_up - di_dn) / (di_up + di_dn + 1e-10)) * 100
+                adx_4h = float(dx.rolling(14).mean().iloc[-1])
+        except Exception:
+            pass
+
+        return htf_score, [l1d, l4h, l1h, l15m], is_major_bull, is_major_bear, round(adx_4h, 1)
+
     def _tqi(self, df, er_len=20, struct_len=20, mom_len=10) -> float:
         try:
-            cl  = df["close"].astype(float)
-            hi  = df["high"].astype(float)
-            lo  = df["low"].astype(float)
-            er  = (cl.diff(er_len).abs() /
-                   cl.diff().abs().rolling(er_len).sum().replace(0, 1e-10)).clip(0, 1)
+            cl = df["close"].astype(float)
+            hi = df["high"].astype(float)
+            lo = df["low"].astype(float)
+            er = (cl.diff(er_len).abs() /
+                  cl.diff().abs().rolling(er_len).sum().replace(0, 1e-10)).clip(0, 1)
             hi_n = hi.rolling(struct_len).max()
             lo_n = lo.rolling(struct_len).min()
             struct = (((cl - lo_n) / (hi_n - lo_n + 1e-10) - 0.5).abs() * 2).clip(0, 1)
-            win_dir = cl.diff(mom_len); bar_dir = cl.diff()
+            win_dir = cl.diff(mom_len)
+            bar_dir = cl.diff()
             aligned = sum(
                 (((win_dir > 0) & (bar_dir.shift(i) > 0)) |
                  ((win_dir < 0) & (bar_dir.shift(i) < 0))).astype(float)
                 for i in range(mom_len)
             )
-            mom   = (aligned / mom_len).clip(0, 1)
+            mom = (aligned / mom_len).clip(0, 1)
             atr_v = (hi - lo).rolling(14).mean()
             vol_f = ((atr_v / atr_v.rolling(100).mean().replace(0, 1e-10) - 0.6) / 1.2).clip(0, 1)
             return float((er * 0.35 + struct * 0.25 + mom * 0.20 + vol_f * 0.20).clip(0, 1).iloc[-1])
         except Exception:
             return 0.5
 
-    def _wavetrend(self, df, n1=10, n2=21):
-        try:
-            if len(df) < n2 + 5: return 0.0, 0.0, False, False
-            ap  = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
-            esa = ap.ewm(span=n1, adjust=False).mean()
-            d   = (ap - esa).abs().ewm(span=n1, adjust=False).mean()
-            ci  = (ap - esa) / (0.015 * d.replace(0, 1e-10))
-            wt1 = ci.ewm(span=n2, adjust=False).mean()
-            wt2 = wt1.rolling(4).mean()
-            w1, w2   = float(wt1.iloc[-1]), float(wt2.iloc[-1])
-            w1p, w2p = float(wt1.iloc[-2]), float(wt2.iloc[-2])
-            return w1, w2, (w1 > w2 and w1p <= w2p), (w1 < w2 and w1p >= w2p)
-        except Exception:
-            return 0.0, 0.0, False, False
-
     def _rsi(self, df, period=14) -> float:
         try:
-            c    = df["close"].astype(float)
-            d    = c.diff()
+            c = df["close"].astype(float)
+            d = c.diff()
             gain = d.clip(lower=0).rolling(period).mean()
             loss = (-d.clip(upper=0)).rolling(period).mean()
             return float((100 - 100 / (1 + gain / loss.replace(0, 1e-10))).iloc[-1])
         except Exception:
             return 50.0
 
-    def _macd_hist(self, df) -> float:
+    def _volume_analysis(self, df_5m: pd.DataFrame, df_1h: pd.DataFrame | None = None):
         try:
-            c    = df["close"].astype(float)
-            fast = c.ewm(span=8,  adjust=False).mean()
-            slow = c.ewm(span=17, adjust=False).mean()
-            line = fast - slow
-            return float((line - line.ewm(span=9, adjust=False).mean()).iloc[-1])
-        except Exception:
-            return 0.0
-
-    def _volume_analysis(self, df_5m: pd.DataFrame,
-                          df_1h: pd.DataFrame | None = None):
-        """
-        Returns (vol_ratio, obv_rising, vol_spike)
-        vol_ratio:   current 5m volume / 20-bar moving average (e.g. 1.8 = 80% above avg)
-        obv_rising:  On-Balance-Volume trend is up (money flowing in)
-        vol_spike:   volume is ≥ 3× average (major institutional move or news)
-        """
-        try:
-            vols  = df_5m["volume"].astype(float)
+            vols = df_5m["volume"].astype(float)
             close = df_5m["close"].astype(float)
             vol_ma = float(vols.rolling(20).mean().iloc[-1])
             vol_now = float(vols.iloc[-1])
             vol_ratio = vol_now / max(vol_ma, 1e-10)
-            vol_spike = vol_ratio >= 3.0   # 3× avg = significant
+            vol_spike = vol_ratio >= 3.0
 
-            # OBV: +volume when close > prev_close, -volume when down
             direction_5m = close.diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
             obv = (vols * direction_5m).cumsum()
-            obv_ema_fast = float(obv.ewm(span=5,  adjust=False).mean().iloc[-1])
+            obv_ema_fast = float(obv.ewm(span=5, adjust=False).mean().iloc[-1])
             obv_ema_slow = float(obv.ewm(span=20, adjust=False).mean().iloc[-1])
             obv_rising = obv_ema_fast > obv_ema_slow
 
-            # 1H volume confirmation (is higher TF participating?)
             if df_1h is not None and len(df_1h) >= 20:
-                vols_1h  = df_1h["volume"].astype(float)
-                vol_1h_ratio = float(vols_1h.iloc[-1]) / max(
-                    float(vols_1h.rolling(20).mean().iloc[-1]), 1e-10)
-                # If 1H volume is below average but 5m spike = fake breakout risk
+                vols_1h = df_1h["volume"].astype(float)
+                vol_1h_ratio = float(vols_1h.iloc[-1]) / max(float(vols_1h.rolling(20).mean().iloc[-1]), 1e-10)
                 if vol_1h_ratio < 0.6 and vol_ratio > 2.0:
-                    vol_spike = False   # 1H not confirming 5m spike
+                    vol_spike = False
 
             return round(vol_ratio, 2), obv_rising, vol_spike
         except Exception:
-            return 1.0, True, False   # neutral defaults on error
+            return 1.0, True, False
 
     def _cci(self, df, period=20) -> float:
-        """Commodity Channel Index — measures deviation from typical price mean."""
         try:
-            tp  = (df["high"].astype(float) + df["low"].astype(float) +
-                   df["close"].astype(float)) / 3.0
+            tp = (df["high"].astype(float) + df["low"].astype(float) + df["close"].astype(float)) / 3.0
             sma = tp.rolling(period).mean()
             mad = tp.rolling(period).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
             return float(((tp - sma) / (0.015 * mad.replace(0, 1e-10))).iloc[-1])
         except Exception:
             return 0.0
 
-    def _displacement(self, df):
-        try:
-            row  = df.iloc[-1]
-            body = abs(float(row["close"]) - float(row["open"]))
-            rng  = float(row["high"]) - float(row["low"])
-            disp = body / rng if rng > 0 else 0.0
-            vols   = df["volume"].astype(float)
-            vol_ma = float(vols.rolling(20).mean().iloc[-1])
-            vol_ok = vol_ma > 0 and float(vols.iloc[-1]) / vol_ma > 1.5
-            return disp, (disp > 0.65 and vol_ok)
-        except Exception:
-            return 0.0, False
 
-    def _sniper_1m(self, df_1m, is_buy: bool) -> float:
-        if df_1m is None or len(df_1m) < 20:
-            return 0.6
-        try:
-            c    = df_1m["close"].astype(float)
-            e9   = float(c.ewm(span=9,  adjust=False).mean().iloc[-1])
-            e21  = float(c.ewm(span=21, adjust=False).mean().iloc[-1])
-            sc   = 0.3 if ((is_buy and e9 > e21) or (not is_buy and e9 < e21)) else 0.0
-            fast = c.ewm(span=8,  adjust=False).mean()
-            slow = c.ewm(span=17, adjust=False).mean()
-            hist = float((fast - slow - (fast - slow).ewm(span=9, adjust=False).mean()).iloc[-1])
-            if (is_buy and hist > 0) or (not is_buy and hist < 0):
-                sc += 0.4
-            return min(1.0, sc + 0.3)
-        except Exception:
-            return 0.6
+_signal_engine: Optional[SignalEngine] = None
 
 
 _signal_engine: Optional[SignalEngine] = None
 
-def get_signal_engine(binance_client=None) -> SignalEngine:
+def get_signal_engine(binance_client=None) -> SignalEngine | None:
     global _signal_engine
     if _signal_engine is None:
+        # Always load config to get the starting threshold
+        from config import AppConfig
+        cfg = AppConfig()
+
         if binance_client is None:
             from src.data.binance_client import BinanceClient
-            from config import AppConfig
-            cfg = AppConfig()
             binance_client = BinanceClient(cfg.binance, cfg.scan)
-        _signal_engine = SignalEngine(binance_client)
+
+        _signal_engine = SignalEngine(binance_client, cfg.signal.adaptive_threshold_start)
+
     return _signal_engine

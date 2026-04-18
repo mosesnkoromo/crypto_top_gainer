@@ -1,7 +1,7 @@
 """
-config.py — v5  (Production)
+config.py — v5 (Production)
 Central configuration loaded from .env. Fails fast with clear errors.
-All scalping parameters tuned for 1H+15m strategy.
+All scalping parameters tuned for structure‑first v5 engine.
 """
 
 import os
@@ -43,11 +43,9 @@ class WhatsAppConfig:
 
 @dataclass(frozen=True)
 class ScanConfig:
-    # Universe: top liquid pairs by volume
     top_gainers_count:     int   = field(default_factory=lambda: _get("TOP_GAINERS_COUNT", 40, int))
     min_gain_percent:      float = field(default_factory=lambda: _get("MIN_GAIN_PERCENT", 2.0, float))
-    # Scalp mode: scan every 5 minutes
-    scan_interval_minutes: int   = field(default_factory=lambda: _get("SCAN_INTERVAL_MINUTES", 2, int))
+    scan_interval_minutes: int   = field(default_factory=lambda: _get("SCAN_INTERVAL_MINUTES", 1, int))
     timeframe:             str   = field(default_factory=lambda: _get("TIMEFRAME", "5m"))
     candle_limit:          int   = field(default_factory=lambda: _get("CANDLE_LIMIT", 80, int))
     min_quote_volume:      float = 5_000_000.0
@@ -67,19 +65,21 @@ class SignalConfig:
     volume_climax:         float = field(default_factory=lambda: _get("VOLUME_CLIMAX", 3.0, float))
     volume_strong:         float = field(default_factory=lambda: _get("VOLUME_STRONG", 2.0, float))
     volume_buy_min:        float = field(default_factory=lambda: _get("VOLUME_BUY_MIN", 1.3, float))
-    # Dynamic threshold — base value; session/volatility adjusts at runtime
     min_sell_confluence:   float = field(default_factory=lambda: _get("MIN_SELL_CONFLUENCE", 4.0, float))
     min_buy_confluence:    float = field(default_factory=lambda: _get("MIN_BUY_CONFLUENCE", 4.0, float))
+
+    # v5 new fields – adaptive threshold & ranking
+    adaptive_threshold_start: int = field(default_factory=lambda: _get("ADAPTIVE_THRESHOLD_START", 48, int))
+    adaptive_threshold_min:   int = field(default_factory=lambda: _get("ADAPTIVE_THRESHOLD_MIN", 42, int))
+    max_candidates_per_cycle: int = field(default_factory=lambda: _get("MAX_CANDIDATES_PER_CYCLE", 3, int))
 
 
 @dataclass(frozen=True)
 class RiskConfig:
-    # Scalp TP targets: fast, tight, achievable
     tp1_pct:       float = field(default_factory=lambda: _get("TP1_PCT", 0.8, float))
     tp2_pct:       float = field(default_factory=lambda: _get("TP2_PCT", 1.2, float))
     tp3_pct:       float = field(default_factory=lambda: _get("TP3_PCT", 2.0, float))
-    sl_pct:        float = field(default_factory=lambda: _get("SL_PCT", 0.8, float))   # fallback only
-    # Position split percentages (must sum to 100)
+    sl_pct:        float = field(default_factory=lambda: _get("SL_PCT", 0.8, float))
     tp1_close_pct: int   = field(default_factory=lambda: _get("TP1_CLOSE", 40, int))
     tp2_close_pct: int   = field(default_factory=lambda: _get("TP2_CLOSE", 35, int))
     tp3_close_pct: int   = field(default_factory=lambda: _get("TP3_CLOSE", 25, int))
@@ -117,21 +117,12 @@ class BinanceConfig:
 
 @dataclass(frozen=True)
 class AutoTradeConfig:
-    """
-    Auto-trade credentials and risk defaults.
-    Master on/off toggle lives in DB (AutoTradeState).
-    Bot starts cleanly with no keys — auto-trade stays disabled.
-    """
     api_key:    str  = field(default_factory=lambda: _get("BINANCE_API_KEY", ""))
     api_secret: str  = field(default_factory=lambda: _get("BINANCE_API_SECRET", ""))
-    # Set BINANCE_TESTNET=false in .env to go live
     testnet:    bool = field(default_factory=lambda: _get_bool("BINANCE_TESTNET", default=True))
-    # Scalp risk: 1.5% per trade, 6% daily loss limit
-    risk_pct_per_trade:   float = field(default_factory=lambda: _get("AUTO_RISK_PCT", 1.5, float))
-    daily_loss_limit_pct: float = field(default_factory=lambda: _get("AUTO_LOSS_LIMIT", 6.0, float))
-    # Time-exit: close stale trades at 60min (if low profit) or 90min hard cap
+    risk_pct_per_trade:   float = field(default_factory=lambda: _get("AUTO_RISK_PCT", 1.0, float))
+    daily_loss_limit_pct: float = field(default_factory=lambda: _get("AUTO_LOSS_LIMIT", 3.0, float))
     max_hold_minutes:     int   = field(default_factory=lambda: _get("MAX_HOLD_MINUTES", 15, int))
-    # Max concurrent open futures positions
     max_concurrent_pos:   int   = field(default_factory=lambda: _get("MAX_CONCURRENT_POS", 5, int))
 
     @property
@@ -149,7 +140,7 @@ class AppConfig:
     auto:     AutoTradeConfig = field(default_factory=AutoTradeConfig)
     log:      LogConfig       = field(default_factory=LogConfig)
     binance:  BinanceConfig   = field(default_factory=BinanceConfig)
-    version:  str             = "4.1.0"
+    version:  str             = "5.0.0"
 
 
 def load_config() -> AppConfig:

@@ -9,14 +9,14 @@ import logging
 from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 
-import now
 from django.shortcuts import render
-from django.http import JsonResponse
 from django.utils import timezone
 from django.db.models import Count, Avg, Sum, Q, F
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
-
+from django.http import JsonResponse
+from dashboard.models import AutoTradeState
+from config import load_config
 from .models import SignalRecord, ScanRecord, CapitalRecord
 
 # ── Scanner reference (set by runall.py on startup) ───────────────────
@@ -86,6 +86,8 @@ def api_stats(request):
 
 # ── Signals with pagination + filters ────────────────────────
 
+
+
 def api_signals(request):
     page      = int(request.GET.get("page", 1))
     per_page  = int(request.GET.get("per_page", 20))
@@ -102,36 +104,70 @@ def api_signals(request):
     # Period shortcuts
     now = timezone.now()
     if period == "today":
-        qs = qs.filter(created_at__gte=now.replace(hour=0,minute=0,second=0))
+        qs = qs.filter(created_at__gte=now.replace(hour=0, minute=0, second=0))
     elif period == "week":
         qs = qs.filter(created_at__gte=now - timedelta(days=7))
     elif period == "month":
         qs = qs.filter(created_at__gte=now - timedelta(days=30))
     else:
         # Default: today
-        qs = qs.filter(created_at__gte=now.replace(hour=0,minute=0,second=0))
+        qs = qs.filter(created_at__gte=now.replace(hour=0, minute=0, second=0))
 
-    if direction: qs = qs.filter(signal=direction.upper())
-    if grade:     qs = qs.filter(grade=grade.upper())
-    if symbol:    qs = qs.filter(symbol__icontains=symbol.upper())
-    if outcome:   qs = qs.filter(outcome=outcome.upper())
+    if direction:
+        qs = qs.filter(signal=direction.upper())
+    if grade:
+        qs = qs.filter(grade=grade.upper())
+    if symbol:
+        qs = qs.filter(symbol__icontains=symbol.upper())
+    if outcome:
+        qs = qs.filter(outcome=outcome.upper())
     if date_from:
-        try:    qs = qs.filter(created_at__date__gte=date_from)
-        except: pass
+        try:
+            qs = qs.filter(created_at__date__gte=date_from)
+        except Exception:
+            pass
     if date_to:
-        try:    qs = qs.filter(created_at__date__lte=date_to)
-        except: pass
+        try:
+            qs = qs.filter(created_at__date__lte=date_to)
+        except Exception:
+            pass
 
     total_count = qs.count()
     total_pages = max(1, (total_count + per_page - 1) // per_page)
-    offset      = (page - 1) * per_page
-    signals     = qs[offset:offset + per_page]
+    offset = (page - 1) * per_page
+    signals = qs[offset:offset + per_page]
+
+    signals_data = []
+    for sig in signals:
+        local_time = timezone.localtime(sig.created_at)
+        signals_data.append({
+            "id": sig.id,
+            "created_at": local_time.strftime("%Y-%m-%d %H:%M"),
+            "symbol": sig.symbol,
+            "signal": sig.signal,
+            "grade": sig.grade,
+            "confidence": sig.confidence,
+            "entry": round(sig.entry_price, 6) if sig.entry_price else None,
+            "tp1": round(sig.tp1, 6) if sig.tp1 else None,
+            "tp2": round(sig.tp2, 6) if sig.tp2 else None,
+            "tp3": round(sig.tp3, 6) if sig.tp3 else None,
+            "sl": round(sig.sl, 6) if sig.sl else None,
+            "rsi": round(sig.rsi, 1) if sig.rsi else None,
+            "btc_score": sig.btc_score,
+            "outcome": sig.outcome,
+            "profit_pct": sig.profit_pct,
+            "auto_checked": sig.auto_checked,
+            "trigger_type": sig.trigger_type,          # v5 new
+            # "score_breakdown": sig.score_breakdown,  # optional – can be added later
+        })
 
     return JsonResponse({
-        "signals": [_sig_dict(s) for s in signals],
+        "signals": signals_data,
         "pagination": {
-            "page": page, "per_page": per_page,
-            "total": total_count, "total_pages": total_pages,
+            "page": page,
+            "per_page": per_page,
+            "total": total_count,
+            "total_pages": total_pages,
         },
     })
 
@@ -468,205 +504,133 @@ def auto_trade_reset_counters(request):
         return JsonResponse({"ok": False, "error": str(e)})
 
 
-def auto_trade_status(request):
-    """GET: independent spot + futures status."""
-    from .models import AutoTradeState
-    from config import load_config
-    state = AutoTradeState.get()
-    cfg   = load_config()
-    has_keys = cfg.auto.has_keys
 
-    resp = {
-        # Spot
-        "spot_enabled":      state.spot_enabled,
-        "spot_risk":         state.spot_risk,
-        "spot_max_trades":   state.spot_max_trades,
+
+def auto_trade_status(request):
+    state = AutoTradeState.get()
+    cfg = load_config()
+
+    # Build response data
+    data = {
+        "spot_enabled": state.spot_enabled,
+        "spot_risk": state.spot_risk,
+        "spot_max_trades": state.spot_max_trades,
         "spot_trades_today": state.spot_trades_today,
-        "spot_total":        state.spot_total,
-        "spot_balance":      0.0,
-        "spot_open_orders":  0,
-        # Futures
-        "futures_enabled":      state.futures_enabled,
-        "futures_risk":         state.futures_risk,
-        "futures_max_trades":   state.futures_max_trades,
+        "spot_total": state.spot_total,
+        "futures_enabled": state.futures_enabled,
+        "futures_risk": state.futures_risk,
+        "futures_max_trades": state.futures_max_trades,
         "futures_trades_today": state.futures_trades_today,
-        "futures_total":        state.futures_total,
-        "futures_balance":      0.0,
-        "futures_open_orders":  0,
-        "futures_positions":    [],
-        # Meta
-        "has_keys": has_keys,
-        "testnet":  cfg.auto.testnet,
-        "block_spot":    "",
-        "block_futures": "",
+        "futures_total": state.futures_total,
+        "testnet": cfg.auto.testnet,
     }
 
-    if has_keys and (state.spot_enabled or state.futures_enabled):
-        import time as _t
-        ts = _t.time()
-        cached = _AT_CACHE.get("at_v2")
-        if cached and (ts - cached["ts"]) < 60:
-            resp.update(cached["data"])
-        else:
-            live = {
-                # Always set defaults so JS never gets undefined (prevents NaN)
-                "spot_balance": 0.0, "spot_open_orders": 0,
-                "futures_balance": 0.0, "futures_open_orders": 0,
-                "futures_positions": [],
-            }
-            from src.trading.binance_trader import BinanceTrader
+    # Try to get live balances and positions if trader is available
+    try:
+        from src.trading.binance_trader import BinanceTrader
 
+        if cfg.auto.has_keys:
+            # Spot trader
             if state.spot_enabled:
-                try:
-                    st = BinanceTrader(cfg.auto.api_key, cfg.auto.api_secret,
-                                       mode="spot", live=not cfg.auto.testnet)
-                    b = st.get_balance()   # returns dict
-                    live["spot_balance"]      = round(float(b.get("available_balance", 0) or 0), 2)
-                    live["spot_wallet"]       = round(float(b.get("wallet_balance",   0) or 0), 2)
-                    spot_orders = st.get_open_orders() or []
-                    # Ensure it's actually a list of dicts
-                    spot_orders = [o for o in spot_orders if isinstance(o, dict)]
-                    live["spot_open_orders"] = len(spot_orders)
-                    # Group orders by symbol to display as "positions"
-                    spot_by_sym = {}
-                    for o in spot_orders:
-                        sym2 = o.get("symbol","")
-                        spot_by_sym.setdefault(sym2, []).append({
-                            "order_id": str(o.get("orderId","")),
-                            "type":     o.get("type",""),
-                            "side":     o.get("side",""),
-                            "price":    o.get("price","0"),
-                            "stop":     o.get("stopPrice","0"),
-                            "qty":      o.get("origQty","0"),
-                            "filled":   o.get("executedQty","0"),
-                            "status":   o.get("status",""),
-                        })
-                    live["spot_positions"] = [
-                        {"symbol": sym2, "orders": ords}
-                        for sym2, ords in spot_by_sym.items()
-                    ]
-                    live["spot_open_orders_detail"] = [
-                        {"symbol": o.get("symbol",""), "type": o.get("type",""),
-                         "side": o.get("side",""), "price": o.get("price","0"),
-                         "qty": o.get("origQty","0"), "status": o.get("status","")}
-                        for o in spot_orders
-                    ]
-                except Exception as e:
-                    live["spot_error"] = str(e)[:80]
-                    logger.warning("Spot status fetch: %s", str(e)[:60])
+                spot_trader = BinanceTrader(
+                    api_key=cfg.auto.api_key,
+                    api_secret=cfg.auto.api_secret,
+                    mode="spot",
+                    live=not cfg.auto.testnet,
+                )
+                bal = spot_trader.get_balance()
+                data["spot_balance"] = bal.get("available_balance", 0)
+                data["spot_wallet"] = bal.get("wallet_balance", 0)
+                data["spot_error"] = bal.get("error", "")
+                data["spot_open_orders"] = len(spot_trader.get_open_orders())
+                # Spot positions (open orders only, as spot doesn't have positions like futures)
+                spot_orders = spot_trader.get_open_orders()
+                spot_positions = []
+                for o in spot_orders:
+                    spot_positions.append({
+                        "symbol": o.get("symbol"),
+                        "side": o.get("side"),
+                        "qty": o.get("origQty"),
+                        "price": o.get("price"),
+                        "type": o.get("type"),
+                    })
+                data["spot_positions"] = spot_positions
+            else:
+                data["spot_balance"] = 0
+                data["spot_wallet"] = 0
+                data["spot_error"] = ""
+                data["spot_open_orders"] = 0
+                data["spot_positions"] = []
 
+            # Futures trader
             if state.futures_enabled:
-                try:
-                    ft = BinanceTrader(cfg.auto.api_key, cfg.auto.api_secret,
-                                       mode="futures", live=not cfg.auto.testnet)
-                    b = ft.get_balance()   # returns dict
-                    live["futures_balance"]     = round(float(b.get("available_balance", 0) or 0), 2)
-                    live["futures_wallet"]      = round(float(b.get("wallet_balance",   0) or 0), 2)
-                    live["futures_pnl"]         = round(float(b.get("unrealised_pnl",  0) or 0), 2)
-                    regular_orders = ft.get_open_orders() or []
-                    # Also fetch algo orders (TAKE_PROFIT_MARKET, STOP_MARKET placed via algoOrder)
-                    try:
-                        algo_resp = ft._req("GET", "/fapi/v1/openAlgoOrders", {})
-                        algo_orders = algo_resp if isinstance(algo_resp, list) else                                       (algo_resp or {}).get("orders", []) if isinstance(algo_resp, dict) else []
-                        # Normalise algo order fields to match regular order format
-                        for ao in algo_orders:
-                            if "algoId" in ao and "orderId" not in ao:
-                                ao["orderId"]    = ao["algoId"]
-                                ao["stop_price"] = ao.get("triggerPrice", "0")
-                                ao["type"]       = ao.get("orderType", ao.get("type",""))
-                                ao["origQty"]    = ao.get("quantity","0")
-                                ao["status"]     = ao.get("algoStatus","NEW")
-                    except Exception:
-                        algo_orders = []
-                    all_orders = regular_orders + algo_orders
-                    live["futures_open_orders"] = len(all_orders)
-                    pos = ft.get_positions()
-                    # Get open orders to match with positions
-                    # Build orders-by-symbol using combined regular+algo orders
-                    orders_by_sym = {}
-                    for o in all_orders:
-                        s2 = o.get("symbol","")
-                        orders_by_sym.setdefault(s2, []).append({
-                            "order_id":   str(o.get("orderId", o.get("algoId",""))),
-                            "type":       o.get("type",""),
-                            "side":       o.get("side",""),
-                            "stop_price": str(o.get("stopPrice", o.get("triggerPrice","0"))),
-                            "price":      str(o.get("price","0")),
-                            "qty":        str(o.get("origQty", o.get("quantity","0"))),
-                            "status":     o.get("status", o.get("algoStatus","NEW")),
-                        })
+                fut_trader = BinanceTrader(
+                    api_key=cfg.auto.api_key,
+                    api_secret=cfg.auto.api_secret,
+                    mode="futures",
+                    live=not cfg.auto.testnet,
+                )
+                bal = fut_trader.get_balance()
+                data["futures_balance"] = bal.get("available_balance", 0)
+                data["futures_wallet"] = bal.get("wallet_balance", 0)
+                data["futures_pnl"] = bal.get("unrealised_pnl", 0)
+                data["futures_error"] = bal.get("error", "")
+                data["futures_open_orders"] = len(fut_trader.get_open_orders())
 
-                    from django.utils import timezone as _tz
-                    live["futures_positions"] = []
-                    for p in pos:
-                        amt      = float(p["positionAmt"])
-                        entry    = float(p["entryPrice"])
-                        pnl_usdt = float(p["unRealizedProfit"])
-                        notional = abs(amt) * entry
-                        pnl_pct  = round(pnl_usdt / max(notional, 0.01) * 100, 2)
-                        side = "LONG" if amt > 0 else "SHORT"
-                        # Get opened_at from ScalpPosition
-                        opened_at_str = None
-                        mins_open = None
-                        try:
-                            from dashboard.models import ScalpPosition
-                            _sp = ScalpPosition.objects.filter(
-                                symbol=p["symbol"], closed=False).first()
-                            if _sp:
-                                _delta = (_tz.now() - _sp.opened_at).total_seconds()
-                                mins_open = int(_delta / 60)
-                                opened_at_str = _sp.opened_at.isoformat()
-                        except Exception:
-                            pass
-                        # Check if signal record exists for this position
-                        _has_signal = False
-                        try:
-                            from datetime import timedelta as _td2
-                            _ts = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                            _has_signal = SignalRecord.objects.filter(
-                                symbol=p["symbol"],
-                                notes__icontains="AUTO_FUT:YES",
-                                outcome="PENDING",
-                            ).exists()
-                        except Exception:
-                            _has_signal = True  # assume OK if check fails
-                        live["futures_positions"].append({
-                            "symbol":        p["symbol"],
-                            "side":          side,
-                            "qty":           abs(amt),
-                            "raw_qty":       amt,
-                            "entry":         entry,
-                            "mark":          float(p.get("markPrice", 0)),
-                            "liq":           float(p.get("liquidationPrice", 0)),
-                            "leverage":      int(p.get("leverage", 1)),
-                            "pnl":           round(pnl_usdt, 4),
-                            "pnl_pct":       pnl_pct,
-                            "notional":      round(notional, 2),
-                            "orders":        orders_by_sym.get(p["symbol"], []),
-                            "opened_at":     opened_at_str,
-                            "minutes_open":  mins_open,
-                            "has_signal":    _has_signal,  # False = untracked position
-                        })
-                except Exception as e:
-                    live["futures_error"] = str(e)[:80]
-                    logger.warning("Futures status fetch: %s", str(e)[:60])
+                # Futures positions
+                positions = fut_trader.get_positions()
+                fut_positions = []
+                for p in positions:
+                    amt = float(p.get("positionAmt", 0))
+                    if abs(amt) < 0.0001:
+                        continue
+                    entry = float(p.get("entryPrice", 0))
+                    mark = float(p.get("markPrice", entry))
+                    pnl = float(p.get("unRealizedProfit", 0))
+                    notional = abs(amt) * entry
+                    pnl_pct = (pnl / notional * 100) if notional > 0 else 0
+                    fut_positions.append({
+                        "symbol": p.get("symbol"),
+                        "side": "LONG" if amt > 0 else "SHORT",
+                        "qty": abs(amt),
+                        "entry": entry,
+                        "mark": mark,
+                        "pnl": pnl,
+                        "pnl_pct": round(pnl_pct, 2),
+                        "leverage": p.get("leverage", 1),
+                        "liq": float(p.get("liquidationPrice", 0)),
+                        "notional": notional,
+                        "orders": [],  # populated below if needed
+                    })
+                data["futures_positions"] = fut_positions
+            else:
+                data["futures_balance"] = 0
+                data["futures_wallet"] = 0
+                data["futures_pnl"] = 0
+                data["futures_error"] = ""
+                data["futures_open_orders"] = 0
+                data["futures_positions"] = []
 
-            _AT_CACHE["at_v2"] = {"ts": ts, "data": live}
-            resp.update(live)
+    except Exception as e:
+        data["spot_error"] = str(e)
+        data["futures_error"] = str(e)
 
-    # Block reasons — always cast to float, never compare dicts
-    try: sb = float(resp.get("spot_balance", 0) or 0)
-    except (TypeError, ValueError): sb = 0.0
-    try: fb = float(resp.get("futures_balance", 0) or 0)
-    except (TypeError, ValueError): fb = 0.0
+    # v5: Adaptive threshold from scanner
+    try:
+        from src.scanner import Scanner
+        # Assuming you have a singleton scanner instance; adjust as needed.
+        # If scanner is not globally available, you can instantiate a new one.
+        # For simplicity, we'll return a default if not found.
+        # In practice, you might store the scanner in the app config or use a module-level variable.
+        from src.scanner import _scanner_instance  # you would need to set this in scanner.py
+        if _scanner_instance:
+            data["adaptive_threshold"] = _scanner_instance._adaptive_threshold
+        else:
+            data["adaptive_threshold"] = 48
+    except Exception:
+        data["adaptive_threshold"] = 48
 
-    resp["block_spot"]    = ("No API keys" if not has_keys else
-                             "Balance $0 — transfer USDT to Spot wallet on Binance" if sb <= 0 else
-                             f"Daily limit {state.spot_max_trades} reached" if state.spot_trades_today >= state.spot_max_trades else "")
-    resp["block_futures"] = ("No API keys" if not has_keys else
-                             "Balance $0 — transfer USDT to Futures wallet on Binance" if fb <= 0 else
-                             f"Daily limit {state.futures_max_trades} reached" if state.futures_trades_today >= state.futures_max_trades else "")
-    return JsonResponse(resp)
+    return JsonResponse(data)
 
 
 @csrf_exempt

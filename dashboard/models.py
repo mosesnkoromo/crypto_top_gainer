@@ -29,6 +29,9 @@ class SignalRecord(models.Model):
     # No choices constraint — engine appends emoji. max_length=30 handles full string.
     grade      = models.CharField(max_length=30, db_index=True)
 
+    trigger_type = models.CharField(max_length=20, blank=True, default="", help_text="Sweep / Breakout")
+    score_breakdown = models.JSONField(default=dict, blank=True, help_text="Scoring breakdown per factor")
+
     confidence = models.IntegerField()
     confluence = models.FloatField()
 
