@@ -8,3 +8,4 @@ db.sqlite3
 staticfiles/
 logs/*.log
 .DS_Store
+.cache
