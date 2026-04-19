@@ -288,7 +288,7 @@ class SignalEngine:
 
             sl_mult = 0.05
             sl_dist = atr_val * sl_mult
-            min_sl_dist = price * 0.003
+            min_sl_dist = price * 0.008
             sl_dist = max(sl_dist, min_sl_dist)
 
             if is_buy:

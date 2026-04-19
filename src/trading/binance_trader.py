@@ -182,7 +182,6 @@ class BinanceTrader:
         sym = signal.symbol
         futures_sym = self._normalize_futures_sym(sym) if self._mode == "futures" else sym
         ok, reason = self._pre_flight(balance_usdt)
-        is_scalp = not hasattr(signal, 'tp2')
         if not ok:
             log.warning("Trade blocked [%s]: %s", sym, reason)
             return TradeResult(False, sym, signal.signal, 0, signal.price,

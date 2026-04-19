@@ -330,10 +330,12 @@ class SignalSimulator:
             high  = float(df["high"].iloc[j])
             low   = float(df["low"].iloc[j])
 
+            # When SL is hit
             if is_buy and low <= current_sl:
-                remaining  = 1.0 - (pos_tp1 if tp1_hit else 0.0) - (pos_tp2 if tp2_hit else 0.0)
+                remaining = 1.0 - (pos_tp1 if tp1_hit else 0.0) - (pos_tp2 if tp2_hit else 0.0)
                 pnl_total += remaining * ((current_sl - sim_entry) / sim_entry)
-                return VirtualTrade(0, sim_entry, current_sl, "SL", pnl_total, j - i, tp1_hit, tp2_hit)
+                outcome = "TP" if (tp1_hit or tp2_hit) else "SL"
+                return VirtualTrade(0, sim_entry, current_sl, outcome, pnl_total, j - i, tp1_hit, tp2_hit)
             if not is_buy and high >= current_sl:
                 remaining  = 1.0 - (pos_tp1 if tp1_hit else 0.0) - (pos_tp2 if tp2_hit else 0.0)
                 pnl_total += remaining * ((sim_entry - current_sl) / sim_entry)

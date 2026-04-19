@@ -117,3 +117,11 @@ def obv_trend(df: pd.DataFrame, period: int = 10) -> str:
     if slope > 0: return "rising"
     if slope < 0: return "falling"
     return "flat"
+
+def vwap(df: pd.DataFrame) -> pd.Series:
+    """Calculate cumulative VWAP (resets daily)."""
+    df = df.copy()
+    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+    df['cum_tp_vol'] = (df['typical_price'] * df['volume']).cumsum()
+    df['cum_vol'] = df['volume'].cumsum()
+    return df['cum_tp_vol'] / df['cum_vol']

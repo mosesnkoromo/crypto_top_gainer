@@ -1,0 +1,87 @@
+{
+  "news_articles": {
+    "expires": 1776626525.3421519,
+    "data": [
+      {
+        "title": "Massive $290 Million Hack Hits Ethereum and Arbitrum",
+        "url": "https://u.today/massive-290-million-hack-hits-ethereum-and-arbitrum",
+        "source": "U.Today",
+        "sentiment": "negative",
+        "published": "2026-04-19T05:59:07Z",
+        "currencies": "ETH"
+      },
+      {
+        "title": "Trump Dishing Out Mar-a-Lago Feast to Crypto Grift\u2019s Biggest Spenders",
+        "url": "https://www.thedailybeast.com/donald-trump-dishing-out-mar-a-lago-feast-to-crypto-grifts-biggest-spenders/",
+        "source": "The Daily Beast",
+        "sentiment": "neutral",
+        "published": "2026-04-19T05:09:25Z",
+        "currencies": ""
+      },
+      {
+        "title": "Celebrities pack Lakers vs. Rockets playoff game from Travis Scott to Timothy Olyphant and more",
+        "url": "https://nypost.com/2026/04/18/sports/celebrities-pack-lakers-vs-rockets-playoff-game-from-travis-scott-to-timothy-olyphant-and-more/",
+        "source": "New York Post",
+        "sentiment": "neutral",
+        "published": "2026-04-19T03:11:45Z",
+        "currencies": ""
+      },
+      {
+        "title": "Next Crypto to Explode as Pepeto Targets 150x, Institutions Enter Crypto",
+        "url": "https://techbullion.com/next-crypto-to-explode-as-pepeto-targets-150x-institutions-enter-crypto/",
+        "source": "TechBullion",
+        "sentiment": "neutral",
+        "published": "2026-04-19T02:40:38Z",
+        "currencies": ""
+      },
+      {
+        "title": "Next Crypto to Explode as Pepeto Rises, BTC ETF Inflows Hit $411M",
+        "url": "https://techbullion.com/next-crypto-to-explode-as-pepeto-rises-btc-etf-inflows-hit-411m/",
+        "source": "TechBullion",
+        "sentiment": "positive",
+        "published": "2026-04-19T02:30:50Z",
+        "currencies": "BTC"
+      },
+      {
+        "title": "Crypto Market News Today as Pepeto Listing Nears, Presale Heats Up",
+        "url": "https://techbullion.com/crypto-market-news-today-as-pepeto-listing-nears-presale-heats-up/",
+        "source": "TechBullion",
+        "sentiment": "neutral",
+        "published": "2026-04-19T02:25:40Z",
+        "currencies": ""
+      },
+      {
+        "title": "Ethereum Price Prediction as ETH Hits $200M Quarter, Pepeto Tops $9M",
+        "url": "https://techbullion.com/ethereum-price-prediction-as-eth-hits-200m-quarter-pepeto-tops-9m/",
+        "source": "TechBullion",
+        "sentiment": "neutral",
+        "published": "2026-04-19T02:20:26Z",
+        "currencies": "ETH"
+      },
+      {
+        "title": "New Cryptocurrency to Buy as Pepeto Presale Fills During Market Fear",
+        "url": "https://techbullion.com/new-cryptocurrency-to-buy-as-pepeto-presale-fills-during-market-fear/",
+        "source": "TechBullion",
+        "sentiment": "neutral",
+        "published": "2026-04-19T02:15:24Z",
+        "currencies": ""
+      },
+      {
+        "title": "Bitcoin Price Prediction to $80K as Pepeto Offers Faster Gains",
+        "url": "https://techbullion.com/bitcoin-price-prediction-to-80k-as-pepeto-offers-faster-gains/",
+        "source": "TechBullion",
+        "sentiment": "neutral",
+        "published": "2026-04-19T02:10:00Z",
+        "currencies": ""
+      },
+      {
+        "title": "Changpeng Zhao\u2019s memoir is key to understanding the future of crypto",
+        "url": "https://nypost.com/2026/04/18/business/changpeng-zhaos-book-detailing-his-life-shows-a-success-story-and-a-controversy-in-the-world-of-cryptocurrency/",
+        "source": "New York Post",
+        "sentiment": "neutral",
+        "published": "2026-04-19T02:01:19Z",
+        "currencies": ""
+      }
+    ]
+  }
+}

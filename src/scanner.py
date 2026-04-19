@@ -33,6 +33,7 @@ from src.utils.formatter import  fmt_digest
 from src.utils.logger import get_logger
 from src.analysis.signal_simulator import get_simulator
 from src.analysis.scalping_engine import ScalpingEngine
+from src.analysis.vwap_scalping_engine import VWAPScalpingEngine
 
 log = get_logger(__name__)
 
@@ -223,7 +224,7 @@ class Scanner:
         self._daily_loss_limit_hit = False
         self._last_loss_hit_date = None
         self._scalp_engine = ScalpingEngine(binance)
-
+        self._vwap_engine = VWAPScalpingEngine(binance)
     # -------------------------------------------------------------------------
     # Main Cycle
     # -------------------------------------------------------------------------
@@ -408,6 +409,20 @@ class Scanner:
                 scalp_signals.append(scalp_signal)
 
         # ---------------------------------------------------------------------
+        # VWAP SCALP ENGINE – VWAP + RSI(3) + EMA(8)
+        # ---------------------------------------------------------------------
+        vwap_signals = []
+        for ticker in gainers[:20]:
+            sym = ticker["symbol"]
+            if sym in self._pending_symbols:
+                continue
+            if self._is_in_cooldown(sym, now):
+                continue
+            vwap_signal = self._vwap_engine.analyze(ticker)
+            if vwap_signal and vwap_signal.confidence >= 50:
+                vwap_signals.append(vwap_signal)
+
+        # ---------------------------------------------------------------------
         # v5 CANDIDATE COLLECTION WITH RANKING
         # ---------------------------------------------------------------------
         candidates = []
@@ -467,10 +482,13 @@ class Scanner:
         # Double-check threshold (engine already filtered, but ensure)
         selected = [s for s in selected if s.confluence >= self._adaptive_threshold]
 
-        if selected:
+        # Merge all signal types: main + scalp + vwap
+        all_trade_signals = selected + scalp_signals + vwap_signals
+
+        if all_trade_signals:
             # Save scan record
             scan_rec = ScanRecord.objects.create(
-                pairs_scanned=len(gainers), signals_found=len(selected),
+                pairs_scanned=len(gainers), signals_found=len(all_trade_signals),
                 signals_sent=0, btc_score=btc.score,
                 btc_price=btc.price, btc_trend=btc.trend,
             )
@@ -559,7 +577,7 @@ class Scanner:
             )
 
         # Auto-trade execution
-        self._run_auto_trade(selected, spot_signals, now)
+        self._run_auto_trade(all_trade_signals, spot_signals, now)
 
         # Protection and cleanup (unchanged from original scanner)
         try:

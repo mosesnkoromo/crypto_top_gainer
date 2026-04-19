@@ -121,7 +121,7 @@ class AutoTradeConfig:
     api_secret: str  = field(default_factory=lambda: _get("BINANCE_API_SECRET", ""))
     testnet:    bool = field(default_factory=lambda: _get_bool("BINANCE_TESTNET", default=True))
     risk_pct_per_trade:   float = field(default_factory=lambda: _get("AUTO_RISK_PCT", 1.0, float))
-    daily_loss_limit_pct: float = field(default_factory=lambda: _get("AUTO_LOSS_LIMIT", 3.0, float))
+    daily_loss_limit_pct: float = field(default_factory=lambda: _get("AUTO_LOSS_LIMIT", 8.0, float))
     max_hold_minutes:     int   = field(default_factory=lambda: _get("MAX_HOLD_MINUTES", 15, int))
     max_concurrent_pos:   int   = field(default_factory=lambda: _get("MAX_CONCURRENT_POS", 5, int))
 
