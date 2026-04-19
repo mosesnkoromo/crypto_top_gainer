@@ -1,15 +1,15 @@
 """
 src/analysis/news_engine.py
 ────────────────────────────
-Production-grade news engine with multiple providers, circuit breakers,
+Production-grade news engine with GNews provider, circuit breaker,
 persistent cache (diskcache / JSON fallback), rate limiting, and health monitoring.
 """
 
 import os
 import json
 import time
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from datetime import datetime, timezone
+from typing import List, Optional, Any
 from pathlib import Path
 
 import requests
@@ -24,7 +24,6 @@ log = get_logger(__name__)
 # Configuration from environment
 # ------------------------------------------------------------------
 GNEWS_API_KEY = os.getenv("GNEWS_API_KEY", "")
-CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "")
 
 CACHE_TTL_MIN = int(os.getenv("NEWS_CACHE_TTL_MIN", "30"))
 CIRCUIT_BREAKER_FAILURE_THRESHOLD = int(os.getenv("CIRCUIT_BREAKER_THRESHOLD", "3"))
@@ -66,10 +65,7 @@ class PersistentCache:
 
     def get(self, key: str) -> Optional[Any]:
         if self._cache is not None:
-            # diskcache handles TTL automatically if we set expire on set
-            value = self._cache.get(key)
-            return value
-
+            return self._cache.get(key)
         # JSON fallback
         if not self._json_file.exists():
             return None
@@ -87,7 +83,6 @@ class PersistentCache:
         if self._cache is not None:
             self._cache.set(key, value, expire=self.ttl)
             return
-
         # JSON fallback
         try:
             if self._json_file.exists():
@@ -108,8 +103,9 @@ class PersistentCache:
     def backend_name(self) -> str:
         return "diskcache" if self._cache is not None else "json_file"
 
+
 # ------------------------------------------------------------------
-# Circuit Breaker (unchanged)
+# Circuit Breaker
 # ------------------------------------------------------------------
 class CircuitBreaker:
     def __init__(self, name: str, failure_threshold: int, timeout_sec: int):
@@ -159,8 +155,9 @@ class CircuitBreaker:
             "cooldown_remaining": max(0, self.timeout_sec - (time.time() - self.last_failure_time)) if self.state == "OPEN" else 0
         }
 
+
 # ------------------------------------------------------------------
-# Provider implementations (GNews, CryptoCompare) – unchanged
+# GNews Provider (sole provider)
 # ------------------------------------------------------------------
 class GNewsProvider:
     def __init__(self, api_key: str):
@@ -173,6 +170,7 @@ class GNewsProvider:
         if not self.api_key:
             raise ValueError("GNEWS_API_KEY missing")
 
+        # Simple rate limiting: 1 request per second (free tier ~100/day)
         elapsed = time.time() - self.last_request_time
         if elapsed < RATE_LIMIT_SLEEP_SEC:
             time.sleep(RATE_LIMIT_SLEEP_SEC - elapsed)
@@ -228,56 +226,6 @@ class GNewsProvider:
         return ",".join(found)
 
 
-class CryptoCompareProvider:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.name = "cryptocompare"
-        self.base_url = "https://min-api.cryptocompare.com/data/v2/news/"
-        self.last_request_time = 0
-
-    def fetch(self, limit: int) -> List[dict]:
-        if not self.api_key:
-            raise ValueError("CRYPTOCOMPARE_API_KEY missing")
-
-        elapsed = time.time() - self.last_request_time
-        if elapsed < RATE_LIMIT_SLEEP_SEC:
-            time.sleep(RATE_LIMIT_SLEEP_SEC - elapsed)
-        self.last_request_time = time.time()
-
-        params = {
-            "api_key": self.api_key,
-            "lang": "EN",
-            "limit": min(limit, 50),
-            "feeds": "cointelegraph,coindesk,decrypt,newsbtc,beincrypto"
-        }
-        resp = requests.get(self.base_url, params=params, timeout=12)
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get("Retry-After", 60))
-            raise Exception(f"Rate limited by CryptoCompare, retry after {retry_after}s")
-        if resp.status_code != 200:
-            raise Exception(f"CryptoCompare HTTP {resp.status_code}: {resp.text[:200]}")
-
-        data = resp.json()
-        articles = data.get("Data", [])
-        parsed = []
-        for art in articles:
-            title = art.get("title", "")
-            if not title:
-                continue
-            sentiment = art.get("sentiment", "neutral")
-            if sentiment not in ("positive", "neutral", "negative"):
-                sentiment = "neutral"
-            parsed.append({
-                "title": title,
-                "url": art.get("url", ""),
-                "source": art.get("source", "CryptoCompare"),
-                "sentiment": sentiment,
-                "published": datetime.fromtimestamp(art.get("published_on", 0)).isoformat(),
-                "currencies": art.get("categories", "").upper()
-            })
-        return parsed
-
-
 # ------------------------------------------------------------------
 # Main NewsEngine class
 # ------------------------------------------------------------------
@@ -290,15 +238,12 @@ class NewsEngine:
         self._cache = PersistentCache(ttl_seconds=CACHE_TTL_MIN * 60)
         self._cache_key = "news_articles"
 
-        # Initialize providers only if API keys exist
+        # Initialize only GNews provider if API key exists
         self._providers = []
         if GNEWS_API_KEY:
             self._providers.append(GNewsProvider(GNEWS_API_KEY))
-        if CRYPTOCOMPARE_API_KEY:
-            self._providers.append(CryptoCompareProvider(CRYPTOCOMPARE_API_KEY))
-
-        if not self._providers:
-            log.error("No news API keys configured. Please set GNEWS_API_KEY or CRYPTOCOMPARE_API_KEY in .env")
+        else:
+            log.error("GNEWS_API_KEY not configured. Please set it in .env")
 
         # Circuit breakers per provider
         self._breakers = {}
@@ -356,7 +301,7 @@ class NewsEngine:
         return {"label": label, "score": score, "articles": total}
 
     def health(self) -> dict:
-        """Return health status of all providers and cache."""
+        """Return health status of provider and cache."""
         status = {
             "cache": {
                 "type": self._cache.backend_name,
@@ -371,11 +316,8 @@ class NewsEngine:
                 "api_key_configured": True,
                 "circuit_breaker": cb.status()
             }
-        # Add missing providers as not configured
-        if "gnews" not in status["providers"]:
+        if not self._providers:
             status["providers"]["gnews"] = {"api_key_configured": False}
-        if "cryptocompare" not in status["providers"]:
-            status["providers"]["cryptocompare"] = {"api_key_configured": False}
         return status
 
     # ------------------------------------------------------------------
