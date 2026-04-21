@@ -448,6 +448,7 @@ class Scanner:
                         gain_24h=s.gain_24h, rsi=getattr(s, 'rsi_1h', getattr(s, 'rsi', 0)),
                         btc_score=s.btc_score, btc_trend=s.btc_trend,
                         factors=json.dumps(s.factors),
+                        score_breakdown=json.dumps(getattr(s, 'score_breakdown', {})),
                     )
                 except Exception as e:
                     log.warning("DB save failed %s: %s", s.symbol, e)

@@ -1,18 +1,23 @@
 """
-src/trading/binance_trader.py — v3
+src/trading/binance_trader.py — v4
 Full automated execution for both SPOT and FUTURES on Binance.
 
-Fixes vs v2:
-  - _daily_loss now tracked correctly after each trade
-  - prec() variable name 's' no longer shadows loop variable
-  - cancel_all_orders uses correct separate paths for GET vs DELETE
-  - OCO validation: checks TP1 > entry > SL before placing
-  - hmac.new → hmac.new (was already correct, confirmed)
+Fixes vs v3:
+  - _place_tp() and SL orders now use _order() for correct algo routing (fix -4120)
+  - _fmt_qty() floors to stepSize, not just round (fix -1111)
+  - _fp() falls back to 2*tick if snapped price becomes zero
+  - Added balance caching to reduce API calls (mitigate IP ban)
+  - Daily counters reset automatically at UTC midnight
+  - SL limit price clamped to mark price ±5% (fix -4024)
 """
-import hmac, hashlib, time, requests
+import hmac
+import hashlib
+import time
+import requests
 from urllib.parse import urlencode
 from dataclasses import dataclass
 from typing import Literal
+from datetime import datetime
 from src.utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -68,9 +73,13 @@ class BinanceTrader:
         self._risk         = risk_pct
         self._loss_limit   = daily_loss_limit_pct
         self._max_trades   = max_trades_per_day
-        self._daily_loss   = 0.0   # % lost today — updated after each SL hit
+        self._daily_loss   = 0.0
         self._daily_trades = 0
         self._sym_cache: dict[str, SymbolInfo] = {}
+
+        # Balance cache (reduces API calls)
+        self._balance_cache = {"value": 0.0, "timestamp": 0, "ttl": 2.0}  # 2 seconds
+        self._last_reset_date = None
 
         self._base = (_FUT_BASE if live else _FUT_TEST) if mode == "futures" \
                      else (_SPOT_BASE if live else _SPOT_TEST)
@@ -79,9 +88,27 @@ class BinanceTrader:
                  mode.upper(), "LIVE" if live else "TESTNET",
                  risk_pct, daily_loss_limit_pct)
 
+    # ── Daily reset ──────────────────────────────────────────────
+
+    def _check_day_reset(self):
+        """Reset daily counters if UTC date has changed."""
+        now = datetime.utcnow()
+        today = now.date()
+        if self._last_reset_date is None:
+            self._last_reset_date = today
+        if today != self._last_reset_date:
+            self.reset_daily_counters()
+            self._last_reset_date = today
+
+    def reset_daily_counters(self):
+        self._daily_trades = 0
+        self._daily_loss   = 0.0
+        log.info("Daily counters reset")
+
     # ── Public ──────────────────────────────────────────────────
 
     def execute_signal(self, signal, balance_usdt: float) -> TradeResult:
+        self._check_day_reset()
         sym = signal.symbol
         ok, reason = self._pre_flight(balance_usdt)
         if not ok:
@@ -97,11 +124,8 @@ class BinanceTrader:
 
         risk_usdt = balance_usdt * (self._risk / 100)
         pos_usdt  = min(risk_usdt / sl_dist, balance_usdt * 0.25)
-        # If calculated position is below minimum, bump up to minimum notional
-        # This can happen when risk% is low but SL distance is large
         if pos_usdt < info.min_notional:
             if balance_usdt >= info.min_notional * 2:
-                # Enough balance — just use the minimum notional
                 pos_usdt = info.min_notional
                 log.info("Position bumped to minimum notional $%.0f for %s",
                          info.min_notional, sym)
@@ -132,7 +156,6 @@ class BinanceTrader:
                                mode=self._mode, error=str(e))
 
     def record_loss(self, loss_pct: float):
-        """Call this when a SL is hit so daily_loss limit is tracked."""
         self._daily_loss += abs(loss_pct)
         log.info("Daily loss updated: %.1f%% / %.1f%% limit",
                  self._daily_loss, self._loss_limit)
@@ -143,13 +166,12 @@ class BinanceTrader:
     def cancel_all_orders(self, symbol: str = None) -> dict:
         cancelled, errors = [], []
         try:
-            # Separate paths for GET (list) and DELETE (cancel)
             if self._mode == "futures":
                 get_path = "/fapi/v1/openOrders"
                 del_path = "/fapi/v1/allOpenOrders"
             else:
                 get_path = "/api/v3/openOrders"
-                del_path = "/api/v3/openOrders"   # same path, DELETE method
+                del_path = "/api/v3/openOrders"
 
             if symbol:
                 self._req("DELETE", del_path, {"symbol": symbol})
@@ -170,16 +192,20 @@ class BinanceTrader:
         return {"cancelled": cancelled, "errors": errors}
 
     def get_available_balance(self) -> float:
-        """Returns available USDT as a plain float — use this for trading decisions."""
+        """Returns available USDT with caching to reduce API calls."""
+        now = time.time()
+        if now - self._balance_cache["timestamp"] < self._balance_cache["ttl"]:
+            return self._balance_cache["value"]
+        bal = self._fetch_balance()
+        self._balance_cache = {"value": bal, "timestamp": now, "ttl": 2.0}
+        return bal
+
+    def _fetch_balance(self) -> float:
+        """Actual balance fetch without cache."""
         info = self.get_balance()
         return float(info.get("available_balance", 0) or 0)
 
     def get_balance(self) -> dict:
-        """
-        Returns dict with wallet_balance, available_balance, unrealised_pnl.
-        wallet_balance = total USDT deposited (stable, use for display).
-        available_balance = free margin (fluctuates with open positions).
-        """
         result = {"wallet_balance": 0.0, "available_balance": 0.0,
                   "unrealised_pnl": 0.0, "error": ""}
         try:
@@ -208,10 +234,7 @@ class BinanceTrader:
         return result
 
     def _order(self, params: dict) -> dict:
-        """Smart order routing:
-        - TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET → /fapi/v1/algoOrder
-        - MARKET, LIMIT, STOP → /fapi/v1/order
-        """
+        """Smart order routing: algo orders to /fapi/v1/algoOrder, others to /fapi/v1/order."""
         if self._mode != "futures":
             return self._req("POST", "/api/v3/order", params) or {}
 
@@ -220,7 +243,6 @@ class BinanceTrader:
                       "TAKE_PROFIT", "STOP"}
 
         if otype in algo_types:
-            # Build algo order params — different field names from standard order
             algo = {
                 "algoType":   "CONDITIONAL",
                 "symbol":     params["symbol"],
@@ -228,16 +250,13 @@ class BinanceTrader:
                 "type":       otype,
                 "timeInForce": params.get("timeInForce", "GTC"),
             }
-            # triggerPrice (algo) = stopPrice (standard)
             stop_p = params.get("stopPrice") or params.get("triggerPrice")
             if stop_p:
                 algo["triggerPrice"] = stop_p
 
-            # price for TAKE_PROFIT / STOP limit types
             if params.get("price"):
                 algo["price"] = params["price"]
 
-            # quantity (not used with closePosition=true)
             close_pos = str(params.get("closePosition", "false")).lower() == "true"
             if close_pos:
                 algo["closePosition"] = "true"
@@ -249,41 +268,33 @@ class BinanceTrader:
                 algo["workingType"] = params["workingType"]
             if params.get("priceProtect"):
                 algo["priceProtect"] = params["priceProtect"]
-            # Trailing stop fields
             if params.get("callbackRate"):
                 algo["callbackRate"] = params["callbackRate"]
             if params.get("activationPrice") or params.get("activatePrice"):
                 algo["activatePrice"] = params.get("activationPrice") or params.get("activatePrice")
 
             r = self._req("POST", "/fapi/v1/algoOrder", algo) or {}
-            # algoOrder returns algoId, not orderId — normalise response
             if isinstance(r, dict) and "algoId" in r and "orderId" not in r:
                 r["orderId"] = r["algoId"]
             return r
 
-        # Standard order (MARKET, LIMIT, STOP)
         return self._req("POST", "/fapi/v1/order", params) or {}
 
     def get_open_orders(self, symbol: str = None) -> list:
-        """Returns ALL open orders including algo orders (TP/SL/TSL placed via algoOrder)."""
         try:
             params = {"symbol": symbol} if symbol else {}
-            # Standard orders
             path   = "/fapi/v1/openOrders" if self._mode == "futures" else "/api/v3/openOrders"
             result = self._req("GET", path, params)
             orders = result if isinstance(result, list) else []
 
-            # Algo orders (futures only) — TAKE_PROFIT_MARKET, STOP_MARKET, TRAILING_STOP_MARKET
             if self._mode == "futures":
                 algo = self._req("GET", "/fapi/v1/openAlgoOrders", params)
                 if isinstance(algo, dict):
-                    # Response: {"total": N, "algoOrders": [...]}
                     algo_list = algo.get("algoOrders", algo.get("orders", []))
                 elif isinstance(algo, list):
                     algo_list = algo
                 else:
                     algo_list = []
-                # Normalise algo order fields to match standard order format
                 for o in algo_list:
                     if "algoId" in o and "orderId" not in o:
                         o["orderId"] = o["algoId"]
@@ -307,11 +318,6 @@ class BinanceTrader:
             log.error("Positions error: %s", e)
             return []
 
-    def reset_daily_counters(self):
-        self._daily_trades = 0
-        self._daily_loss   = 0.0
-        log.info("Daily counters reset")
-
     # ── Spot ────────────────────────────────────────────────────
 
     def _spot(self, sym, signal, qty, info, risk_usdt, pos_usdt) -> TradeResult:
@@ -319,7 +325,6 @@ class BinanceTrader:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="spot",
                                error="SELL signals not supported on spot. Enable futures mode.")
 
-        # Validate levels before placing any order
         if signal.tp1 <= signal.price:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="spot",
                                error=f"TP1 ({signal.tp1}) must be above entry ({signal.price})")
@@ -327,7 +332,6 @@ class BinanceTrader:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="spot",
                                error=f"SL ({signal.sl}) must be below entry ({signal.price})")
 
-        # Market BUY
         buy = self._req("POST", "/api/v3/order", {
             "symbol": sym, "side": "BUY", "type": "MARKET", "quantity": qty,
         })
@@ -347,14 +351,13 @@ class BinanceTrader:
         sl_p  = self._fp(signal.sl,  info)
         sl_lim= self._fp(signal.sl * 0.998, info)
 
-        # OCO: TP1 limit + SL stop-limit
         oco_id = tp1_id = sl_id = ""
         if q_oco >= info.min_qty:
             oco = self._req("POST", "/api/v3/order/oco", {
                 "symbol": sym, "side": "SELL", "quantity": q_oco,
-                "price": tp1_p,              # take-profit limit
-                "stopPrice": sl_p,           # stop trigger
-                "stopLimitPrice": sl_lim,    # stop limit fill
+                "price": tp1_p,
+                "stopPrice": sl_p,
+                "stopLimitPrice": sl_lim,
                 "stopLimitTimeInForce": "GTC",
             })
             if oco:
@@ -390,18 +393,13 @@ class BinanceTrader:
                            tp1_order_id=tp1_id, tp2_order_id=tp2_id,
                            tp3_order_id=tp3_id, sl_order_id=sl_id)
 
-    # ── Futures (ONE-WAY MODE) ──────────────────────────────────
-    # Always uses one-way mode (no positionSide parameter).
-    # BUY = open long, SELL = open short.
-    # If same symbol has open position in opposite direction,
-    # the new order will reduce/close it first (Binance default).
+    # ── Futures ─────────────────────────────────────────────────
 
     def _futures(self, sym, signal, qty, info, risk_usdt, pos_usdt) -> TradeResult:
         is_long    = signal.signal == "BUY"
         side       = "BUY"  if is_long else "SELL"
         close_side = "SELL" if is_long else "BUY"
 
-        # Validate signal levels
         if is_long and signal.tp1 <= signal.price:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="futures",
                                error=f"TP1 {signal.tp1:.6g} must be above entry {signal.price:.6g}")
@@ -409,14 +407,9 @@ class BinanceTrader:
             return TradeResult(False, sym, signal.signal, qty, signal.price, mode="futures",
                                error=f"TP1 {signal.tp1:.6g} must be below entry {signal.price:.6g}")
 
-        # Set leverage (conservative: 2x bear, 3x bull)
         lev = 3 if getattr(signal, "btc_score", 50) >= 62 else 2
         self._req("POST", "/fapi/v1/leverage", {"symbol": sym, "leverage": lev})
 
-        # NEVER attempt to switch position mode — use account's current mode as-is
-        # One-way mode: no positionSide field in any order
-
-        # Market entry — ONE-WAY MODE (no positionSide)
         entry = self._req("POST", "/fapi/v1/order", {
             "symbol":   sym,
             "side":     side,
@@ -430,13 +423,6 @@ class BinanceTrader:
         log.info("Futures %s %s: qty=%s @ %.6g lev=%dx id=%s",
                  "LONG" if is_long else "SHORT", sym, qty, fill_price, lev, entry_id)
 
-        # Position split:
-        #   TP1 → 40% at TP1 level (quick profit lock)
-        #   TP2 → 35% at TP2 level (main target)
-        #   SL  → closePosition=true (closes ALL remaining when hit)
-        #   TSL → 25% trailing stop, activates at TP1 (protects runner)
-        # Total explicit qty = 75% (TP1+TP2). SL closes whatever is left.
-        # This avoids -2010 "would reduce too much" error.
         q_tp1 = self._fmt_qty(qty * 0.40, info)
         q_tp2 = self._fmt_qty(qty * 0.35, info)
         q_tp3 = self._fmt_qty(qty * 0.15, info)
@@ -446,13 +432,10 @@ class BinanceTrader:
         tp3_p = self._fp(signal.tp3, info)
         sl_p  = self._fp(signal.sl,  info)
 
+        # ---- TP placement ----
         def _place_tp(label, stop_p, q) -> str:
-            if q < info.min_qty:
+            if q < info.min_qty or stop_p <= 0:
                 return ""
-            if stop_p <= 0:
-                log.error("TP %s skipped — price is 0", label)
-                return ""
-            # Attempt order types in order: algo → limit
             attempts = [
                 ("TAKE_PROFIT_MARKET", {
                     "symbol": sym, "side": close_side, "type": "TAKE_PROFIT_MARKET",
@@ -466,7 +449,7 @@ class BinanceTrader:
                 }),
             ]
             for name, params in attempts:
-                r = self._req("POST", "/fapi/v1/order", params)
+                r = self._order(params)  # FIX: use _order for proper routing
                 if isinstance(r, dict) and "orderId" in r:
                     log.info("Futures %s (%s) @ %.6g qty=%s id=%s ✅", label, name, stop_p, q, r["orderId"])
                     return str(r["orderId"])
@@ -482,18 +465,26 @@ class BinanceTrader:
         tp2_id = _place_tp("TP2", tp2_p, q_tp2)
         tp3_id = _place_tp("TP3", tp3_p, q_tp3)
 
-        # ── Hard Stop-Loss: closePosition=true, NO quantity, NO reduceOnly ──
-        # closePosition closes 100% of remaining position (no qty needed, avoids conflicts)
+        # ---- Hard Stop-Loss ----
         sl_id = ""
         if sl_p <= 0:
             log.error("Futures SL skipped — price is 0 for %s", sym)
         else:
-            # SL uses standard /fapi/v1/order with STOP type (NOT algoOrder)
-            # This avoids -4045 "Reach max stop order limit" on algo orders
             sl_qty_val = self._fmt_qty(qty, info)
             sl_lim_p   = self._fp(sl_p * (1.005 if not is_long else 0.995), info)
+
+            # Fetch mark price to clamp limit price if fallback is needed
+            mark_price = 0
+            try:
+                mp_resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                                       params={"symbol": sym}, timeout=3)
+                if mp_resp.ok:
+                    mark_price = float(mp_resp.json().get("markPrice", 0))
+            except Exception:
+                pass
+
             for sl_type, sl_params in [
-                ("STOP_qty", {           # Standard STOP with explicit qty + reduceOnly
+                ("STOP_qty", {
                     "symbol":      sym,
                     "side":        close_side,
                     "type":        "STOP",
@@ -503,7 +494,7 @@ class BinanceTrader:
                     "timeInForce": "GTC",
                     "reduceOnly":  "true",
                 }),
-                ("LIMIT_sl", {           # Last resort: limit order at SL price
+                ("LIMIT_sl", {
                     "symbol":      sym,
                     "side":        close_side,
                     "type":        "LIMIT",
@@ -513,7 +504,18 @@ class BinanceTrader:
                     "reduceOnly":  "true",
                 }),
             ]:
-                sl_r = self._req("POST", "/fapi/v1/order", sl_params)
+                # Clamp LIMIT price to mark price ±5% to avoid -4024
+                if sl_type == "LIMIT_sl" and mark_price > 0:
+                    if is_long:
+                        min_limit = mark_price * 0.95
+                        max_limit = mark_price * 1.05
+                    else:
+                        min_limit = mark_price * 0.95
+                        max_limit = mark_price * 1.05
+                    clamped = max(min_limit, min(sl_params["price"], max_limit))
+                    sl_params["price"] = clamped
+
+                sl_r = self._order(sl_params)  # FIX: use _order
                 if isinstance(sl_r, dict) and "orderId" in sl_r:
                     sl_id = str(sl_r["orderId"])
                     log.info("Futures SL (%s) @ %.6g id=%s ✅", sl_type, sl_p, sl_id)
@@ -526,34 +528,44 @@ class BinanceTrader:
                 try:
                     from dashboard.views import push_trade_alert
                     push_trade_alert("error", f"⚠️ NO SL on {sym} code={code}")
-                except Exception: pass
+                except Exception:
+                    pass
                 break
 
-        # ── Trailing Stop-Loss: 25% of position, activates at TP1 ──
-        # Protects the runner portion. No qty conflict since SL uses closePosition.
+        # ---- Trailing Stop ----
         trailing_id = ""
-        if q_tsl >= info.min_qty:
+        if q_tsl >= info.min_qty and tp1_p > 0:
+            cur_mark = 0
+            try:
+                mp_resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                                       params={"symbol": sym}, timeout=3)
+                if mp_resp.ok:
+                    cur_mark = float(mp_resp.json().get("markPrice", 0))
+            except Exception:
+                pass
+
+            if cur_mark > 0:
+                if is_long:
+                    act_p = tp1_p if tp1_p >= cur_mark else self._fp(cur_mark * 1.001, info)
+                else:
+                    act_p = tp1_p if tp1_p <= cur_mark else self._fp(cur_mark * 0.999, info)
+            else:
+                act_p = tp1_p
+
             trail_r = self._order({
-                "symbol":          sym,
-                "side":            close_side,
-                "type":            "TRAILING_STOP_MARKET",
-                "quantity":        q_tsl,
-                "callbackRate":    1.5,
-                "activationPrice": tp1_p,
-                "workingType":     "MARK_PRICE",
-                "reduceOnly":      "true",
+                "symbol": sym, "side": close_side,
+                "type": "TRAILING_STOP_MARKET",
+                "quantity": q_tsl, "callbackRate": 1.5,
+                "activationPrice": act_p,
+                "workingType": "MARK_PRICE", "reduceOnly": "true",
             })
             if isinstance(trail_r, dict) and "orderId" in trail_r:
                 trailing_id = str(trail_r["orderId"])
-                log.info("Futures TSL activation=%.6g callback=1.5%% id=%s ✅", tp1_p, trailing_id)
-            else:
-                log.warning("Futures TSL failed (non-critical): %s", trail_r)
+                log.info("Futures TSL activation=%.6g callback=1.5%% id=%s ✅", act_p, trailing_id)
 
-        log.info(
-            "Futures orders placed: entry=%s tp1=%s tp2=%s sl=%s tsl=%s",
-            entry_id, tp1_id or "FAIL", tp2_id or "FAIL",
-            sl_id or "FAIL⚠️", trailing_id or "skip"
-        )
+        log.info("Futures orders placed: entry=%s tp1=%s tp2=%s sl=%s tsl=%s",
+                 entry_id, tp1_id or "FAIL", tp2_id or "FAIL",
+                 sl_id or "FAIL⚠️", trailing_id or "skip")
 
         return TradeResult(True, sym, side, qty, fill_price, mode="futures",
                            leverage=lev,
@@ -600,14 +612,13 @@ class BinanceTrader:
                 lf   = filters.get("LOT_SIZE",     {})
                 nf   = filters.get("MIN_NOTIONAL", {}) or filters.get("NOTIONAL", {})
                 tick = float(pf.get("tickSize",      "0.0001") or "0.0001")
-                info.symbol    = sym
                 info.tick_size = tick
                 step = float(lf.get("stepSize",      "0.001")  or "0.001")
                 mq   = float(lf.get("minQty",        "0.001")  or "0.001")
                 mn_raw = float(nf.get("minNotional", "5") or nf.get("notional","5") or "5")
                 mn   = max(mn_raw, 20.0) if self._mode == "futures" else mn_raw
 
-                def _prec(val: float) -> int:   # FIX: renamed from 's' to avoid loop var shadow
+                def _prec(val: float) -> int:
                     txt = str(val)
                     return len(txt.rstrip("0").split(".")[1]) if "." in txt else 0
 
@@ -623,7 +634,7 @@ class BinanceTrader:
     def _req(self, method: str, path: str, params: dict) -> dict | None:
         p = {k: v for k, v in params.items() if v is not None}
         p["timestamp"]  = int(time.time() * 1000)
-        p["recvWindow"] = 10000   # allow ±10s clock drift — fixes -1021 timestamp error
+        p["recvWindow"] = 10000
         query = urlencode(p)
         sig   = hmac.new(self._secret.encode(), query.encode(), hashlib.sha256).hexdigest()
         url   = f"{self._base}{path}?{query}&signature={sig}"
@@ -632,9 +643,8 @@ class BinanceTrader:
         if resp.status_code not in (200, 201):
             log.error("Binance %s %s → %d: %s", method, path,
                       resp.status_code, resp.text[:400])
-            # Return the error body so callers can inspect error code
             try:
-                return resp.json()   # {"code": -4120, "msg": "..."}
+                return resp.json()
             except Exception:
                 return {"code": resp.status_code, "msg": resp.text[:200]}
         return resp.json()
@@ -644,20 +654,20 @@ class BinanceTrader:
         return resp.json() if resp.ok else None
 
     def _fp(self, price: float, info: SymbolInfo) -> float:
-        """Snap price to nearest valid tick size."""
+        """Snap price to nearest valid tick size; never return 0 if price > 0."""
         if price <= 0:
             return 0.0
-        tick = getattr(info, "tick_size", 0)
+        tick = info.tick_size
         if tick and tick > 0:
             snapped = round(price / tick) * tick
-            # Format to correct decimal places
+            if snapped <= 0 and price > 0:
+                snapped = tick * 2   # fallback to 2 ticks above zero
             if tick >= 1:
                 result = round(snapped, 0)
             else:
                 tick_str = f"{tick:.10f}".rstrip("0")
                 dec = len(tick_str.split(".")[1]) if "." in tick_str else 0
                 result = round(snapped, dec)
-            # Safety: if result is 0 but price isn't, return price rounded to 4dp
             if result == 0 and price > 0:
                 result = round(price, 4)
             return result
@@ -671,34 +681,28 @@ class BinanceTrader:
         return result
 
     def _fmt_qty(self, qty: float, info: SymbolInfo) -> float:
-        return round(qty, info.qty_precision)
+        """Floor quantity to nearest stepSize (not just round)."""
+        step = info.step_size
+        if step <= 0:
+            return round(qty, info.qty_precision)
+        floored = (qty // step) * step
+        dec = info.qty_precision
+        return round(floored, dec)
 
-
-    # ══════════════════════════════════════════════════════════
-    # PROTECT UNPROTECTED POSITIONS
-    # Call this every cycle to set TP/SL on positions that have none
-    # ══════════════════════════════════════════════════════════
+    # ── Protect Open Positions ──────────────────────────────────
 
     def protect_open_positions(self, signal_lookup: dict) -> list:
-        """
-        Scan all open futures positions. For any that have no open orders
-        (no TP/SL), place TP1 + TP2 + SL + TSL immediately.
-
-        signal_lookup: dict mapping symbol → signal-like object with
-                       tp1, tp2, tp3, sl fields. Can come from DB records.
-        Returns list of symbols that were protected.
-        """
+        """Scan all open futures positions; place missing TP/SL/TSL."""
         if self._mode != "futures":
             return []
-
+        self._check_day_reset()
         protected = []
         try:
             positions = self.get_positions()
             open_orders = self.get_open_orders() or []
             syms_with_orders = set(o.get("symbol","") for o in open_orders)
 
-            # Build per-symbol order type sets for smart checking
-            sym_orders = {}  # sym → list of orders
+            sym_orders = {}
             for o in open_orders:
                 s = o.get("symbol","")
                 sym_orders.setdefault(s, []).append(o)
@@ -711,7 +715,6 @@ class BinanceTrader:
             log.info("protect_open_positions: %d positions, %d open orders",
                      len(positions), total_orders)
 
-            # Duplicate cleanup: if >5 orders per position, cancel all and re-protect
             max_ok = max(len(positions) * 5, 10)
             if total_orders > max_ok and positions:
                 log.warning("Duplicate orders (%d > %d) — cancelling all for clean reset",
@@ -744,16 +747,13 @@ class BinanceTrader:
                          "✅" if has_sl else "❌",
                          "✅" if has_tsl else "❌")
 
-                # Skip only if ALL protections are in place
                 if has_tp and has_sl:
                     if not has_tsl:
                         log.info("  %s: TP+SL ok — adding missing TSL", sym)
-                        # Fall through to add TSL only (handled below)
                     else:
                         log.info("  %s: fully protected ✅", sym)
                         continue
 
-                # No orders — needs protection
                 is_long    = amt > 0
                 close_side = "SELL" if is_long else "BUY"
                 qty        = abs(amt)
@@ -827,16 +827,25 @@ class BinanceTrader:
                                   label, name, code, r.get("msg",""))
                         return
 
-                # Only place TP orders if none exist yet
                 if not has_tp:
                     _prot_tp("TP1", tp1_p, q_tp1)
                     _prot_tp("TP2", tp2_p, q_tp2)
                     _prot_tp("TP3", tp3_p, q_tsl)
 
-                # Only place SL if none exists yet
                 if not has_sl and sl_p > 0:
                     _sl_qty  = self._fmt_qty(qty, info)
                     _sl_limp = self._fp(sl_p * (1.005 if not is_long else 0.995), info)
+
+                    # Fetch mark price to clamp limit fallback
+                    mark_price = 0
+                    try:
+                        mp_resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                                               params={"symbol": sym}, timeout=3)
+                        if mp_resp.ok:
+                            mark_price = float(mp_resp.json().get("markPrice", 0))
+                    except Exception:
+                        pass
+
                     for sl_t, sl_p2 in [
                         ("STOP_MARKET", {"stopPrice": sl_p, "quantity": _sl_qty,
                                          "workingType": "MARK_PRICE", "priceProtect": "true",
@@ -845,8 +854,18 @@ class BinanceTrader:
                                   "quantity": _sl_qty,
                                   "timeInForce": "GTC", "reduceOnly": "true"}),
                     ]:
-                        sl_r = self._order({
-                            "symbol": sym, "side": close_side, "type": sl_t, **sl_p2})
+                        # Clamp limit price for STOP (non-market) to avoid -4024
+                        if sl_t == "STOP" and mark_price > 0:
+                            if is_long:
+                                min_limit = mark_price * 0.95
+                                max_limit = mark_price * 1.05
+                            else:
+                                min_limit = mark_price * 0.95
+                                max_limit = mark_price * 1.05
+                            clamped = max(min_limit, min(sl_p2.get("price", sl_p), max_limit))
+                            sl_p2["price"] = clamped
+
+                        sl_r = self._order({"symbol": sym, "side": close_side, "type": sl_t, **sl_p2})
                         if isinstance(sl_r, dict) and "orderId" in sl_r:
                             log.info("  SL (%s) @ %.6g id=%s ✅", sl_t, sl_p, sl_r["orderId"])
                             break
@@ -858,26 +877,22 @@ class BinanceTrader:
                         try:
                             from dashboard.views import push_trade_alert
                             push_trade_alert("error", f"⚠️ {sym} still unprotected — SL failed (code {code})")
-                        except Exception: pass
+                        except Exception:
+                            pass
                         break
                 else:
                     log.error("  SL skipped — price rounds to 0 for %s", sym)
 
-                # TSL — place if missing (always attempt regardless of TP/SL status)
                 if not has_tsl and q_tsl >= info.min_qty and tp1_p > 0:
-                    # Get current mark price to ensure activation is valid
+                    cur_mark = 0
                     try:
-                        import requests as _rq
-                        _mp = _rq.get("https://fapi.binance.com/fapi/v1/premiumIndex",
-                                      params={"symbol": sym}, timeout=5)
-                        cur_mark = float(_mp.json().get("markPrice", 0)) if _mp.ok else 0
+                        mp_resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex",
+                                               params={"symbol": sym}, timeout=3)
+                        if mp_resp.ok:
+                            cur_mark = float(mp_resp.json().get("markPrice", 0))
                     except Exception:
-                        cur_mark = 0
+                        pass
 
-                    # activationPrice rules:
-                    #   LONG/BUY:  activation must be >= current (above current, will trail down)
-                    #   SHORT/SELL: activation must be <= current (below current, will trail up)
-                    # If TP1 already passed, use current mark as activation
                     if cur_mark > 0:
                         if is_long:
                             act_p = tp1_p if tp1_p >= cur_mark else self._fp(cur_mark * 1.001, info)
