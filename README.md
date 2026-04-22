@@ -43,6 +43,14 @@ python manage.py createsuperuser
 
 # 5. Run dashboard
 python manage.py  runall
+
+
+Development: set DB_ENGINE=sqlite in .env → uses SQLite.
+
+Production (Railway): Railway sets DATABASE_URL automatically → uses PostgreSQL.
+
+Manual override: set PRODUCTION=true and provide DATABASE_URL if needed.
+
 ```
 
 ---
@@ -71,6 +79,8 @@ Or use the Django admin at `/admin` for bulk updates.
 ## Signal Grade Filter
 
 By default the bot only sends **STRONG** and **ULTRA** signals (`MIN_SEND_GRADE = "STRONG"` in `signal_engine.py`). To also receive STANDARD signals, change it to `"STANDARD"`.
+
+
 
 ---
 

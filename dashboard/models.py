@@ -57,6 +57,8 @@ class SignalRecord(models.Model):
     created_at  = models.DateTimeField(default=timezone.now, db_index=True)
     closed_at   = models.DateTimeField(null=True, blank=True)
 
+    score_breakdown = models.JSONField(default=dict)
+
     class Meta:
         ordering = ["-created_at"]
         indexes  = [
