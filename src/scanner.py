@@ -137,6 +137,8 @@ class PatternLearner:
         except Exception as e:
             log.warning("PatternLearner refresh failed: %s", e)
 
+
+
     @staticmethod
     def _btc_range(score: int) -> str:
         if score >= 60: return "high"
@@ -364,24 +366,32 @@ class Scanner:
         log.info("Pairs to scan: %d (top gainers + liquid) | BTC Score: %d/100", len(gainers), btc.score)
 
         # ── Step 5: Analyse pairs ─────────────────────────────
+
         collected: list[Signal] = []
-        spot_signals: list = []   # spot engine results (default empty)
+        spot_signals: list = []
+        seen_in_cycle = set()  # <-- check duplicate signal
+
         for ticker in gainers:
             sym = ticker["symbol"]
 
-            # Skip if in cooldown
-            if self._is_in_cooldown(sym, now):
-                log.debug("Cooldown: %s", sym)
-                continue
-
-            # Skip if already has a pending signal for this pair
+            # Skip if already pending today
             if sym in self._pending_symbols:
                 log.debug("Skipping %s — pending signal exists", sym)
                 continue
 
+            # NEW: skip if already queued in this cycle
+            if sym in seen_in_cycle:
+                log.debug("Skipping %s — already queued in this cycle", sym)
+                continue
+
             signal = self._sig.analyze(ticker, btc)
             if signal:
-                # Apply pattern-learning confidence boost
+                # NEW: skip if recent signal in DB (last 24h)
+                if self._has_recent_signal(signal.symbol):
+                    log.info("Skipping %s — recent signal in last 24h", signal.symbol)
+                    continue
+
+                # Apply pattern-learning confidence boost (existing)
                 boost = self._learner.get_confidence_boost(
                     signal.grade.split()[0], signal.btc_score, sym
                 )
@@ -390,6 +400,7 @@ class Scanner:
                     log.info("Pattern boost %+d%% applied to %s", boost, sym)
 
                 collected.append(signal)
+                seen_in_cycle.add(sym)  # <-- ADD THIS LINE
                 log.info(
                     "Queued: %s %s — %s (%d%%) confluence=%.1f",
                     signal.signal, sym, signal.grade, signal.confidence, signal.confluence,
@@ -439,6 +450,12 @@ class Scanner:
         if collected:
             # Save to DB
             for s in collected:
+
+                # NEW: prevent DB duplicate within last 2 minutes (same price)
+                if self._is_duplicate_in_db(s.symbol, s.price):
+                    log.info("Skipping DB save for %s – duplicate already exists", s.symbol)
+                    continue
+                    
                 try:
                     SignalRecord.objects.create(
                         symbol=s.symbol, signal=s.signal,
@@ -564,6 +581,40 @@ class Scanner:
         # Daily report is now embedded in every signal digest (not time-gated)
 
     # ── Helpers ───────────────────────────────────────────────
+
+    # ── Duplicate prevention helpers ──────────────────────────
+
+    def _has_recent_signal(self, symbol: str, hours: int = 24) -> bool:
+        """Return True if a signal for this symbol was created in the last `hours` hours."""
+        try:
+            from dashboard.models import SignalRecord
+            cutoff = timezone.now() - timedelta(hours=hours)
+            return SignalRecord.objects.filter(
+                symbol=symbol,
+                created_at__gte=cutoff
+            ).exists()
+        except Exception:
+            return False
+
+    def _is_duplicate_in_cycle(self, symbol: str, seen_in_cycle: set) -> bool:
+        """Return True if symbol already processed in this scan cycle."""
+        return symbol in seen_in_cycle
+
+    def _is_duplicate_in_db(self, symbol: str, entry_price: float) -> bool:
+        """Return True if an identical signal (same symbol & price) was saved in the last 2 minutes."""
+        try:
+            from dashboard.models import SignalRecord
+            cutoff = timezone.now() - timedelta(minutes=2)
+            lower = entry_price * 0.999
+            upper = entry_price * 1.001
+            return SignalRecord.objects.filter(
+                symbol=symbol,
+                entry_price__gte=lower,
+                entry_price__lte=upper,
+                created_at__gte=cutoff
+            ).exists()
+        except Exception:
+            return False
 
     def _get_trader_for_mode(self, state, mode: str):
         try:
@@ -815,10 +866,7 @@ class Scanner:
         return (now - self._last_btc_update).total_seconds() >= self._cfg.alert.btc_update_every_hours * 3600
 
     def _is_in_cooldown(self, symbol: str, now: datetime) -> bool:
-        # FIX 5: 4-hour cooldown per symbol regardless of direction.
-        # Report showed GUSDT signaled 6x in one day, MEUSDT 5x — compounding losses.
-        # The cooldown now blocks BOTH BUY and SELL on the same symbol for 4 hours
-        # after any signal (win or loss) to prevent repeated entries on volatile pairs.
+
         COOLDOWN_SECONDS = max(
             self._cfg.alert.cooldown_hours * 3600,
             24 * 3600   # minimum 24 hours for swing trading — let the trade breathe
