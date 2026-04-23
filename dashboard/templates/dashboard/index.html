@@ -2021,6 +2021,69 @@
                 padding: 3px 7px;
             }
         }
+
+        /* Max trades input + inline save/reset buttons */
+        .mx-row {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .mx-row input {
+            flex: 1;
+            padding: 7px 10px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--text);
+            font-size: 13px;
+            outline: none;
+            transition: border-color .15s;
+        }
+
+        .mx-row input.dirty {
+            border-color: var(--gold);
+        }
+
+        .mx-btn {
+            width: 32px;
+            height: 32px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg);
+            color: var(--dim);
+            cursor: pointer;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all .15s;
+        }
+
+        .mx-btn:hover {
+            border-color: var(--muted);
+            color: var(--text);
+        }
+
+        .mx-btn.save.dirty {
+            border-color: var(--green);
+            color: var(--green);
+            background: rgba(0, 229, 160, .1);
+        }
+
+        .mx-btn.save.dirty:hover {
+            background: rgba(0, 229, 160, .2);
+        }
+
+        .mx-btn.reset.dirty {
+            border-color: var(--red);
+            color: var(--red);
+            background: rgba(255, 69, 96, .08);
+        }
+
+        .mx-btn.reset.dirty:hover {
+            background: rgba(255, 69, 96, .15);
+        }
     </style>
 </head>
 <body>
@@ -2543,6 +2606,7 @@
                             </div>
                         </div>
                     </div>
+                    <!-- BLOCK 1: Risk slider — unchanged from your original -->
                     <div style="margin-bottom:14px">
                         <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">
                             Risk per trade: <span id="spot-risk-lbl" style="color:var(--gold);font-weight:600">2%</span>
@@ -2551,12 +2615,28 @@
                                oninput="document.getElementById('spot-risk-lbl').textContent=this.value+'%'"
                                onchange="atSaveSettings()">
                     </div>
+
+                    <!-- BLOCK 2: Max trades — NEW version with save/reset buttons -->
                     <div style="margin-bottom:14px">
                         <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Max
                             trades/day</label>
-                        <input type="number" id="spot-max" min="1" max="200" value="100"
-                               style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px"
-                               onchange="atSaveSettings()">
+                        <div class="mx-row">
+                            <input type="number" id="spot-max" min="20" max="500" value="100"
+                                   oninput="mxDirty('spot')">
+                            <button class="mx-btn save" id="spot-max-save" onclick="mxSave('spot')" title="Save">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                     stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="20 6 9 17 4 12"/>
+                                </svg>
+                            </button>
+                            <button class="mx-btn reset" id="spot-max-reset" onclick="mxReset('spot')" title="Reset">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                     stroke-width="3" stroke-linecap="round">
+                                    <line x1="18" y1="6" x2="6" y2="18"/>
+                                    <line x1="6" y1="6" x2="18" y2="18"/>
+                                </svg>
+                            </button>
+                        </div>
                     </div>
                     <div id="spot-block"
                          style="display:none;background:rgba(255,69,96,.08);border:1px solid rgba(255,69,96,.3);border-radius:6px;padding:8px 10px;font-size:11px;color:#ff4560;line-height:1.5;margin-bottom:10px"></div>
@@ -2619,6 +2699,8 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- BLOCK 1: Futures risk slider — unchanged -->
                     <div style="margin-bottom:14px">
                         <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">
                             Risk per trade: <span id="fut-risk-lbl" style="color:var(--gold);font-weight:600">2%</span>
@@ -2627,12 +2709,28 @@
                                oninput="document.getElementById('fut-risk-lbl').textContent=this.value+'%'"
                                onchange="atSaveSettings()">
                     </div>
+
+                    <!-- BLOCK 2: Futures max trades — NEW version with save/reset buttons -->
                     <div style="margin-bottom:14px">
                         <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Max
                             trades/day</label>
-                        <input type="number" id="fut-max" min="1" max="200" value="100"
-                               style="width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px"
-                               onchange="atSaveSettings()">
+                        <div class="mx-row">
+                            <input type="number" id="fut-max" min="20" max="500" value="100"
+                                   oninput="mxDirty('fut')">
+                            <button class="mx-btn save" id="fut-max-save" onclick="mxSave('fut')" title="Save">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                     stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                                    <polyline points="20 6 9 17 4 12"/>
+                                </svg>
+                            </button>
+                            <button class="mx-btn reset" id="fut-max-reset" onclick="mxReset('fut')" title="Reset">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                     stroke-width="3" stroke-linecap="round">
+                                    <line x1="18" y1="6" x2="6" y2="18"/>
+                                    <line x1="6" y1="6" x2="18" y2="18"/>
+                                </svg>
+                            </button>
+                        </div>
                     </div>
                     <div id="fut-block"
                          style="display:none;background:rgba(255,69,96,.08);border:1px solid rgba(255,69,96,.3);border-radius:6px;padding:8px 10px;font-size:11px;color:#ff4560;line-height:1.5;margin-bottom:10px"></div>
@@ -3812,13 +3910,18 @@
                 if (d.spot_error) el('spot-balance').innerHTML = '<span style="font-size:11px;color:var(--red)">API Error</span>';
                 else el('spot-balance').textContent = fmt(d.spot_balance);
             }
-            if (el('spot-trades')) el('spot-trades').textContent = (d.spot_trades_today || 0) + '/' + (d.spot_max_trades || 5);
+            if (el('spot-trades')) el('spot-trades').textContent = (d.spot_trades_today || 0) + '/' + (d.spot_max_trades || 100);
             if (el('spot-total')) el('spot-total').textContent = 'total: ' + (d.spot_total || 0);
             if (el('spot-orders')) el('spot-orders').textContent = d.spot_open_orders ?? '—';
             if (el('spot-status')) el('spot-status').textContent = d.spot_enabled ? (d.block_spot || '✅ Ready') : 'Off';
             if (el('spot-risk')) el('spot-risk').value = d.spot_risk || 2;
             if (el('spot-risk-lbl')) el('spot-risk-lbl').textContent = (d.spot_risk || 2) + '%';
-            if (el('spot-max')) el('spot-max').value = d.spot_max_trades || 5;
+            if (el('spot-max')) {
+                const v = d.spot_max_trades || 100;
+                el('spot-max').value = v;
+                el('spot-max').dataset.original = v;
+                mxDirty('spot');
+            }
             const sb = el('spot-block');
             if (sb) {
                 sb.textContent = d.block_spot || '';
@@ -3849,13 +3952,18 @@
                     el('fut-balance').innerHTML = html;
                 }
             }
-            if (el('fut-trades')) el('fut-trades').textContent = (d.futures_trades_today || 0) + '/' + (d.futures_max_trades || 5);
+            if (el('fut-trades')) el('fut-trades').textContent = (d.futures_trades_today || 0) + '/' + (d.futures_max_trades || 100);
             if (el('fut-total')) el('fut-total').textContent = 'total: ' + (d.futures_total || 0);
             if (el('fut-orders')) el('fut-orders').textContent = d.futures_open_orders ?? '—';
             if (el('fut-status')) el('fut-status').textContent = d.futures_enabled ? (d.block_futures || '✅ Ready') : 'Off';
             if (el('fut-risk')) el('fut-risk').value = d.futures_risk || 2;
             if (el('fut-risk-lbl')) el('fut-risk-lbl').textContent = (d.futures_risk || 2) + '%';
-            if (el('fut-max')) el('fut-max').value = d.futures_max_trades || 5;
+            if (el('fut-max')) {
+                const v = d.futures_max_trades || 100;
+                el('fut-max').value = v;
+                el('fut-max').dataset.original = v;
+                mxDirty('fut');
+            }
             const fb = el('fut-block');
             if (fb) {
                 fb.textContent = d.block_futures || '';
@@ -3918,14 +4026,13 @@
 
     async function atSaveSettings() {
         const spotRisk = parseFloat(document.getElementById('spot-risk').value);
-        const spotMax = parseInt(document.getElementById('spot-max').value);
         const futRisk = parseFloat(document.getElementById('fut-risk').value);
-        const futMax = parseInt(document.getElementById('fut-max').value);
         try {
-            await post('/api/auto/settings/', {
-                spot_risk: spotRisk, spot_max_trades: spotMax,
-                futures_risk: futRisk, futures_max_trades: futMax
+            const res = await post('/api/auto/settings/', {
+                spot_risk: spotRisk,
+                futures_risk: futRisk
             });
+            if (!res || !res.ok) toast('Failed to save settings', 'error');
         } catch (e) {
             toast('Failed to save settings', 'error');
         }
@@ -4015,26 +4122,26 @@
     }, 30000);
 
     function toggleNav(force) {
-    const tabs = document.getElementById('nav-tabs');
-    const burger = document.getElementById('nav-burger');
-    const backdrop = document.getElementById('nav-backdrop');
-    const topbar = document.querySelector('.topbar');   // ← add this
+        const tabs = document.getElementById('nav-tabs');
+        const burger = document.getElementById('nav-burger');
+        const backdrop = document.getElementById('nav-backdrop');
+        const topbar = document.querySelector('.topbar');   // ← add this
 
-    const willOpen = (force === false) ? false
-        : (force === true) ? true
-            : !tabs.classList.contains('open');
+        const willOpen = (force === false) ? false
+            : (force === true) ? true
+                : !tabs.classList.contains('open');
 
-    tabs.classList.toggle('open', willOpen);
-    burger.classList.toggle('open', willOpen);
-    backdrop.classList.toggle('show', willOpen);
+        tabs.classList.toggle('open', willOpen);
+        burger.classList.toggle('open', willOpen);
+        backdrop.classList.toggle('show', willOpen);
 
-    // ← add these two lines
-    topbar.style.overflow = willOpen ? 'visible' : '';
-    tabs.style.zIndex = willOpen ? '205' : '';         // revert to CSS default
+        // ← add these two lines
+        topbar.style.overflow = willOpen ? 'visible' : '';
+        tabs.style.zIndex = willOpen ? '205' : '';         // revert to CSS default
 
-    burger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-    document.body.style.overflow = willOpen ? 'hidden' : '';
-}
+        burger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        document.body.style.overflow = willOpen ? 'hidden' : '';
+    }
 
     // Auto-close the drawer whenever a nav tab is clicked on mobile.
     // Uses event capture so it runs BEFORE showPage(), keeping the existing
@@ -4055,12 +4162,50 @@
     });
 
     // If the window is resized from mobile → desktop, make sure the drawer
-    // state is cleared so desktop layout isn't affected.
     window.addEventListener('resize', () => {
         if (window.innerWidth >= 768) {
             toggleNav(false);
         }
     });
+
+    function mxDirty(prefix) {
+        const input = document.getElementById(prefix + '-max');
+        const saveBtn = document.getElementById(prefix + '-max-save');
+        const resetBtn = document.getElementById(prefix + '-max-reset');
+        const original = input.dataset.original || input.value;
+        const dirty = String(input.value) !== String(original);
+        input.classList.toggle('dirty', dirty);
+        saveBtn.classList.toggle('dirty', dirty);
+        resetBtn.classList.toggle('dirty', dirty);
+    }
+
+    async function mxSave(prefix) {
+        const input = document.getElementById(prefix + '-max');
+        const val = parseInt(input.value);
+        if (isNaN(val) || val < 20 || val > 500) {
+            toast('Max trades must be between 20 and 500', 'warning');
+            return;
+        }
+        const key = prefix === 'spot' ? 'spot_max_trades' : 'futures_max_trades';
+        try {
+            const res = await post('/api/auto/settings/', {[key]: val});
+            if (res && res.ok) {
+                input.dataset.original = val;
+                mxDirty(prefix);
+                toast((prefix === 'spot' ? 'Spot' : 'Futures') + ' max trades saved', 'success');
+            } else {
+                toast('Save failed', 'error');
+            }
+        } catch (e) {
+            toast('Save failed: ' + e, 'error');
+        }
+    }
+
+    function mxReset(prefix) {
+        const input = document.getElementById(prefix + '-max');
+        input.value = input.dataset.original || 100;
+        mxDirty(prefix);
+    }
 </script>
 </body>
 </html>

@@ -573,8 +573,8 @@ def auto_trade_toggle(request):
     if "futures_enabled" in data: state.futures_enabled = bool(data["futures_enabled"])
     if "spot_risk"       in data: state.spot_risk           = min(5.0, max(0.1, float(data["spot_risk"])))
     if "futures_risk"    in data: state.futures_risk         = min(5.0, max(0.1, float(data["futures_risk"])))
-    if "spot_max"        in data: state.spot_max_trades      = max(1, min(20, int(data["spot_max"])))
-    if "futures_max"     in data: state.futures_max_trades   = max(1, min(20, int(data["futures_max"])))
+    if "spot_max"        in data: state.spot_max_trades      = max(1, min(100, int(data["spot_max"])))
+    if "futures_max"     in data: state.futures_max_trades   = max(1, min(100, int(data["futures_max"])))
     # Legacy fields — keep in sync
     state.enabled = state.spot_enabled or state.futures_enabled
     state.save()
@@ -769,3 +769,69 @@ def auto_trade_alerts(request):
     recent = [a for a in _TRADE_ALERTS if now - a["ts"] < 120]
     _TRADE_ALERTS.clear()
     return JsonResponse({"alerts": recent})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def auto_trade_settings(request):
+    """
+    Partial settings update. Any subset of these keys may be sent:
+        spot_risk, futures_risk, spot_max_trades, futures_max_trades
+    Invalid values are silently ignored (only valid ones persist).
+    """
+    from .models import AutoTradeState
+
+    try:
+        data = json.loads(request.body or "{}")
+    except ValueError:
+        return JsonResponse({"ok": False, "error": "Invalid JSON"}, status=400)
+
+    state = AutoTradeState.objects.first()
+    if state is None:
+        state = AutoTradeState.objects.create()
+
+    updated = []
+
+    # Risk %: 0.1 – 10
+    for key in ("spot_risk", "futures_risk"):
+        if key in data:
+            try:
+                v = float(data[key])
+                if 0.1 <= v <= 10:
+                    setattr(state, key, v)
+                    updated.append(key)
+            except (TypeError, ValueError):
+                pass
+
+    # Max trades/day: 1 – 1000
+    for key in ("spot_max_trades", "futures_max_trades"):
+        if key in data:
+            try:
+                v = int(data[key])
+                if 1 <= v <= 1000:
+                    setattr(state, key, v)
+                    updated.append(key)
+            except (TypeError, ValueError):
+                pass
+
+    if updated:
+        state.save(update_fields=updated)
+
+    return JsonResponse({"ok": True, "updated": updated})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def auto_trade_reset_counters(request):
+    """Zero out today's spot + futures trade counters without touching totals."""
+    from .models import AutoTradeState
+
+    state = AutoTradeState.objects.first()
+    if state is None:
+        return JsonResponse({"ok": False, "error": "No state found"}, status=404)
+
+    state.spot_trades_today = 0
+    state.futures_trades_today = 0
+    state.save(update_fields=["spot_trades_today", "futures_trades_today"])
+
+    return JsonResponse({"ok": True})

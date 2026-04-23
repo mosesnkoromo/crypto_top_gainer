@@ -22,4 +22,7 @@ urlpatterns = [
     path("api/auto/stop/", views.auto_trade_emergency_stop, name="auto_stop"),
     path("api/autotrade/", views.auto_trade_status, name="auto_status_compat"),
     path("api/autotrade/toggle/", views.auto_trade_toggle, name="auto_toggle_compat"),
+    path("api/auto/settings/", views.auto_trade_settings, name="auto_settings"),
+    path("api/auto/reset-counters/", views.auto_trade_reset_counters, name="auto_reset_counters"),
+    path("api/auto/emergency-stop/", views.auto_trade_emergency_stop, name="auto_emergency_stop"),
 ]
