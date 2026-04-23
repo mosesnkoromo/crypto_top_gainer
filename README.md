@@ -41,15 +41,22 @@ python manage.py migrate
 # 4. Create admin user (for /admin panel)
 python manage.py createsuperuser
 
-# 5. Run dashboard
+# 5. Run dashboard on development
 python manage.py  runall
 
+# 6  Run on production
+
+web	Django API + frontend	gunicorn btc_project.wsgi --bind 0.0.0.0:$PORT
+bot	Scanner / auto‑trade	python manage.py runbot
 
 Development: set DB_ENGINE=sqlite in .env → uses SQLite.
 
 Production (Railway): Railway sets DATABASE_URL automatically → uses PostgreSQL.
 
 Manual override: set PRODUCTION=true and provide DATABASE_URL if needed.
+
+
+
 
 ```
 

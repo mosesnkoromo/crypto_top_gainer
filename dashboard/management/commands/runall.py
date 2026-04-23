@@ -1,12 +1,16 @@
 """
 dashboard/management/commands/runall.py
-Single command: auto-migrates, then starts server + bot together.
-Usage: python manage.py runall
+Single command: auto-migrate, then start server + bot together.
+Usage: python manage.py runall          # uses env WORKERS or default 2
+       python manage.py runall --workers=3
 """
 
 import threading
 import time
 import schedule
+import os
+import sys
+import subprocess
 
 from django.core.management.base import BaseCommand
 from django.core.management import call_command
@@ -24,10 +28,14 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--port", type=int, default=8000)
         parser.add_argument("--host", type=str, default="127.0.0.1")
+        parser.add_argument("--workers", type=int,
+                            default=int(os.environ.get("WORKERS", 2)),
+                            help="Number of gunicorn workers (only used in production)")
 
     def handle(self, *args, **options):
         port = options["port"]
         host = options["host"]
+        workers = options["workers"]
 
         # ── Step 1: Auto-migrate ──────────────────────────────
         self.stdout.write("  Running migrations...")
@@ -84,25 +92,21 @@ class Command(BaseCommand):
         bot_thread.start()
 
         # ── Step 4: Start server ──────────────────────────────
-        import os, subprocess, sys
-        render_port = os.environ.get("PORT")  # Render injects $PORT
+        render_port = os.environ.get("PORT")
         if render_port:
-            # On Render: start gunicorn bound to 0.0.0.0:$PORT
-            self.stdout.write(f"  Starting gunicorn on 0.0.0.0:{render_port} ...\n\n")
-            try:
-                subprocess.run([
-                    sys.executable, "-m", "gunicorn",
-                    "btc_project.wsgi:application",
-                    "--bind", f"0.0.0.0:{render_port}",
-                    "--workers", "2",
-                    "--timeout", "120",
-                ], check=True)
-            except KeyboardInterrupt:
-                pass
+            # Production: gunicorn
+            self.stdout.write(
+                f"  Starting gunicorn on 0.0.0.0:{render_port} with {workers} workers...\n\n"
+            )
+            subprocess.run([
+                sys.executable, "-m", "gunicorn",
+                "btc_project.wsgi:application",
+                "--bind", f"0.0.0.0:{render_port}",
+                "--workers", str(workers),
+                "--timeout", "120",
+                "--access-logfile", "-",
+            ])
         else:
-            # Local dev: use Django dev server
-            self.stdout.write(f"  Starting server at http://{host}:{port} ...\n\n")
-            try:
-                call_command("runserver", f"{host}:{port}", use_reloader=False)
-            except KeyboardInterrupt:
-                self.stdout.write("\n  Shutting down...\n")
+            # Local dev
+            self.stdout.write(f"  Starting dev server at http://{host}:{port} ...\n\n")
+            call_command("runserver", f"{host}:{port}", use_reloader=False)

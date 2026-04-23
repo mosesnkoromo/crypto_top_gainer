@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>BTC Strength Bot — Analytics</title>
+    <title>Bot — Analytics</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap"
           rel="stylesheet">
@@ -1817,6 +1817,210 @@
                 display: none;
             }
         }
+
+        /* Hamburger button — hidden on desktop, shown on mobile */
+        .nav-burger {
+            display: none;
+            align-items: center;
+            justify-content: center;
+            width: 38px;
+            height: 38px;
+            border-radius: 8px;
+            background: var(--card);
+            border: 1px solid var(--border);
+            color: var(--text);
+            cursor: pointer;
+            margin-left: auto;
+            margin-right: 8px;
+            transition: all .15s;
+            flex-shrink: 0;
+        }
+
+        /* Override overflow when menu is open – prevents clipping */
+        .topbar.nav-open {
+            overflow: visible !important;
+        }
+
+        .nav-burger:hover {
+            border-color: var(--blue);
+            color: var(--blue);
+        }
+
+        .nav-burger svg {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* Burger animation — 3 lines → X */
+        .nav-burger .line {
+            transition: transform .25s cubic-bezier(0.4, 0, 0.2, 1),
+            opacity .25s;
+            transform-origin: center;
+        }
+
+        .nav-burger.open .line-1 {
+            transform: translateY(6px) rotate(45deg);
+        }
+
+        .nav-burger.open .line-2 {
+            opacity: 0;
+            transform: scaleX(0);
+        }
+
+        .nav-burger.open .line-3 {
+            transform: translateY(-6px) rotate(-45deg);
+        }
+
+        /* Backdrop — fades in when mobile menu opens */
+        .nav-backdrop {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(6, 8, 15, .7);
+            backdrop-filter: blur(4px);
+            z-index: 190;
+            opacity: 0;
+            transition: opacity .25s;
+        }
+
+        .nav-backdrop.show {
+            display: block;
+            opacity: 1;
+        }
+
+        /* ═══ DESKTOP (>= 768px): normal horizontal tabs ═══ */
+        @media (min-width: 768px) {
+            .nav-tabs {
+                display: flex !important;
+                position: static !important;
+                flex-direction: row;
+                background: transparent;
+                padding: 0;
+                height: 60px;
+                border: none;
+                box-shadow: none;
+                transform: none !important;
+                opacity: 1 !important;
+                visibility: visible !important;
+            }
+
+            .nav-burger {
+                display: none !important;
+            }
+        }
+
+        /* ═══ MOBILE (< 768px): hamburger + slide-down menu ═══ */
+        @media (max-width: 767px) {
+            .topbar {
+                padding: 0 12px;
+            }
+
+            .nav-burger {
+                display: inline-flex;
+            }
+
+            /* Hide the whole tab strip by default; reveal on toggle */
+            .nav-tabs {
+                position: fixed;
+                top: 60px;
+                left: 0;
+                right: 0;
+                flex-direction: column;
+                background: rgba(10, 13, 22, 0.98);
+                backdrop-filter: blur(20px);
+                padding: 8px 12px 14px;
+                gap: 2px;
+                border-bottom: 1px solid var(--border);
+                box-shadow: 0 12px 32px rgba(0, 0, 0, .5);
+                overflow-y: auto;
+                max-height: calc(100vh - 60px);
+                /* Hidden state */
+                transform: translateY(-8px);
+                opacity: 0;
+                visibility: hidden;
+                transition: transform .25s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity .2s,
+                visibility 0s linear .25s;
+                z-index: 195;
+            }
+
+            .nav-tabs.open {
+                transform: translateY(0);
+                opacity: 1;
+                visibility: visible;
+                transition: transform .25s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity .2s,
+                visibility 0s;
+                z-index: 205 !important;
+            }
+
+            /* Prevent the topbar from clipping the menu */
+            .topbar:has(.nav-tabs.open) {
+                overflow: visible !important;
+            }
+
+            /* Each tab becomes a full-width row */
+            .nav-tab {
+                width: 100%;
+                height: 48px;
+                padding: 0 14px;
+                gap: 12px;
+                border: 1px solid transparent;
+                border-bottom: 1px solid transparent;
+                border-radius: 10px;
+                font-size: 14px;
+                justify-content: flex-start;
+            }
+
+            .nav-tab span {
+                display: inline;
+                font-weight: 500;
+            }
+
+            .nav-tab svg {
+                width: 18px;
+                height: 18px;
+            }
+
+            .nav-tab:hover {
+                background: rgba(77, 159, 255, .08);
+                border-color: var(--border);
+            }
+
+            .nav-tab.active {
+                background: linear-gradient(90deg, rgba(77, 159, 255, .12), transparent);
+                border-color: rgba(77, 159, 255, .25);
+                border-bottom-color: rgba(77, 159, 255, .25);
+                color: var(--blue);
+            }
+
+            /* Logo smaller on very narrow screens */
+            .logo-name {
+                display: inline;
+                font-size: 14px;
+            }
+        }
+
+        /* Very narrow phones (< 380px) — hide logo text entirely */
+        @media (max-width: 380px) {
+            .logo-name {
+                display: none;
+            }
+
+            .logo {
+                margin-right: 8px;
+            }
+
+            #btc-price {
+                font-size: 11px;
+                padding: 3px 7px;
+            }
+
+            .live-badge {
+                font-size: 9px;
+                padding: 3px 7px;
+            }
+        }
     </style>
 </head>
 <body>
@@ -1838,7 +2042,10 @@
         <div class="logo-pulse"></div>
         <div class="logo-name">BTC<em>Bot</em></div>
     </div>
-    <div class="nav-tabs">
+
+
+    <!-- Nav tabs (slides down on mobile, inline on desktop) -->
+    <div class="nav-tabs" id="nav-tabs">
         <button class="nav-tab active" onclick="showPage('dashboard',this)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <rect x="3" y="3" width="7" height="7"/>
@@ -1881,11 +2088,23 @@
             <span>Auto Trade</span>
         </button>
     </div>
+
+    <!-- Hamburger — only shows on mobile -->
+    <button class="nav-burger" id="nav-burger" onclick="toggleNav()" aria-label="Menu" aria-expanded="false">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round">
+            <line class="line line-1" x1="4" y1="6" x2="20" y2="6"/>
+            <line class="line line-2" x1="4" y1="12" x2="20" y2="12"/>
+            <line class="line line-3" x1="4" y1="18" x2="20" y2="18"/>
+        </svg>
+    </button>
+    <div class="nav-backdrop" id="nav-backdrop" onclick="toggleNav(false)"></div>
+
     <div class="topbar-right">
         <span id="btc-price">BTC $—</span>
         <span class="live-badge">LIVE</span>
     </div>
 </div>
+
 
 <!-- DASHBOARD -->
 <div id="page-dashboard" class="page active">
@@ -3794,6 +4013,54 @@
             loadPortfolio();
         }
     }, 30000);
+
+    function toggleNav(force) {
+    const tabs = document.getElementById('nav-tabs');
+    const burger = document.getElementById('nav-burger');
+    const backdrop = document.getElementById('nav-backdrop');
+    const topbar = document.querySelector('.topbar');   // ← add this
+
+    const willOpen = (force === false) ? false
+        : (force === true) ? true
+            : !tabs.classList.contains('open');
+
+    tabs.classList.toggle('open', willOpen);
+    burger.classList.toggle('open', willOpen);
+    backdrop.classList.toggle('show', willOpen);
+
+    // ← add these two lines
+    topbar.style.overflow = willOpen ? 'visible' : '';
+    tabs.style.zIndex = willOpen ? '205' : '';         // revert to CSS default
+
+    burger.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    document.body.style.overflow = willOpen ? 'hidden' : '';
+}
+
+    // Auto-close the drawer whenever a nav tab is clicked on mobile.
+    // Uses event capture so it runs BEFORE showPage(), keeping the existing
+    // click handler untouched.
+    document.addEventListener('click', (e) => {
+        const tab = e.target.closest('.nav-tab');
+        if (tab && window.innerWidth < 768) {
+            // Close after a tiny delay so the visual press registers
+            setTimeout(() => toggleNav(false), 120);
+        }
+    });
+
+    // Close on Escape key
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && document.getElementById('nav-tabs').classList.contains('open')) {
+            toggleNav(false);
+        }
+    });
+
+    // If the window is resized from mobile → desktop, make sure the drawer
+    // state is cleared so desktop layout isn't affected.
+    window.addEventListener('resize', () => {
+        if (window.innerWidth >= 768) {
+            toggleNav(false);
+        }
+    });
 </script>
 </body>
 </html>
