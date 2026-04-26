@@ -38,10 +38,11 @@ from src.trading.binance_trader import BinanceTrader, TradeResult
 from src.data.binance_client import BinanceClient
 from src.utils.formatter import fmt_btc_update, fmt_digest, fmt_no_signals
 from src.utils.logger import get_logger
+from src.analysis.tradfi_signal_engine import TradFiSignalEngine, TRADFI_ALL
 
 log = get_logger(__name__)
 
-_GRADE_ORDER    = {"ULTRA": 0, "STRONG": 1, "STANDARD": 2}
+_GRADE_ORDER = {"ULTRA": 0, "STRONG": 1, "STANDARD": 2}
 _BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 
 
@@ -72,22 +73,30 @@ class PatternLearner:
 
         # Grade performance boost
         grade_wr = self._cache.get(f"grade_{grade}", 50)
-        if grade_wr >= 75:   boost += 5
-        elif grade_wr >= 65: boost += 3
-        elif grade_wr <= 40: boost -= 5
-        elif grade_wr <= 50: boost -= 3
+        if grade_wr >= 75:
+            boost += 5
+        elif grade_wr >= 65:
+            boost += 3
+        elif grade_wr <= 40:
+            boost -= 5
+        elif grade_wr <= 50:
+            boost -= 3
 
         # BTC range performance
         btc_range = self._btc_range(btc_score)
-        range_wr  = self._cache.get(f"btc_{btc_range}", 50)
-        if range_wr >= 70:   boost += 3
-        elif range_wr <= 40: boost -= 3
+        range_wr = self._cache.get(f"btc_{btc_range}", 50)
+        if range_wr >= 70:
+            boost += 3
+        elif range_wr <= 40:
+            boost -= 3
 
         # Symbol performance
         sym_wr = self._cache.get(f"sym_{symbol}", None)
         if sym_wr is not None:
-            if sym_wr >= 80:   boost += 4
-            elif sym_wr <= 35: boost -= 4
+            if sym_wr >= 80:
+                boost += 4
+            elif sym_wr <= 35:
+                boost -= 4
 
         return max(-10, min(10, boost))
 
@@ -104,20 +113,23 @@ class PatternLearner:
 
             # Grade win rates
             for grade in ("ULTRA", "STRONG", "STANDARD"):
-                qs    = SignalRecord.objects.filter(grade=grade, created_at__gte=since).exclude(outcome="PENDING")
+                qs = SignalRecord.objects.filter(grade=grade, created_at__gte=since).exclude(outcome="PENDING")
                 total = qs.count()
-                wins  = qs.filter(outcome__in=["TP1","TP2","TP3"]).count()
+                wins = qs.filter(outcome__in=["TP1", "TP2", "TP3"]).count()
                 if total >= 5:
                     cache[f"grade_{grade}"] = round(wins / total * 100)
 
             # BTC range win rates
-            for rng in ("high","mid","low"):
-                if rng == "high":   qs = SignalRecord.objects.filter(btc_score__gte=60, created_at__gte=since)
-                elif rng == "mid":  qs = SignalRecord.objects.filter(btc_score__gte=40, btc_score__lt=60, created_at__gte=since)
-                else:               qs = SignalRecord.objects.filter(btc_score__lt=40, created_at__gte=since)
-                qs    = qs.exclude(outcome="PENDING")
+            for rng in ("high", "mid", "low"):
+                if rng == "high":
+                    qs = SignalRecord.objects.filter(btc_score__gte=60, created_at__gte=since)
+                elif rng == "mid":
+                    qs = SignalRecord.objects.filter(btc_score__gte=40, btc_score__lt=60, created_at__gte=since)
+                else:
+                    qs = SignalRecord.objects.filter(btc_score__lt=40, created_at__gte=since)
+                qs = qs.exclude(outcome="PENDING")
                 total = qs.count()
-                wins  = qs.filter(outcome__in=["TP1","TP2","TP3"]).count()
+                wins = qs.filter(outcome__in=["TP1", "TP2", "TP3"]).count()
                 if total >= 5:
                     cache[f"btc_{rng}"] = round(wins / total * 100)
 
@@ -126,12 +138,12 @@ class PatternLearner:
                      .exclude(outcome="PENDING")
                      .values("symbol")
                      .annotate(total=Count("id"),
-                               wins=Count("id", filter=Q(outcome__in=["TP1","TP2","TP3"])))
+                               wins=Count("id", filter=Q(outcome__in=["TP1", "TP2", "TP3"])))
                      .filter(total__gte=3))
             for p in pairs:
                 cache[f"sym_{p['symbol']}"] = round(p["wins"] / p["total"] * 100)
 
-            self._cache        = cache
+            self._cache = cache
             self._refreshed_at = timezone.now()
             log.info("PatternLearner refreshed — %d entries", len(cache))
         except Exception as e:
@@ -160,19 +172,19 @@ class OutcomeChecker:
         try:
             from dashboard.models import SignalRecord
 
-            cutoff  = timezone.now() - timedelta(days=7)
+            cutoff = timezone.now() - timedelta(days=7)
             pending = SignalRecord.objects.filter(outcome="PENDING", created_at__gte=cutoff)
-            count   = 0
+            count = 0
 
             for sig in pending:
                 since_ms = int(sig.created_at.timestamp() * 1000)
                 outcome, close_price = self._determine(sig, since_ms)
                 if outcome != "PENDING":
-                    sig.outcome      = outcome
-                    sig.close_price  = close_price
-                    sig.profit_pct   = self._calc_pnl(sig, close_price)
+                    sig.outcome = outcome
+                    sig.close_price = close_price
+                    sig.profit_pct = self._calc_pnl(sig, close_price)
                     sig.auto_checked = True
-                    sig.closed_at    = timezone.now()
+                    sig.closed_at = timezone.now()
                     sig.save()
                     count += 1
                     log.info(
@@ -202,17 +214,17 @@ class OutcomeChecker:
             }, timeout=12)
             resp.raise_for_status()
             df = pd.DataFrame(resp.json(), columns=[
-                "open_time","open","high","low","close","volume",
-                "close_time","quote_vol","trades","buy_base","buy_quote","ignore"
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_vol", "trades", "buy_base", "buy_quote", "ignore"
             ])
-            for col in ["high","low"]:
+            for col in ["high", "low"]:
                 df[col] = pd.to_numeric(df[col])
         except Exception:
             return "PENDING", None
 
-        is_sell    = sig.signal == "SELL"
-        best_tp    = None          # highest TP reached so far
-        trail_sl   = sig.sl        # trailing SL — moves up as TPs are hit
+        is_sell = sig.signal == "SELL"
+        best_tp = None  # highest TP reached so far
+        trail_sl = sig.sl  # trailing SL — moves up as TPs are hit
 
         for _, row in df.iterrows():
             h, l = float(row["high"]), float(row["low"])
@@ -226,13 +238,13 @@ class OutcomeChecker:
                     }.get(best_tp)) or sig.sl
 
                 if l <= sig.tp3:
-                    return "TP3", sig.tp3          # full target hit
+                    return "TP3", sig.tp3  # full target hit
                 if l <= sig.tp2:
-                    best_tp  = "TP2"
-                    trail_sl = sig.tp1             # SL moves to TP1 level
+                    best_tp = "TP2"
+                    trail_sl = sig.tp1  # SL moves to TP1 level
                 elif l <= sig.tp1 and best_tp is None:
-                    best_tp  = "TP1"
-                    trail_sl = sig.entry_price     # SL moves to breakeven
+                    best_tp = "TP1"
+                    trail_sl = sig.entry_price  # SL moves to breakeven
             else:
                 if trail_sl is not None and l <= trail_sl:
                     return best_tp or "SL", (best_tp and {
@@ -242,16 +254,16 @@ class OutcomeChecker:
                 if h >= sig.tp3:
                     return "TP3", sig.tp3
                 if h >= sig.tp2:
-                    best_tp  = "TP2"
+                    best_tp = "TP2"
                     trail_sl = sig.tp1
                 elif h >= sig.tp1 and best_tp is None:
-                    best_tp  = "TP1"
+                    best_tp = "TP1"
                     trail_sl = sig.entry_price
 
         # End of candles — return best reached
         return best_tp or "PENDING", ({
-            "TP1": sig.tp1, "TP2": sig.tp2, "TP3": sig.tp3
-        }.get(best_tp)) if best_tp else None
+                                          "TP1": sig.tp1, "TP2": sig.tp2, "TP3": sig.tp3
+                                      }.get(best_tp)) if best_tp else None
 
     @staticmethod
     def _calc_pnl(sig, close_price) -> float | None:
@@ -278,16 +290,16 @@ class Scanner:
     """
 
     def __init__(self, cfg: AppConfig):
-        self._cfg     = cfg
-        binance       = BinanceClient(cfg.binance, cfg.scan)
-        self._btc     = BtcStrengthEngine(binance, cfg.scan)
-        self._news    = NewsEngine(os.environ.get("CRYPTOPANIC_API_KEY", ""))
-        self._sig     = SignalEngine(binance, cfg.signal, cfg.risk, cfg.scan, self._news)
-        self._spot   = SpotSignalEngine(binance)
+        self._cfg = cfg
+        binance = BinanceClient(cfg.binance, cfg.scan)
+        self._btc = BtcStrengthEngine(binance, cfg.scan)
+        self._news = NewsEngine(os.environ.get("CRYPTOPANIC_API_KEY", ""))
+        self._sig = SignalEngine(binance, cfg.signal, cfg.risk, cfg.scan, self._news)
+        self._spot = SpotSignalEngine(binance)
         self._trader: "BinanceTrader | None" = None
-        self._trader_mode: str = ""   # track current mode so we rebuild if mode changes
-        self._wa      = WhatsAppSender(cfg.whatsapp)
-        self._bin     = binance
+        self._trader_mode: str = ""  # track current mode so we rebuild if mode changes
+        self._wa = WhatsAppSender(cfg.whatsapp)
+        self._bin = binance
         self._checker = OutcomeChecker()
         self._learner = PatternLearner()
 
@@ -296,6 +308,8 @@ class Scanner:
         self._last_daily_report: datetime | None = None
         self._daily_scan_count: int = 0
         self._pending_symbols: set[str] = set()
+        # TradFi engine — runs in parallel with crypto engine, completely isolated
+        self._tradfi = TradFiSignalEngine(binance, cfg.signal, cfg.risk)
 
     def run_cycle(self) -> None:
         from dashboard.models import ScanRecord, SignalRecord, NewsItem
@@ -324,7 +338,7 @@ class Scanner:
                 .values_list("symbol", flat=True)
             ) | set(
                 SignalRecord.objects
-                .filter(outcome="PENDING")             # any open trade
+                .filter(outcome="PENDING")  # any open trade
                 .values_list("symbol", flat=True)
             )
         except Exception:
@@ -341,18 +355,18 @@ class Scanner:
                 NewsItem.objects.get_or_create(
                     title=n["title"][:298], source=n["source"],
                     defaults={
-                        "url": n.get("url",""), "sentiment": n.get("sentiment","neutral"),
-                        "published": timezone.now(), "currencies": n.get("currencies",""),
+                        "url": n.get("url", ""), "sentiment": n.get("sentiment", "neutral"),
+                        "published": timezone.now(), "currencies": n.get("currencies", ""),
                     }
                 )
             except Exception:
                 pass
 
         # ── Step 4: BTC Strength ──────────────────────────────
-        btc     = self._btc.calculate()
+        btc = self._btc.calculate()
         # v7: scan BOTH top gainers (momentum) AND liquid pairs (trends)
         # This gives 50-60 pairs per cycle → 5-15 signals daily
-        top_gainers  = self._bin.get_top_gainers(30)
+        top_gainers = self._bin.get_top_gainers(30)
         liquid_pairs = self._bin.get_trending_pairs(30)
         # Merge, deduplicate by symbol
         seen = set()
@@ -365,23 +379,20 @@ class Scanner:
 
         # ── Step 5: Analyse pairs ─────────────────────────────
         collected: list[Signal] = []
-        spot_signals: list = []   # spot engine results (default empty)
+        spot_signals: list = []  # spot engine results (default empty)
         for ticker in gainers:
             sym = ticker["symbol"]
 
-            # Skip if in cooldown
             if self._is_in_cooldown(sym, now):
                 log.debug("Cooldown: %s", sym)
                 continue
 
-            # Skip if already has a pending signal for this pair
             if sym in self._pending_symbols:
                 log.debug("Skipping %s — pending signal exists", sym)
                 continue
 
             signal = self._sig.analyze(ticker, btc)
             if signal:
-                # Apply pattern-learning confidence boost
                 boost = self._learner.get_confidence_boost(
                     signal.grade.split()[0], signal.btc_score, sym
                 )
@@ -397,6 +408,39 @@ class Scanner:
 
             time.sleep(self._cfg.alert.binance_rate_limit_seconds)
 
+            # ── TradFi scan (runs ONCE per cycle, AFTER crypto loop completes) ──
+            # Uses its own engine with no BTC gate, no crypto news, wider ATR.
+            # Signals merge into `collected` and flow through the same DB save,
+            # digest send, and auto-trade pipeline as crypto signals.
+        tradfi_seen = set()
+        try:
+            tradfi_tickers = self._bin.get_tradfi_pairs()
+            log.info("TradFi pairs available: %d", len(tradfi_tickers))
+            tradfi_signals_count = 0
+            for tf_ticker in tradfi_tickers:
+                tf_sym = tf_ticker.get("symbol", "")
+                if not tf_sym or tf_sym in tradfi_seen:
+                    continue
+                tradfi_seen.add(tf_sym)
+                if self._is_in_cooldown(tf_sym, now):
+                    continue
+                if tf_sym in self._pending_symbols:
+                    continue
+                tf_signal = self._tradfi.analyze(tf_ticker, btc)
+                if tf_signal:
+                    collected.append(tf_signal)
+                    tradfi_signals_count += 1
+                    log.info(
+                        "TradFi queued: %s %s — %s (%d%%) confluence=%.1f",
+                        tf_signal.signal, tf_sym, tf_signal.grade,
+                        tf_signal.confidence, tf_signal.confluence,
+                    )
+                time.sleep(self._cfg.alert.binance_rate_limit_seconds)
+            if tradfi_signals_count:
+                log.info("TradFi scan: %d signals added", tradfi_signals_count)
+        except Exception as e:
+            log.warning("TradFi scan error (non-fatal, crypto unaffected): %s", e)
+
         log.info("Scan done — %d pairs, %d signals queued", len(gainers), len(collected))
 
         # ── Step 6: Save scan record ──────────────────────────
@@ -410,11 +454,11 @@ class Scanner:
         collected.sort(key=lambda s: _GRADE_ORDER.get(s.grade.split()[0], 9))
 
         # Keep only top 5 by confluence, same direction as majority
-        buy_sigs  = [s for s in collected if s.signal == "BUY"]
+        buy_sigs = [s for s in collected if s.signal == "BUY"]
         sell_sigs = [s for s in collected if s.signal == "SELL"]
         if buy_sigs and sell_sigs:
             # If both directions fire, keep only the stronger side
-            buy_avg  = sum(s.confluence for s in buy_sigs)  / len(buy_sigs)
+            buy_avg = sum(s.confluence for s in buy_sigs) / len(buy_sigs)
             sell_avg = sum(s.confluence for s in sell_sigs) / len(sell_sigs)
             collected = buy_sigs if buy_avg >= sell_avg else sell_sigs
             log.info("Direction consensus: kept %s only (buy avg=%.1f sell avg=%.1f)",
@@ -429,7 +473,8 @@ class Scanner:
         if not collected:
             import inspect as _ins
             _fmt_p = _ins.signature(fmt_digest).parameters
-            _extra = {"closed_today": [], "open_positions": [], "scan_number": self._daily_scan_count} if "closed_today" in _fmt_p else {}
+            _extra = {"closed_today": [], "open_positions": [],
+                      "scan_number": self._daily_scan_count} if "closed_today" in _fmt_p else {}
             if "spot_signals" in _fmt_p:
                 _extra["spot_signals"] = spot_signals
             msg = fmt_digest([], btc.to_dict(), self._cfg.risk, news_items, **_extra)
@@ -464,28 +509,29 @@ class Scanner:
 
                 closed_today = []
                 for sig_rec in SignalRecord.objects.filter(
-                    created_at__gte=today_start
+                        created_at__gte=today_start
                 ).exclude(outcome="PENDING").order_by("-closed_at")[:10]:
                     closed_today.append({
-                        "symbol":   sig_rec.symbol,
-                        "signal":   sig_rec.signal,
-                        "grade":    sig_rec.grade,
-                        "outcome":  sig_rec.outcome,
-                        "pnl":      sig_rec.profit_pct,
+                        "symbol": sig_rec.symbol,
+                        "signal": sig_rec.signal,
+                        "grade": sig_rec.grade,
+                        "outcome": sig_rec.outcome,
+                        "pnl": sig_rec.profit_pct,
                         "entry_price": sig_rec.entry_price,
                         "tp1": sig_rec.tp1, "tp2": sig_rec.tp2, "tp3": sig_rec.tp3,
                         "sl": sig_rec.sl,
-                        "closed_at": sig_rec.closed_at.astimezone(_EAT_z).strftime("%H:%M") if sig_rec.closed_at else "",
+                        "closed_at": sig_rec.closed_at.astimezone(_EAT_z).strftime(
+                            "%H:%M") if sig_rec.closed_at else "",
                     })
 
                 open_positions = []
                 for sig_rec in SignalRecord.objects.filter(
-                    created_at__gte=today_start, outcome="PENDING"
+                        created_at__gte=today_start, outcome="PENDING"
                 ).order_by("-created_at")[:5]:
                     open_positions.append({
-                        "symbol":   sig_rec.symbol,
-                        "signal":   sig_rec.signal,
-                        "grade":    sig_rec.grade,
+                        "symbol": sig_rec.symbol,
+                        "signal": sig_rec.signal,
+                        "grade": sig_rec.grade,
                         "entry_price": sig_rec.entry_price,
                         "tp1": sig_rec.tp1, "tp2": sig_rec.tp2, "tp3": sig_rec.tp3,
                         "sl": sig_rec.sl,
@@ -499,9 +545,9 @@ class Scanner:
             _fmt_params = _inspect.signature(fmt_digest).parameters
             _extra = {}
             if "closed_today" in _fmt_params:
-                _extra["closed_today"]   = closed_today
+                _extra["closed_today"] = closed_today
                 _extra["open_positions"] = open_positions
-                _extra["scan_number"]    = self._daily_scan_count
+                _extra["scan_number"] = self._daily_scan_count
             msg = fmt_digest(collected, btc.to_dict(), self._cfg.risk, news_items, **_extra)
             delivered = self._wa.send(msg)
 
@@ -531,13 +577,16 @@ class Scanner:
                 week_ago = now - timedelta(days=7)
                 _sig_lookup = {}
                 for _rec in SignalRecord.objects.filter(
-                    created_at__gte=week_ago, outcome="PENDING"
+                        created_at__gte=week_ago, outcome="PENDING"
                 ).order_by("-created_at"):
                     if _rec.symbol not in _sig_lookup:
                         class _S: pass
+
                         _s = _S()
-                        _s.tp1=_rec.tp1; _s.tp2=_rec.tp2
-                        _s.tp3=_rec.tp3; _s.sl=_rec.sl
+                        _s.tp1 = _rec.tp1;
+                        _s.tp2 = _rec.tp2
+                        _s.tp3 = _rec.tp3;
+                        _s.sl = _rec.sl
                         _sig_lookup[_rec.symbol] = _s
                 _fut_t = self._get_trader_for_mode(_state, "futures")
                 if _fut_t:
@@ -554,35 +603,36 @@ class Scanner:
             from dashboard.models import AutoTradeState
             from zoneinfo import ZoneInfo
             eat_hour = now.astimezone(ZoneInfo("Africa/Dar_es_Salaam")).hour
-            eat_min  = now.astimezone(ZoneInfo("Africa/Dar_es_Salaam")).minute
+            eat_min = now.astimezone(ZoneInfo("Africa/Dar_es_Salaam")).minute
             if eat_hour == 0 and eat_min < 16:
                 state = AutoTradeState.get()
                 if state.trades_today > 0:
                     state.trades_today = 0
                     state.save(update_fields=["trades_today"])
-        except Exception: pass
+        except Exception:
+            pass
         # Daily report is now embedded in every signal digest (not time-gated)
 
     # ── Helpers ───────────────────────────────────────────────
 
     def _get_trader_for_mode(self, state, mode: str):
         try:
-            api_key    = self._cfg.auto.api_key
+            api_key = self._cfg.auto.api_key
             api_secret = self._cfg.auto.api_secret
             if not api_key or not api_secret:
                 log.warning('Auto-trade: no API keys in .env')
                 return None
             from src.trading.binance_trader import BinanceTrader
-            risk  = state.spot_risk        if mode == 'spot' else state.futures_risk
-            max_t = state.spot_max_trades   if mode == 'spot' else state.futures_max_trades
+            risk = state.spot_risk if mode == 'spot' else state.futures_risk
+            max_t = state.spot_max_trades if mode == 'spot' else state.futures_max_trades
             return BinanceTrader(
-                api_key    = api_key,
-                api_secret = api_secret,
-                mode       = mode,
-                live       = not self._cfg.auto.testnet,
-                risk_pct   = risk,
-                daily_loss_limit_pct = self._cfg.auto.daily_loss_limit_pct,
-                max_trades_per_day   = max_t,
+                api_key=api_key,
+                api_secret=api_secret,
+                mode=mode,
+                live=not self._cfg.auto.testnet,
+                risk_pct=risk,
+                daily_loss_limit_pct=self._cfg.auto.daily_loss_limit_pct,
+                max_trades_per_day=max_t,
             )
         except Exception as e:
             log.error('Trader init error (%s): %s', mode, e)
@@ -605,14 +655,14 @@ class Scanner:
             from dashboard.models import AutoTradeState, SignalRecord
             state = AutoTradeState.get()
 
-            spot_on    = state.spot_enabled
-            fut_on     = state.futures_enabled
+            spot_on = state.spot_enabled
+            fut_on = state.futures_enabled
             if not spot_on and not fut_on:
                 return
 
             # Build traders
-            spot_trader = self._get_trader_for_mode(state, "spot")    if spot_on    else None
-            fut_trader  = self._get_trader_for_mode(state, "futures") if fut_on     else None
+            spot_trader = self._get_trader_for_mode(state, "spot") if spot_on else None
+            fut_trader = self._get_trader_for_mode(state, "futures") if fut_on else None
 
             # Connectivity pre-check — log clearly if API is unreachable
             def _check_api(url):
@@ -624,15 +674,17 @@ class Scanner:
                     return False
 
             spot_api_ok = _check_api("https://api.binance.com/api/v3/ping")
-            fut_api_ok  = _check_api("https://fapi.binance.com/fapi/v1/ping")
+            fut_api_ok = _check_api("https://fapi.binance.com/fapi/v1/ping")
 
             if spot_on and not spot_api_ok:
-                log.warning("AUTO-TRADE BLOCKED: Binance Spot API (api.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
+                log.warning(
+                    "AUTO-TRADE BLOCKED: Binance Spot API (api.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
                 spot_on = False  # disable for this cycle
                 spot_trader = None
 
             if fut_on and not fut_api_ok:
-                log.warning("AUTO-TRADE BLOCKED: Binance Futures API (fapi.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
+                log.warning(
+                    "AUTO-TRADE BLOCKED: Binance Futures API (fapi.binance.com) is unreachable from this network. Use VPN or deploy to a server.")
                 fut_on = False
                 fut_trader = None
 
@@ -646,17 +698,17 @@ class Scanner:
             _today = _eat.replace(hour=0, minute=0, second=0, microsecond=0)
             last_reset = getattr(self, "_last_counter_reset", None)
             if last_reset is None or last_reset < _today:
-                state.spot_trades_today    = 0
+                state.spot_trades_today = 0
                 state.futures_trades_today = 0
                 state.save(update_fields=["spot_trades_today", "futures_trades_today"])
                 self._last_counter_reset = _today
                 log.info("Daily trade counters reset to 0 (new day)")
 
-            spot_bal = spot_trader.get_available_balance()  if spot_trader else 0.0
-            fut_bal  = fut_trader.get_available_balance()   if fut_trader  else 0.0
+            spot_bal = spot_trader.get_available_balance() if spot_trader else 0.0
+            fut_bal = fut_trader.get_available_balance() if fut_trader else 0.0
             log.info("Auto-trade | Spot=%s $%.2f (api=%s) | Futures=%s $%.2f (api=%s) | new=%d",
                      "ON" if spot_on else "OFF", spot_bal, "✅" if spot_api_ok else "❌",
-                     "ON" if fut_on  else "OFF", fut_bal,  "✅" if fut_api_ok  else "❌",
+                     "ON" if fut_on else "OFF", fut_bal, "✅" if fut_api_ok else "❌",
                      len(new_signals))
 
             today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -680,14 +732,21 @@ class Scanner:
             ).exclude(notes__icontains="AUTO_SPOT:YES"))
 
             def _sig_from_rec(rec):
-                class _S: pass
+                class _S:
+                    pass
+
                 s = _S()
-                s.symbol=rec.symbol; s.signal=rec.signal; s.grade=rec.grade
+                s.symbol = rec.symbol;
+                s.signal = rec.signal;
+                s.grade = rec.grade
                 # Use ORIGINAL entry_price — TP/SL levels are relative to it
                 s.price = rec.entry_price
-                s.tp1=rec.tp1; s.tp2=rec.tp2
-                s.tp3=rec.tp3; s.sl=rec.sl
-                s.btc_score=rec.btc_score; s.confidence=rec.confidence
+                s.tp1 = rec.tp1;
+                s.tp2 = rec.tp2
+                s.tp3 = rec.tp3;
+                s.sl = rec.sl
+                s.btc_score = rec.btc_score;
+                s.confidence = rec.confidence
                 # Staleness check: skip if current price blew past SL
                 try:
                     import requests as _rq
@@ -695,7 +754,7 @@ class Scanner:
                                 params={"symbol": rec.symbol}, timeout=4)
                     if r.ok:
                         cur = float(r.json().get("price", rec.entry_price))
-                        if rec.signal == "BUY"  and cur <= rec.sl:
+                        if rec.signal == "BUY" and cur <= rec.sl:
                             log.info("Skip %s BUY — current $%.5g already below SL $%.5g", rec.symbol, cur, rec.sl)
                             return None
                         if rec.signal == "SELL" and cur >= rec.sl:
@@ -708,12 +767,13 @@ class Scanner:
             # --- Execute SPOT trades ---
             if spot_on and spot_trader:
                 seen_spot = set()
-                all_spot  = list(spot_candidates_new) + [_sig_from_rec(r) for r in pending_spot]
-                log.info("Spot candidates: %d (new=%d pending=%d)", len(all_spot), len(spot_candidates_new), len(pending_spot))
+                all_spot = list(spot_candidates_new) + [_sig_from_rec(r) for r in pending_spot]
+                log.info("Spot candidates: %d (new=%d pending=%d)", len(all_spot), len(spot_candidates_new),
+                         len(pending_spot))
                 for sig in all_spot:
                     if sig is None: continue
                     grade_key = sig.grade.split()[0]
-                    if grade_key not in ("ULTRA","STRONG","STANDARD"):
+                    if grade_key not in ("ULTRA", "STRONG", "STANDARD"):
                         log.debug("Spot skip %s: grade=%s", sig.symbol, grade_key)
                         continue
                     if state.spot_trades_today >= state.spot_max_trades:
@@ -744,7 +804,7 @@ class Scanner:
                         spot_bal -= result.qty * result.entry_price
                         state.spot_trades_today += 1
                         state.spot_total += 1
-                        state.save(update_fields=["spot_trades_today","spot_total"])
+                        state.save(update_fields=["spot_trades_today", "spot_total"])
                         log.info("SPOT TRADE ✅ %s %s @ %.6g | oco=%s sl=%s tp1=%s tp2=%s tp3=%s",
                                  result.side, sig.symbol, result.entry_price,
                                  result.oco_id, result.sl_order_id,
@@ -756,12 +816,13 @@ class Scanner:
             # --- Execute FUTURES trades ---
             if fut_on and fut_trader:
                 seen_fut = set()
-                all_fut  = list(fut_candidates_new) + [_sig_from_rec(r) for r in pending_fut]
-                log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new), len(pending_fut), fut_bal)
+                all_fut = list(fut_candidates_new) + [_sig_from_rec(r) for r in pending_fut]
+                log.info("Futures candidates: %d (new=%d pending=%d bal=$%.2f)", len(all_fut), len(fut_candidates_new),
+                         len(pending_fut), fut_bal)
                 for sig in all_fut:
                     if sig is None: continue
                     grade_key = sig.grade.split()[0]
-                    if grade_key not in ("ULTRA","STRONG","STANDARD"):
+                    if grade_key not in ("ULTRA", "STRONG", "STANDARD"):
                         log.debug("Futures skip %s: grade=%s", sig.symbol, grade_key)
                         continue
                     if state.futures_trades_today >= state.futures_max_trades:
@@ -789,7 +850,7 @@ class Scanner:
                         fut_bal -= result.qty * result.entry_price
                         state.futures_trades_today += 1
                         state.futures_total += 1
-                        state.save(update_fields=["futures_trades_today","futures_total"])
+                        state.save(update_fields=["futures_trades_today", "futures_total"])
                         log.info("FUTURES TRADE ✅ %s %s @ %.6g | sl=%s tp1=%s tp2=%s tp3=%s",
                                  result.side, sig.symbol, result.entry_price,
                                  result.sl_order_id, sig.tp1, sig.tp2, sig.tp3)
@@ -821,7 +882,7 @@ class Scanner:
         # after any signal (win or loss) to prevent repeated entries on volatile pairs.
         COOLDOWN_SECONDS = max(
             self._cfg.alert.cooldown_hours * 3600,
-            24 * 3600   # minimum 24 hours for swing trading — let the trade breathe
+            24 * 3600  # minimum 24 hours for swing trading — let the trade breathe
         )
         last = self._cooldowns.get(symbol)
         if last is None:

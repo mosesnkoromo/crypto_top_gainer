@@ -24,6 +24,19 @@ _BINANCE_ENDPOINTS = [
 ]
 _COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
+# TradFi pairs only exist on the futures API, not spot
+_FUT_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+_FUT_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+
+# Match list in src/analysis/tradfi_signal_engine.py — keep them in sync
+_TRADFI_SYMBOLS = {
+    # Metals (Tier 1)
+    "XAUUSDT", "XAGUSDT",
+    # Stocks (Tier 1)
+    "MSTRUSDT", "TSLAUSDT", "AAPLUSDT", "NVDAUSDT",
+    "AMZNUSDT", "GOOGLUSDT", "METAUSDT", "MSFTUSDT",
+}
+
 _COLS = ["open_time","open","high","low","close","volume",
          "close_time","quote_vol","trades","buy_base","buy_quote","ignore"]
 _NUM  = ["open","high","low","close","volume"]
@@ -52,11 +65,48 @@ class BinanceClient:
     # ── Public ────────────────────────────────────────────────
 
     def get_klines(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
+        # TradFi (gold, silver, stocks) only exist on futures, not spot
+        if symbol in _TRADFI_SYMBOLS:
+            return self._futures_klines(symbol, interval, limit)
         if self._binance_ok:
             df = self._binance_klines(symbol, interval, limit)
             if df is not None:
                 return df
         return self._cg_klines(symbol, interval, limit)
+
+    def _futures_klines(self, symbol: str, interval: str, limit: int) -> pd.DataFrame:
+        """Direct futures klines — used for TradFi pairs only."""
+        try:
+            r = self._session.get(
+                _FUT_KLINES_URL,
+                params={"symbol": symbol, "interval": interval, "limit": limit},
+                timeout=self._timeout,
+            )
+            if not r.ok:
+                log.debug("Futures klines %s %s: HTTP %d", symbol, interval, r.status_code)
+                return pd.DataFrame()
+            df = pd.DataFrame(r.json(), columns=_COLS)
+            df[_NUM] = df[_NUM].apply(pd.to_numeric)
+            return df
+        except Exception as e:
+            log.debug("Futures klines error %s: %s", symbol, e)
+            return pd.DataFrame()
+
+    def get_tradfi_pairs(self) -> list[dict]:
+        """
+        Fetch 24hr ticker for TradFi futures only.
+        Returns same shape as get_top_gainers so the scanner can iterate uniformly.
+        """
+        try:
+            r = self._session.get(_FUT_TICKER_URL, timeout=self._timeout)
+            if not r.ok:
+                log.warning("TradFi ticker fetch: HTTP %d", r.status_code)
+                return []
+            tickers = r.json()
+            return [t for t in tickers if t.get("symbol") in _TRADFI_SYMBOLS]
+        except Exception as e:
+            log.warning("TradFi ticker error: %s", e)
+            return []
 
     def get_top_gainers(self, limit: int | None = None) -> list[dict]:
         limit = limit or self._scan.top_gainers_count
