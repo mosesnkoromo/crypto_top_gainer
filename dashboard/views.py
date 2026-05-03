@@ -835,3 +835,66 @@ def auto_trade_reset_counters(request):
     state.save(update_fields=["spot_trades_today", "futures_trades_today"])
 
     return JsonResponse({"ok": True})
+
+def api_real_pnl(request):
+    """
+    Returns dashboard stats using REAL Binance fills where available.
+    Falls back to signal-outcome PnL when no Binance event exists.
+    """
+    import json
+    from dashboard.models import SignalRecord
+    from django.utils import timezone
+    from datetime import timedelta
+
+    period = request.GET.get("period", "week")
+    since = {
+        "week":  timezone.now() - timedelta(days=7),
+        "month": timezone.now() - timedelta(days=30),
+        "year":  timezone.now() - timedelta(days=365),
+    }.get(period, timezone.now() - timedelta(days=7))
+
+    qs = SignalRecord.objects.filter(
+        created_at__gte=since,
+    ).exclude(outcome="PENDING")
+
+    real_total_usdt = 0.0
+    real_count      = 0
+    fallback_total  = 0.0
+    fallback_count  = 0
+    wins = losses = 0
+
+    for rec in qs:
+        try:
+            bd = json.loads(rec.score_breakdown) if rec.score_breakdown else {}
+        except Exception:
+            bd = {}
+
+        real_pnl = bd.get("binance_realized_pnl_usdt")
+        if real_pnl is not None:
+            real_total_usdt += float(real_pnl)
+            real_count += 1
+            if float(real_pnl) > 0:
+                wins += 1
+            elif float(real_pnl) < 0:
+                losses += 1
+        elif rec.profit_pct is not None:
+            fallback_total += float(rec.profit_pct)
+            fallback_count += 1
+            if rec.outcome in ("TP1", "TP2", "TP3"):
+                wins += 1
+            elif rec.outcome == "SL":
+                losses += 1
+
+    total_closed = wins + losses
+    return JsonResponse({
+        "period":              period,
+        "real_pnl_usdt":       round(real_total_usdt, 2),
+        "real_trade_count":    real_count,
+        "fallback_pnl_pct":    round(fallback_total, 2),
+        "fallback_count":      fallback_count,
+        "win_rate":            round(wins / max(total_closed, 1) * 100, 1),
+        "wins":                wins,
+        "losses":              losses,
+        "total_closed":        total_closed,
+        "data_source": "binance_fills" if real_count > fallback_count else "signal_outcomes",
+    })

@@ -64,6 +64,7 @@ class Command(BaseCommand):
             f"  Dashboard : http://{host}:{port}\n"
             f"  Scanner   : every {cfg.scan.scan_interval_minutes} min\n"
             f"  Logs      : {cfg.log.log_dir / cfg.log.log_filename}\n"
+            f"  Workers   : {workers}\n"
         ))
 
         # ── Step 3: Start bot in background thread ────────────

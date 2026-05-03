@@ -25,4 +25,6 @@ urlpatterns = [
     path("api/auto/settings/", views.auto_trade_settings, name="auto_settings"),
     path("api/auto/reset-counters/", views.auto_trade_reset_counters, name="auto_reset_counters"),
     path("api/auto/emergency-stop/", views.auto_trade_emergency_stop, name="auto_emergency_stop"),
+    path("api/real-pnl/", views.api_real_pnl, name="api_real_pnl"),
+
 ]

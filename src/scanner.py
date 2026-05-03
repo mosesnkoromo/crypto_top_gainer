@@ -596,6 +596,15 @@ class Scanner:
         except Exception as _pe:
             log.warning("protect_positions error: %s", _pe)
 
+        # Real-PnL sync — runs every 10 cycles to avoid hammering Binance API
+        if self._daily_scan_count % 10 == 0:
+            try:
+                from src.analysis.binance_pnl_sync import BinancePnLSync
+                sync = BinancePnLSync(self._cfg.auto.api_key, self._cfg.auto.api_secret)
+                sync.sync_recent(days=2)  # last 48 hours of closed signals
+            except Exception as e:
+                log.warning("Binance PnL sync error (non-fatal): %s", e)
+
         log.info("Cycle complete")
         self._daily_scan_count += 1
         # Reset auto-trade daily count at midnight EAT
@@ -786,6 +795,21 @@ class Scanner:
                         continue
                     seen_spot.add(sig.symbol)
 
+                    if not hasattr(self, "_risk_filter"):
+                        from src.trading.risk_filter import RiskFilter
+                        self._risk_filter = RiskFilter()
+
+                    bl, reason = self._risk_filter.is_blacklisted(sig.symbol)
+                    if bl:
+                        log.info("Spot RiskFilter L1 rejected %s: %s", sig.symbol, reason)
+                        rec_qs = SignalRecord.objects.filter(
+                            symbol=sig.symbol, created_at__gte=today_start, outcome="PENDING"
+                        ).first()
+                        if rec_qs:
+                            rec_qs.notes = (rec_qs.notes or "") + " | RISKFILTER:L1"
+                            rec_qs.save(update_fields=["notes"])
+                        continue
+
                     result = spot_trader.execute_signal(sig, spot_bal)
                     # Mark DB record
                     rec_qs = SignalRecord.objects.filter(
@@ -832,7 +856,45 @@ class Scanner:
                         continue
                     seen_fut.add(sig.symbol)
 
-                    result = fut_trader.execute_signal(sig, fut_bal)
+                    # Build / cache the risk filter once per Scanner instance
+                    if not hasattr(self, "_risk_filter"):
+                        from src.trading.risk_filter import RiskFilter
+                        self._risk_filter = RiskFilter()
+
+                    # Get currently-open futures symbols for correlation guard
+                    open_syms = fut_trader.get_open_positions_symbols() if fut_trader else []
+
+                    # Evaluate all 3 layers
+                    decision = self._risk_filter.evaluate(sig.symbol, open_syms)
+                    if not decision.allowed:
+                        log.info("RiskFilter rejected %s: %s", sig.symbol, decision.reason)
+                        # Mark DB record so we know why the trade was skipped
+                        rec_qs = SignalRecord.objects.filter(
+                            symbol=sig.symbol, created_at__gte=today_start, outcome="PENDING"
+                        ).first()
+                        if rec_qs:
+                            rec_qs.notes = (rec_qs.notes or "") + f" | RISKFILTER:{decision.layer}"
+                            rec_qs.save(update_fields=["notes"])
+                        continue
+
+                    # If liquidity flagged "STOP_MARKET only" — rebuild trader with that flag
+                    if decision.use_stop_market_only and not getattr(fut_trader, "_stop_market_only", False):
+                        log.info("Sub-$50M pair %s — switching to STOP_MARKET-only mode", sig.symbol)
+                        from src.trading.binance_trader import BinanceTrader
+                        fut_trader_sm = BinanceTrader(
+                            api_key=self._cfg.auto.api_key,
+                            api_secret=self._cfg.auto.api_secret,
+                            mode="futures",
+                            live=not self._cfg.auto.testnet,
+                            risk_pct=state.futures_risk,
+                            daily_loss_limit_pct=self._cfg.auto.daily_loss_limit_pct,
+                            max_trades_per_day=state.futures_max_trades,
+                            stop_market_only=True,
+                        )
+                        result = fut_trader_sm.execute_signal(sig, fut_bal)
+                    else:
+                        result = fut_trader.execute_signal(sig, fut_bal)
+
                     # Mark DB record
                     rec_qs = SignalRecord.objects.filter(
                         symbol=sig.symbol, created_at__gte=today_start, outcome="PENDING"
