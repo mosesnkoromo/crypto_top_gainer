@@ -32,25 +32,35 @@ log = get_logger(__name__)
 # Hard blacklist: 0% historical win rate AND ≥3% net loss.
 # Re-evaluate every 30 days. Reset in the dashboard if a pair recovers.
 HARD_BLACKLIST: set[str] = {
-    "GIGGLEUSDT",      # 1 trade, -18.22%, microcap meme
-    "BANANAS31USDT",   # 1 trade, -16.59%, microcap meme
-    "FILUSDT",         # 1 trade, -11.00%
-    "CHZUSDT",         # 1 trade, -10.98%
-    "SEIUSDT",         # 1 trade, -9.29%
-    "HBARUSDT",        # 1 trade, -4.63%
+    "GIGGLEUSDT",  # 1 trade, -18.22%, microcap meme
+    "BANANAS31USDT",  # 1 trade, -16.59%, microcap meme
+    "FILUSDT",  # 1 trade, -11.00%
+    "CHZUSDT",  # 1 trade, -10.98%
+    "SEIUSDT",  # 1 trade, -9.29%
+    "HBARUSDT",  # 1 trade, -4.63%
+    "AAVEUSDT",  # 0/8, -$5.40 — structural failure
+    "WLFIUSDT",  # 0/1, -$5.45 — microcap pattern
+    "ZAMAUSDT",  # 1 trade, -4.63%
+    "ASTERUSDT",  # 1 trade, -4.63%
 }
 
 # Watch blacklist: mixed record, 50% WR but net negative.
 # These pairs trade only at STANDARD grade size (or skip entirely).
 WATCH_BLACKLIST: set[str] = {
-    "ZECUSDT",         # 0/2, -10.98%
-    "ENAUSDT",         # 2/2, -11.70%
+    "ZECUSDT",  # 0/2, -10.98%
+    "ENAUSDT",  # 2/2, -11.70%
+    "TAOUSDT",
+    "MASKUSDT",  # 2 trade 0% WR, -$1.73
+    "METAUSDT",  # 2 trade 0% WR, -$1.73
+    "NFPUSDT",  # 2 trade 0% WR, -$1.73
+    "OPENUSDT",  # 2 trade 0% WR, -$1.73
+    "SUIUSDT",  # 2 trade 0% WR, -$1.73
 }
 
 # ─────────────────────────────────────────────────────────────────
 # LAYER 2 — Liquidity gate
 # ─────────────────────────────────────────────────────────────────
-MIN_QUOTE_VOLUME_24H_USD = 10_000_000     # below this = reject
+MIN_QUOTE_VOLUME_24H_USD = 10_000_000  # below this = reject
 
 # Sub-$50M = use STOP_MARKET only (no LIMIT fallback). LIMIT stops
 # don't fire on illiquid books — the position bleeds through them.
@@ -78,11 +88,11 @@ MAX_CORRELATED_OPEN = 2
 # ─────────────────────────────────────────────────────────────────
 @dataclass
 class RiskDecision:
-    allowed:           bool
-    reason:            str = ""
-    layer:             str = ""
-    use_stop_market_only: bool = False    # Layer 5 / P1 hint
-    quote_volume_usd:  float = 0.0
+    allowed: bool
+    reason: str = ""
+    layer: str = ""
+    use_stop_market_only: bool = False  # Layer 5 / P1 hint
+    quote_volume_usd: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -91,9 +101,9 @@ class RiskDecision:
 class _VolumeCache:
     def __init__(self, ttl_sec: int = 300):
         self._ttl = ttl_sec
-        self._data: dict[str, tuple[float, float]] = {}    # sym -> (vol_usd, ts)
+        self._data: dict[str, tuple[float, float]] = {}  # sym -> (vol_usd, ts)
         self._all_loaded_at: float = 0.0
-        self._all_data: dict[str, float] = {}              # bulk snapshot
+        self._all_data: dict[str, float] = {}  # bulk snapshot
 
     def get(self, symbol: str) -> Optional[float]:
         now = time.time()
@@ -127,10 +137,10 @@ class RiskFilter:
                  min_volume_usd: float = MIN_QUOTE_VOLUME_24H_USD,
                  stop_market_only_threshold_usd: float = STOP_MARKET_ONLY_THRESHOLD_USD,
                  max_correlated_open: int = MAX_CORRELATED_OPEN):
-        self._min_vol      = min_volume_usd
-        self._stop_only_v  = stop_market_only_threshold_usd
-        self._max_corr     = max_correlated_open
-        self._vol_cache    = _VolumeCache(ttl_sec=300)
+        self._min_vol = min_volume_usd
+        self._stop_only_v = stop_market_only_threshold_usd
+        self._max_corr = max_correlated_open
+        self._vol_cache = _VolumeCache(ttl_sec=300)
 
     # ── Layer 1 ────────────────────────────────────────────────
 
@@ -161,7 +171,7 @@ class RiskFilter:
                 snap = {}
                 for t in data:
                     sym = t.get("symbol", "")
-                    qv  = t.get("quoteVolume")
+                    qv = t.get("quoteVolume")
                     if sym and qv is not None:
                         try:
                             snap[sym] = float(qv)
@@ -196,7 +206,7 @@ class RiskFilter:
         """
         vol = self.get_quote_volume(symbol)
         if vol is None:
-            return True, 0.0, False    # fail-open
+            return True, 0.0, False  # fail-open
         passes_min = vol >= self._min_vol
         require_sm = vol < self._stop_only_v
         return passes_min, vol, require_sm
@@ -242,7 +252,7 @@ class RiskFilter:
         if not ok:
             return RiskDecision(
                 False,
-                f"L2 liquidity: ${vol/1e6:.1f}M < ${self._min_vol/1e6:.0f}M minimum",
+                f"L2 liquidity: ${vol / 1e6:.1f}M < ${self._min_vol / 1e6:.0f}M minimum",
                 "L2",
                 quote_volume_usd=vol,
             )
