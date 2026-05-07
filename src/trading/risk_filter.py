@@ -41,7 +41,12 @@ HARD_BLACKLIST: set[str] = {
     "AAVEUSDT",  # 0/8, -$5.40 — structural failure
     "WLFIUSDT",  # 0/1, -$5.45 — microcap pattern
     "ZAMAUSDT",  # 1 trade, -4.63%
-    "ASTERUSDT",  # 1 trade, -4.63%
+    "ASTERUSDT",  # 1 trade, -12.63%
+    "XPLUSDT",  # 1 trade, -4.63%
+    "LUMIAUSDT",  # 1 trade, -4.63%
+    "AVAXUSDT",  # 1 trade, -4.63%
+    "SEIUSDT",  # 1 trade, -4.63%
+    "WIFUSDT",  # 1 trade, -4.63%
 }
 
 # Watch blacklist: mixed record, 50% WR but net negative.
@@ -55,6 +60,7 @@ WATCH_BLACKLIST: set[str] = {
     "NFPUSDT",  # 2 trade 0% WR, -$1.73
     "OPENUSDT",  # 2 trade 0% WR, -$1.73
     "SUIUSDT",  # 2 trade 0% WR, -$1.73
+    "WLDUSDT",  # 2 trade 0% WR, -$1.73
 }
 
 # ─────────────────────────────────────────────────────────────────
@@ -74,7 +80,7 @@ CORRELATION_GROUPS: list[set[str]] = [
     {"BTCUSDT", "ETHUSDT"},
     {"XRPUSDT", "XLMUSDT"},
     {"LINKUSDT", "DOTUSDT", "ATOMUSDT"},
-    {"SOLUSDT", "AVAXUSDT", "NEARUSDT", "SEIUSDT"},
+    {"SOLUSDT",  "NEARUSDT"},
     {"DOGEUSDT", "PEPEUSDT", "WIFUSDT", "1000PEPEUSDT", "FLOKIUSDT", "1000FLOKIUSDT"},
     {"ARBUSDT", "OPUSDT"},
     {"INJUSDT", "TIAUSDT"},
@@ -144,7 +150,8 @@ class RiskFilter:
 
     # ── Layer 1 ────────────────────────────────────────────────
 
-    def is_blacklisted(self, symbol: str) -> tuple[bool, str]:
+    @staticmethod
+    def is_blacklisted(symbol: str) -> tuple[bool, str]:
         sym = symbol.upper()
         if sym in HARD_BLACKLIST:
             return True, f"L1 hard-blacklist: {sym} (0% WR history)"

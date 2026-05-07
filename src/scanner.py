@@ -33,12 +33,14 @@ from src.alerts.whatsapp import WhatsAppSender
 from src.analysis.btc_strength import BtcStrengthEngine
 from src.analysis.news_engine import NewsEngine
 from src.analysis.signal_engine import Signal, SignalEngine
-from src.analysis.spot_signal_engine import SpotSignalEngine, SpotSignal
-from src.trading.binance_trader import BinanceTrader, TradeResult
+from src.analysis.spot_signal_engine import SpotSignalEngine
+from src.trading.binance_trader import BinanceTrader
 from src.data.binance_client import BinanceClient
-from src.utils.formatter import fmt_btc_update, fmt_digest, fmt_no_signals
+from src.utils.formatter import  fmt_digest
 from src.utils.logger import get_logger
-from src.analysis.tradfi_signal_engine import TradFiSignalEngine, TRADFI_ALL
+from src.analysis.tradfi_signal_engine import TradFiSignalEngine
+from src.trading.risk_manager import RiskManager
+from src.trading.risk_filter import RiskFilter
 
 log = get_logger(__name__)
 
@@ -309,8 +311,9 @@ class Scanner:
         self._daily_scan_count: int = 0
         self._pending_symbols: set[str] = set()
         # TradFi engine — runs in parallel with crypto engine, completely isolated
-        self._tradfi = TradFiSignalEngine(binance, cfg.signal, cfg.risk)
-
+        # FIX
+        self._risk_filter = RiskFilter()
+        self._risk_manager = RiskManager(self._trader)
     def run_cycle(self) -> None:
         from dashboard.models import ScanRecord, SignalRecord, NewsItem
 
@@ -596,6 +599,31 @@ class Scanner:
         except Exception as _pe:
             log.warning("protect_positions error: %s", _pe)
 
+
+        # ── RiskManager: L1 loss-cap + L2 time-stop + L3 DD-halt ──
+        try:
+            from dashboard.models import AutoTradeState
+            _state = AutoTradeState.get()
+            if _state.futures_enabled:
+                _ft = self._get_trader_for_mode(_state, "futures")
+                if _ft:
+                    if self._risk_manager is None:
+                        from src.trading.risk_manager import RiskManager
+                        self._risk_manager = RiskManager(_ft)
+                    else:
+                        self._risk_manager._trader = _ft
+                    rm = self._risk_manager.enforce_all()
+                    if rm.actions:
+                        log.info("RiskManager: closed %d position(s) — %s",
+                                 len(rm.actions),
+                                 ", ".join(f"{a.symbol}({a.layer})" for a in rm.actions))
+                    if rm.halted:
+                        log.warning("RiskManager halt active — equity $%.2f, "
+                                    "DD %.2f%% from start $%.2f",
+                                    rm.equity, rm.drawdown_pct, rm.session_start)
+        except Exception as _re:
+            log.warning("RiskManager error (non-fatal): %s", _re)
+
         # Real-PnL sync — runs every 10 cycles to avoid hammering Binance API
         if self._daily_scan_count % 10 == 0:
             try:
@@ -701,6 +729,14 @@ class Scanner:
                 log.warning("Both APIs unreachable — skipping auto-trade this cycle")
                 return
 
+            # ── L3 daily-drawdown halt — block NEW futures trades ──
+            if fut_on and self._risk_manager is not None \
+                    and self._risk_manager.is_trading_halted():
+                log.warning("L3 DD halt active — blocking new futures trades this cycle")
+                fut_on = False
+                fut_trader = None
+
+
             # Reset daily trade counters at midnight EAT
             from zoneinfo import ZoneInfo as _ZI
             _eat = now.astimezone(_ZI("Africa/Dar_es_Salaam"))
@@ -795,7 +831,7 @@ class Scanner:
                         continue
                     seen_spot.add(sig.symbol)
 
-                    if not hasattr(self, "_risk_filter"):
+                    if self._risk_filter is None:
                         from src.trading.risk_filter import RiskFilter
                         self._risk_filter = RiskFilter()
 
