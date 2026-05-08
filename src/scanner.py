@@ -313,6 +313,7 @@ class Scanner:
         # TradFi engine — runs in parallel with crypto engine, completely isolated
         # FIX
         self._risk_filter = RiskFilter()
+        self._tradfi = TradFiSignalEngine(binance,cfg.signal,cfg.risk)
         self._risk_manager = RiskManager(self._trader)
     def run_cycle(self) -> None:
         from dashboard.models import ScanRecord, SignalRecord, NewsItem
