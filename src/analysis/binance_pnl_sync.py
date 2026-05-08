@@ -1,26 +1,41 @@
 """
-src/analysis/binance_pnl_sync.py
-─────────────────────────────────
+src/analysis/binance_pnl_sync.py — v2
+─────────────────────────────────────
 Real Binance PnL synchronisation.
 
 The dashboard's `profit_pct` column is computed from signal-level
 outcomes (TP1=+0.6%, TP2=+1.2%, ...). That's not the actual realised
 PnL — it ignores fill slippage, partial fills, and per-position fees.
 
-This module queries Binance income history and writes the REAL pct
-PnL into `SignalRecord.score_breakdown["binance_realized_pnl_pct"]`
+This module queries Binance income history and writes the REAL USDT
+PnL into `SignalRecord.score_breakdown["binance_realized_pnl_usdt"]`
 without touching the existing `profit_pct` column. Dashboards can
-then prefer the real value when present, falling back to the signal
+prefer the real value when present, falling back to the signal
 outcome when the trade wasn't auto-executed or sync hasn't run yet.
 
 Schema-safe: uses the existing JSONField. No migration needed.
+
+Fixes vs v1:
+  • HTTP 400 body is now logged with the symbol — previously you only
+    saw "HTTP 400" with no clue which symbol or why.
+  • Failed syncs are persisted to score_breakdown so we don't retry
+    every 10 cycles forever (the source of the log spam).
+  • Empty results are also persisted (closed signals that don't have
+    matching income events get marked done instead of looping).
+  • Non-ASCII symbols (Binance Alpha tokens like 币安人生USDT) are
+    skipped — /fapi/v1/income rejects them.
+  • Window clamped to Binance's 200-day max.
+  • Future timestamps clamped to now (clock skew safety).
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as _tz
 from typing import Optional
+from urllib.parse import urlencode
 
 import requests
 
@@ -28,7 +43,17 @@ from src.utils.logger import get_logger
 
 log = get_logger(__name__)
 
-_FUT_INCOME_URL = "https://fapi.binance.com/fapi/v1/income"
+_FUT_BASE        = "https://fapi.binance.com"
+_FUT_INCOME_PATH = "/fapi/v1/income"
+
+# Binance docs: max window for /fapi/v1/income is 200 days.
+_MAX_WINDOW_MS = 200 * 24 * 3600 * 1000
+
+# In-memory cache of symbols that have failed THIS process lifecycle —
+# avoids calling Binance again until the bot restarts. Combined with
+# the persisted `binance_pnl_sync_failed` flag in score_breakdown,
+# this gives both per-process and per-record dedup.
+_FAILED_SYMBOLS_CACHE: set[str] = set()
 
 
 class BinancePnLSync:
@@ -37,7 +62,7 @@ class BinancePnLSync:
 
     Usage:
         sync = BinancePnLSync(api_key, api_secret)
-        n = sync.sync_recent(days=7)   # update the last week's signals
+        sync.sync_recent(days=7)
     """
 
     def __init__(self, api_key: str, api_secret: str):
@@ -47,10 +72,8 @@ class BinancePnLSync:
     # ── Binance helpers ──────────────────────────────────────────
 
     def _signed_get(self, path: str, params: dict) -> Optional[list]:
-        import hmac, hashlib
-        from urllib.parse import urlencode
-
         if not self._key or not self._secret:
+            log.debug("PnL sync: no API keys configured")
             return None
 
         params = dict(params)
@@ -60,25 +83,57 @@ class BinancePnLSync:
         sig   = hmac.new(self._secret.encode(),
                          query.encode(),
                          hashlib.sha256).hexdigest()
-        url   = f"https://fapi.binance.com{path}?{query}&signature={sig}"
+        url   = f"{_FUT_BASE}{path}?{query}&signature={sig}"
         try:
             r = requests.get(url, headers={"X-MBX-APIKEY": self._key}, timeout=12)
             if r.status_code != 200:
-                log.warning("Binance income fetch %s: HTTP %d", path, r.status_code)
+                # FIX: log the actual body so we can diagnose 400s
+                body = (r.text or "<empty>")[:300]
+                log.warning("Binance income %s: HTTP %d symbol=%s body=%s",
+                            path, r.status_code,
+                            params.get("symbol", "?"), body)
                 return None
             return r.json()
         except Exception as e:
-            log.warning("Binance income fetch error: %s", e)
+            log.warning("Binance income fetch error (%s): %s",
+                        params.get("symbol", "?"), e)
             return None
 
     def fetch_realized_pnl(self,
                             symbol: str,
                             start_ms: int,
-                            end_ms: Optional[int] = None) -> list[dict]:
+                            end_ms: Optional[int] = None) -> Optional[list[dict]]:
         """
         Fetch REALIZED_PNL income events for a symbol in [start_ms, end_ms].
-        Returns list of dicts with {"income": float, "time": int}.
+        Returns:
+          • list[dict] on success (possibly empty)
+          • None       on API error (caller should mark the record failed)
         """
+        # FIX: skip non-ASCII symbols — /fapi/v1/income rejects Alpha tokens
+        try:
+            symbol.encode("ascii")
+        except (UnicodeEncodeError, AttributeError):
+            log.debug("PnL sync: skipping non-ASCII symbol %r", symbol)
+            return []
+
+        # FIX: timestamp validation
+        if not start_ms or start_ms <= 0:
+            return []
+        now_ms = int(time.time() * 1000)
+        if start_ms > now_ms:
+            log.debug("PnL sync %s: start_ms in future, skipping", symbol)
+            return []
+        if end_ms is not None and end_ms < start_ms:
+            log.debug("PnL sync %s: end < start, skipping", symbol)
+            return []
+        # Clamp window to 200 days max (Binance's hard limit)
+        if end_ms is not None and (end_ms - start_ms) > _MAX_WINDOW_MS:
+            log.debug("PnL sync %s: window > 200d, clamping", symbol)
+            end_ms = start_ms + _MAX_WINDOW_MS
+        # Don't send future end_ms
+        if end_ms is not None and end_ms > now_ms:
+            end_ms = now_ms
+
         params = {
             "symbol":     symbol,
             "incomeType": "REALIZED_PNL",
@@ -88,9 +143,12 @@ class BinancePnLSync:
         if end_ms:
             params["endTime"] = end_ms
 
-        data = self._signed_get("/fapi/v1/income", params)
+        data = self._signed_get(_FUT_INCOME_PATH, params)
+        if data is None:
+            return None  # API error — caller marks record as failed
         if not isinstance(data, list):
             return []
+
         out = []
         for ev in data:
             try:
@@ -105,95 +163,159 @@ class BinancePnLSync:
 
     # ── Per-signal sync ──────────────────────────────────────────
 
+    @staticmethod
+    def _load_breakdown(sig_record) -> dict:
+        try:
+            existing = sig_record.score_breakdown
+            if not existing:
+                return {}
+            return json.loads(existing) if isinstance(existing, str) else dict(existing)
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _save_breakdown(sig_record, breakdown: dict) -> None:
+        try:
+            sig_record.score_breakdown = json.dumps(breakdown)
+            sig_record.save(update_fields=["score_breakdown"])
+        except Exception as e:
+            log.debug("PnL sync save_breakdown error: %s", e)
+
     def sync_signal(self, sig_record) -> Optional[float]:
         """
-        Sync one SignalRecord. Returns the realised PnL pct or None
-        if Binance had no matching activity (manual trade, signal-only, etc.)
+        Sync one SignalRecord. Returns realised PnL USDT, 0.0 if no events,
+        or None on API error (record is marked failed so we skip next time).
         """
-        # Only meaningful for closed signals
         if sig_record.outcome == "PENDING":
             return None
         if not sig_record.entry_price or sig_record.entry_price <= 0:
             return None
 
+        # In-memory cache: skip symbols already failed this process lifecycle
+        if sig_record.symbol in _FAILED_SYMBOLS_CACHE:
+            return None
+
         # Window: signal time → close time + 6h buffer
-        start_ms = int(sig_record.created_at.timestamp() * 1000)
+        try:
+            start_ms = int(sig_record.created_at.timestamp() * 1000)
+        except Exception:
+            return None
+
         if sig_record.closed_at:
-            end_ms = int(sig_record.closed_at.timestamp() * 1000) + 6 * 3600 * 1000
+            try:
+                end_ms = int(sig_record.closed_at.timestamp() * 1000) + 6 * 3600 * 1000
+            except Exception:
+                end_ms = start_ms + 7 * 24 * 3600 * 1000
         else:
             end_ms = start_ms + 7 * 24 * 3600 * 1000
 
         events = self.fetch_realized_pnl(sig_record.symbol, start_ms, end_ms)
-        if not events:
+
+        # API error — persist failure so we don't retry every cycle
+        if events is None:
+            _FAILED_SYMBOLS_CACHE.add(sig_record.symbol)
+            breakdown = self._load_breakdown(sig_record)
+            breakdown["binance_pnl_sync_failed"] = True
+            breakdown["binance_pnl_failed_at"]   = datetime.now(_tz.utc).isoformat()
+            self._save_breakdown(sig_record, breakdown)
             return None
 
-        # Sum realized PnL (USDT) for this symbol within the window
+        # Success but no events — also persist so we don't retry
+        if not events:
+            breakdown = self._load_breakdown(sig_record)
+            breakdown["binance_realized_pnl_usdt"] = 0.0
+            breakdown["binance_pnl_event_count"]  = 0
+            breakdown["binance_pnl_synced_at"]    = datetime.now(_tz.utc).isoformat()
+            self._save_breakdown(sig_record, breakdown)
+            return 0.0
+
+        # Real events
         total_usdt = sum(e["income"] for e in events)
-
-        # Convert to % using the position notional. We don't have the
-        # exact qty stored on the record — best estimate from signal
-        # entry × the bot's risk allocation. Fallback: report raw USDT
-        # via the same field as `_usd` suffix variant.
-        # For now: store both raw USDT and the inferred pct.
-        # (Pct inference requires balance at trade time, which we
-        # don't track. So we expose USDT as primary truth.)
-
-        breakdown = {}
-        try:
-            existing = sig_record.score_breakdown
-            if existing:
-                breakdown = json.loads(existing) if isinstance(existing, str) else dict(existing)
-        except Exception:
-            breakdown = {}
-
+        breakdown = self._load_breakdown(sig_record)
         breakdown["binance_realized_pnl_usdt"] = round(total_usdt, 4)
-        breakdown["binance_pnl_synced_at"]    = datetime.utcnow().isoformat()
+        breakdown["binance_pnl_synced_at"]    = datetime.now(_tz.utc).isoformat()
         breakdown["binance_pnl_event_count"]  = len(events)
-
-        sig_record.score_breakdown = json.dumps(breakdown)
-        sig_record.save(update_fields=["score_breakdown"])
-
+        self._save_breakdown(sig_record, breakdown)
         return total_usdt
 
     # ── Batch sync ───────────────────────────────────────────────
 
     def sync_recent(self, days: int = 7) -> dict:
         """
-        Batch sync all closed signals from the last N days.
-        Returns {"updated": N, "skipped": N, "errors": N}.
+        Bulk-fetch all REALIZED_PNL events for the window in ONE call,
+        then bucket them onto matching SignalRecords. Eliminates per-symbol
+        rejection failures entirely.
         """
         from dashboard.models import SignalRecord
         from django.utils import timezone
 
         since = timezone.now() - timedelta(days=days)
+        start_ms = int(since.timestamp() * 1000)
+        end_ms = int(time.time() * 1000)
+
+        # ONE bulk call — no symbol filter, server returns all symbols
+        events = self._signed_get(_FUT_INCOME_PATH, {
+            "incomeType": "REALIZED_PNL",
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 1000,
+        })
+        if events is None:
+            log.warning("Binance PnL bulk fetch failed — body in prior log line")
+            return {"updated": 0, "skipped": 0, "errors": 1}
+        if not isinstance(events, list):
+            return {"updated": 0, "skipped": 0, "errors": 0}
+
+        # Bucket events by symbol → list of (income_usdt, time_ms)
+        from collections import defaultdict
+        by_symbol: dict[str, list[tuple[float, int]]] = defaultdict(list)
+        for ev in events:
+            try:
+                sym = ev.get("symbol", "")
+                inc = float(ev.get("income", 0))
+                t_ms = int(ev.get("time", 0))
+                if sym:
+                    by_symbol[sym].append((inc, t_ms))
+            except (TypeError, ValueError):
+                continue
+
+        log.info("Binance PnL bulk: %d events across %d symbols",
+                 len(events), len(by_symbol))
+
+        # Match against SignalRecords
         qs = SignalRecord.objects.filter(
             created_at__gte=since,
         ).exclude(outcome="PENDING")
 
-        updated = skipped = errors = 0
+        updated = skipped = 0
         for rec in qs:
-            try:
-                # Skip if already synced recently
-                try:
-                    bd = json.loads(rec.score_breakdown) if rec.score_breakdown else {}
-                except Exception:
-                    bd = {}
-                if "binance_realized_pnl_usdt" in bd:
-                    skipped += 1
-                    continue
-
-                result = self.sync_signal(rec)
-                if result is not None:
-                    updated += 1
-                    log.info("PnL sync: %s %s → $%.4f USDT",
-                             rec.symbol, rec.outcome, result)
-                else:
-                    skipped += 1
-            except Exception as e:
-                errors += 1
-                log.warning("PnL sync error %s: %s", rec.symbol, e)
+            bd = self._load_breakdown(rec)
+            if "binance_realized_pnl_usdt" in bd:
+                skipped += 1
                 continue
 
-        log.info("Binance PnL sync done: %d updated, %d skipped, %d errors",
-                 updated, skipped, errors)
-        return {"updated": updated, "skipped": skipped, "errors": errors}
+            try:
+                rec_start = int(rec.created_at.timestamp() * 1000)
+                rec_end = (int(rec.closed_at.timestamp() * 1000) + 6 * 3600 * 1000) \
+                    if rec.closed_at else (rec_start + 7 * 24 * 3600 * 1000)
+            except Exception:
+                skipped += 1
+                continue
+
+            # Find events for this symbol within the record's window
+            matched = [inc for inc, t in by_symbol.get(rec.symbol, [])
+                       if rec_start <= t <= rec_end]
+
+            bd["binance_realized_pnl_usdt"] = round(sum(matched), 4)
+            bd["binance_pnl_event_count"] = len(matched)
+            bd["binance_pnl_synced_at"] = datetime.now(_tz.utc).isoformat()
+            self._save_breakdown(rec, bd)
+
+            updated += 1
+            if matched:
+                log.info("PnL sync: %s %s → $%.4f (%d events)",
+                         rec.symbol, rec.outcome, sum(matched), len(matched))
+
+        log.info("Binance PnL bulk sync done: %d updated, %d skipped",
+                 updated, skipped)
+        return {"updated": updated, "skipped": skipped, "errors": 0}
