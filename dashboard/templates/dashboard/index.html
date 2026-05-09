@@ -2621,7 +2621,7 @@
                         <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Max
                             trades/day</label>
                         <div class="mx-row">
-                            <input type="number" id="spot-max" min="20" max="500" value="100"
+                            <input type="number" id="spot-max" min="10" max="500" value="100"
                                    oninput="mxDirty('spot')">
                             <button class="mx-btn save" id="spot-max-save" onclick="mxSave('spot')" title="Save">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -2715,7 +2715,7 @@
                         <label style="font-size:11px;color:var(--dim);display:block;margin-bottom:5px">Max
                             trades/day</label>
                         <div class="mx-row">
-                            <input type="number" id="fut-max" min="20" max="500" value="100"
+                            <input type="number" id="fut-max" min="10" max="500" value="100"
                                    oninput="mxDirty('fut')">
                             <button class="mx-btn save" id="fut-max-save" onclick="mxSave('fut')" title="Save">
                                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -4182,8 +4182,8 @@
     async function mxSave(prefix) {
         const input = document.getElementById(prefix + '-max');
         const val = parseInt(input.value);
-        if (isNaN(val) || val < 20 || val > 500) {
-            toast('Max trades must be between 20 and 500', 'warning');
+        if (isNaN(val) || val < 10 || val > 500) {
+            toast('Max trades must be between 10 and 500', 'warning');
             return;
         }
         const key = prefix === 'spot' ? 'spot_max_trades' : 'futures_max_trades';

@@ -15,12 +15,11 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from django.utils import timezone
-from collections import defaultdict
 
 import django
-import requests
 import pandas as pd
+import requests
+from django.utils import timezone
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "btc_project.settings")
 try:
@@ -36,7 +35,7 @@ from src.analysis.signal_engine import Signal, SignalEngine
 from src.analysis.spot_signal_engine import SpotSignalEngine
 from src.trading.binance_trader import BinanceTrader
 from src.data.binance_client import BinanceClient
-from src.utils.formatter import  fmt_digest
+from src.utils.formatter import fmt_digest
 from src.utils.logger import get_logger
 from src.analysis.tradfi_signal_engine import TradFiSignalEngine
 from src.trading.risk_manager import RiskManager
@@ -313,8 +312,13 @@ class Scanner:
         # TradFi engine — runs in parallel with crypto engine, completely isolated
         # FIX
         self._risk_filter = RiskFilter()
-        self._tradfi = TradFiSignalEngine(binance,cfg.signal,cfg.risk)
+        self._tradfi = TradFiSignalEngine(binance, cfg.signal, cfg.risk)
         self._risk_manager = RiskManager(self._trader)
+
+        # Spot notional fail counters — tracks symbols that keep failing -1013
+        # so they can be auto-suspended after _SPOT_NOTIONAL_FAIL_THRESHOLD cycles
+        self._spot_notional_fails: dict[str, int] = {}
+
     def run_cycle(self) -> None:
         from dashboard.models import ScanRecord, SignalRecord, NewsItem
 
@@ -600,6 +604,38 @@ class Scanner:
         except Exception as _pe:
             log.warning("protect_positions error: %s", _pe)
 
+            # ── Protect unprotected SPOT positions (every cycle) ────────────────
+        try:
+            from dashboard.models import AutoTradeState, SignalRecord
+            _spot_state = AutoTradeState.get()
+            if _spot_state.spot_enabled:
+                from datetime import timedelta
+                _spot_week_ago = now - timedelta(days=7)
+                _spot_sig_lookup = {}
+                for _rec in SignalRecord.objects.filter(
+                    created_at__gte=_spot_week_ago,
+                    outcome="PENDING",
+                    signal="BUY",
+                ).order_by("-created_at"):
+                    if _rec.symbol not in _spot_sig_lookup:
+                        class _SpotSig:
+                            pass
+                        _s = _SpotSig()
+                        _s.tp1        = float(_rec.tp1         or 0)
+                        _s.tp2        = float(_rec.tp2         or 0)
+                        _s.tp3        = float(_rec.tp3         or 0)
+                        _s.sl         = float(_rec.sl          or 0)
+                        _s.price      = float(_rec.entry_price or 0)
+                        _spot_sig_lookup[_rec.symbol] = _s
+
+                _spot_t = self._get_trader_for_mode(_spot_state, "spot")
+                if _spot_t and _spot_sig_lookup:
+                    _protected_spot = _spot_t.protect_spot_positions(_spot_sig_lookup)
+                    if _protected_spot:
+                        log.info("Spot protected %d positions: %s",
+                                 len(_protected_spot), _protected_spot)
+        except Exception as _spe:
+            log.warning("protect_spot_positions error: %s", _spe)
 
         # ── RiskManager: L1 loss-cap + L2 time-stop + L3 DD-halt ──
         try:
@@ -635,6 +671,7 @@ class Scanner:
                 log.warning("Binance PnL sync error (non-fatal): %s", e)
 
         log.info("Cycle complete")
+
         self._daily_scan_count += 1
         # Reset auto-trade daily count at midnight EAT
         try:
@@ -737,7 +774,6 @@ class Scanner:
                 fut_on = False
                 fut_trader = None
 
-
             # Reset daily trade counters at midnight EAT
             from zoneinfo import ZoneInfo as _ZI
             _eat = now.astimezone(_ZI("Africa/Dar_es_Salaam"))
@@ -810,10 +846,49 @@ class Scanner:
                     pass
                 return s
 
-            # --- Execute SPOT trades ---
+                # --- Execute SPOT trades ---
             if spot_on and spot_trader:
                 seen_spot = set()
                 all_spot = list(spot_candidates_new) + [_sig_from_rec(r) for r in pending_spot]
+
+                # ── Auto-suspend spot signals that repeatedly fail notional ──────
+                # If balance is too tight to meet a symbol's min_notional for 3+
+                # consecutive cycles, mark the pending signal FAILED so it stops
+
+                _SPOT_NOTIONAL_FAIL_THRESHOLD = 3
+                _filtered_spot = []
+                for _sig in all_spot:
+                    if _sig is None:
+                        continue
+                    _sym = getattr(_sig, "symbol", "")
+                    _cand_info = spot_trader._get_symbol_info(_sym) if _sym else None
+                    _min_n = getattr(_cand_info, "min_notional", 5.0) if _cand_info else 5.0
+                    # 1.2× buffer: if balance can barely meet the minimum it will
+                    # almost certainly fail after step-size flooring too.
+                    if spot_bal < _min_n * 1.2:
+                        _fails = self._spot_notional_fails.get(_sym, 0) + 1
+                        self._spot_notional_fails[_sym] = _fails
+                        if _fails >= _SPOT_NOTIONAL_FAIL_THRESHOLD:
+                            log.warning(
+                                "Auto-suspending spot signal %s: balance $%.2f < "
+                                "min_notional $%.2f × 1.2 after %d consecutive attempts "
+                                "— marking FAILED",
+                                _sym, spot_bal, _min_n, _fails,
+                            )
+                            try:
+                                SignalRecord.objects.filter(
+                                    symbol=_sym, outcome="PENDING", signal="BUY"
+                                ).update(outcome="FAILED")
+                            except Exception:
+                                pass
+                            self._spot_notional_fails[_sym] = 0
+                            continue   # skip this cycle
+                        # below threshold — allow retry, will be suspended next time
+                    else:
+                        self._spot_notional_fails[_sym] = 0  # reset on healthy balance
+                    _filtered_spot.append(_sig)
+                all_spot = _filtered_spot
+
                 log.info("Spot candidates: %d (new=%d pending=%d)", len(all_spot), len(spot_candidates_new),
                          len(pending_spot))
                 for sig in all_spot:
@@ -873,6 +948,8 @@ class Scanner:
                     else:
                         log.warning("SPOT TRADE ❌ %s %s — %s",
                                     sig.signal, sig.symbol, result.error)
+
+
 
             # --- Execute FUTURES trades ---
             if fut_on and fut_trader:
