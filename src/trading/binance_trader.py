@@ -1,20 +1,19 @@
 """
-src/trading/binance_trader.py — v8
+src/trading/binance_trader.py — v9
 
-Fixes vs v7:
-  - Market BUY notional shortfall (-1013 on CFGUSDT and similar small positions):
-    After _fmt_qty floors qty, actual notional can drop just below min_notional.
-    execute_signal now bumps qty by one step at a time until notional ≥ minimum.
+Fixes vs v8:
+  - protect_spot_positions() OCO false positive: _req() returns the error JSON dict
+    {"code": -1013} on HTTP 400 — which is truthy — so `if oco:` passed even when
+    the order was rejected, logging "placed ✅" incorrectly. Fix: check for
+    `oco.get("orderListId")` to confirm actual placement.
 
-  - protect_spot_positions(): new method mirroring protect_open_positions for futures.
-    Each cycle it:
-      1. Reads account balances to find held assets (non-USDT with balance > 0).
-      2. Cancels ORPHAN SELL orders — open SELL orders for assets whose free
-         balance is zero (position already closed/filled, orders dangling).
-      3. For each asset that matches a pending SignalRecord:
-         - Checks which of OCO / TP2 / TP3 / extra-SL are missing.
-         - Places only the missing ones, skipping any whose notional < min_notional.
-    Called from scanner.run_cycle() after the futures protect block.
+  - protect_open_positions() overfull positions: fully-protected positions
+    (has_tp✅ has_sl✅ has_tsl✅) were skipped with `continue` BEFORE the per-symbol
+    order-count check ran. So ALGOUSDT=15 orders, TAOUSDT=10, SANDUSDT=10 etc.
+    accumulated indefinitely, pushing the account total to 200 open orders and
+    triggering Binance -4045 "Reach max stop order limit" on new trades.
+    Fix: if fully protected BUT order count > _PER_SYM_MAX_ORDERS, cancel and
+    rebuild that symbol before skipping. Otherwise skip as before.
 """
 import hmac
 import hashlib
@@ -647,11 +646,15 @@ class BinanceTrader:
                         "price": tp1_p, "stopPrice": sl_p,
                         "stopLimitPrice": sl_lim, "stopLimitTimeInForce": "GTC",
                     })
-                    if oco:
+                    # FIX: _req returns the error JSON dict on 400 (truthy!) — must
+                    # check orderListId to confirm the OCO was actually created.
+                    if isinstance(oco, dict) and oco.get("orderListId"):
                         log.info("  Spot %s: OCO (TP1+SL1) placed ✅", sym)
                         did_protect = True
                     else:
-                        log.error("  Spot %s: OCO FAILED — TP1+SL1 unprotected!", sym)
+                        code = (oco or {}).get("code", 0) if isinstance(oco, dict) else 0
+                        log.error("  Spot %s: OCO FAILED code=%d — TP1+SL1 unprotected!",
+                                  sym, code)
 
                 # Place TP2 LIMIT if no TP2 exists yet
                 tp2_exists = any(o.get("side") == "SELL" and
@@ -1063,8 +1066,31 @@ class BinanceTrader:
                          "✅" if has_tsl else "❌")
 
                 if has_tp and has_sl and has_tsl:
-                    log.info("  %s: fully protected ✅", sym)
-                    continue
+                    if len(orders_for_sym) <= _PER_SYM_MAX_ORDERS:
+                        log.info("  %s: fully protected ✅", sym)
+                        continue
+                    else:
+                        # Fully protected but too many orders (e.g. ALGOUSDT=15, TAOUSDT=10).
+                        # These accumulate because the "fully protected → skip" check ran
+                        # before the order-count check could clean them. The excess pushes
+                        # the account toward Binance's 200-order cap (-4045).
+                        # Cancel and rebuild this symbol only — other positions untouched.
+                        log.warning(
+                            "  %s: fully protected but %d orders > %d — cleaning excess orders",
+                            sym, len(orders_for_sym), _PER_SYM_MAX_ORDERS,
+                        )
+                        self._cancel_all_orders_for_symbol(sym)
+                        orders_for_sym = self.get_open_orders(sym) or []
+                        sym_orders[sym] = orders_for_sym
+                        has_sl  = any(o.get("type") in SL_TYPES  for o in orders_for_sym)
+                        has_tsl = any(o.get("type") in TSL_TYPES for o in orders_for_sym)
+                        has_tp  = any(o.get("type") in TP_TYPES  for o in orders_for_sym)
+                        log.info("  %s after clean: %d orders has_tp=%s has_sl=%s has_tsl=%s",
+                                 sym, len(orders_for_sym),
+                                 "✅" if has_tp else "❌",
+                                 "✅" if has_sl else "❌",
+                                 "✅" if has_tsl else "❌")
+                        # Fall through to re-protect what's now missing
 
                 if has_tp and has_sl and not has_tsl:
                     log.info("  %s: TP+SL ok — adding missing TSL only", sym)
