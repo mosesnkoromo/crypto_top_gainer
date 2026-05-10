@@ -1048,6 +1048,23 @@ class BinanceTrader:
             log.info("protect_open_positions: %d positions, %d open orders",
                      len(positions), total_orders)
 
+            # ── Orphan sweep ─────────────────────────────────────────────
+            # Orders for symbols with NO open position are stale remnants
+            # from positions that closed (all TPs hit, SL hit, or manually
+            # closed). They count toward Binance 's 200-order cap and cause
+            # -4045 on new trades. Cancel them BEFORE touching live positions.
+            open_syms = {p.get("symbol", "") for p in positions
+                         if float(p.get("positionAmt", 0)) != 0}
+            orphan_syms = [s for s in sym_orders if s and s not in open_syms]
+            if orphan_syms:
+                log.info("Orphan orders for %d closed positions — cancelling: %s",
+                         len(orphan_syms), orphan_syms)
+                for _osym in orphan_syms:
+                    self._cancel_all_orders_for_symbol(_osym)
+                    sym_orders.pop(_osym, None)
+                total_orders = sum(len(v) for v in sym_orders.values())
+                log.info("After orphan sweep: %d orders remaining", total_orders)
+
             for pos in positions:
                 sym = pos.get("symbol", "")
                 amt = float(pos.get("positionAmt", 0))
