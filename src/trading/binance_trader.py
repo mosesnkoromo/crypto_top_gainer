@@ -532,9 +532,24 @@ class BinanceTrader:
                     free_bal[a["asset"]] = free
 
             # ── 2. Fetch all open spot orders ───────────────────
-            open_orders = self._req("GET", "/api/v3/openOrders", {}) or []
+            # FIX: _req returns an error dict {"code":...} on HTTP 400, which
+            # is truthy — "or []" would NOT replace it. Iterating a dict yields
+            # its string keys, causing 'str' object has no attribute 'get'.
+            _raw_spot_orders = self._req("GET", "/api/v3/openOrders", {})
+            if not isinstance(_raw_spot_orders, list):
+                if _raw_spot_orders:
+                    log.warning("protect_spot_positions: openOrders unexpected "
+                                "response (%s) — %s",
+                                type(_raw_spot_orders).__name__,
+                                str(_raw_spot_orders)[:120])
+                open_orders = []
+            else:
+                open_orders = _raw_spot_orders
             sym_orders: dict[str, list] = {}
             for o in open_orders:
+                if not isinstance(o, dict):
+                    log.debug("Skipping non-dict spot order entry: %r", o)
+                    continue
                 sym_orders.setdefault(o.get("symbol", ""), []).append(o)
 
             # ── 3. Cancel orphan SELL orders ────────────────────
@@ -1134,6 +1149,52 @@ class BinanceTrader:
                 entry      = float(pos.get("entryPrice", 0))
                 info       = self._get_symbol_info(sym)
                 sig        = signal_lookup.get(sym)
+
+                # ── All-TPs-hit → close remainder to free margin ──────────────
+                # If no TP orders remain, check whether price confirms they fired.
+                # Condition: mark price ≥ TP3 (long) or ≤ TP3 (short).
+                # Uses 0.5% tolerance so a brief TP3 touch counts even if price
+                # has retraced slightly since then.
+                if not has_tp:
+                    _tp3_level = float(getattr(sig, "tp3", 0) or 0) if sig else 0
+                    if _tp3_level > 0:
+                        _mark_p = 0
+                        try:
+                            _mpr = requests.get(
+                                "https://fapi.binance.com/fapi/v1/premiumIndex",
+                                params={"symbol": sym}, timeout=3)
+                            if _mpr.ok:
+                                _mark_p = float(_mpr.json().get("markPrice", 0))
+                        except Exception:
+                            pass
+                        _all_hit = (
+                            (is_long     and _mark_p > 0 and _mark_p >= _tp3_level * 0.995) or
+                            (not is_long and _mark_p > 0 and _mark_p <= _tp3_level * 1.005)
+                        )
+                        if _all_hit:
+                            log.info(
+                                "  %s: all TPs hit (mark=%s %s TP3=%s) — "
+                                "closing remainder qty=%.4f to free margin",
+                                sym,
+                                self._fmt_num(_mark_p),
+                                ">=" if is_long else "<=",
+                                self._fmt_num(_tp3_level),
+                                qty,
+                            )
+                            self._cancel_all_orders_for_symbol(sym)
+                            _cq = self._fmt_qty(qty, info)
+                            if _cq >= info.min_qty:
+                                _cr = self._req("POST", "/fapi/v1/order", {
+                                    "symbol": sym, "side": close_side,
+                                    "type": "MARKET",
+                                    "quantity": _cq, "reduceOnly": "true",
+                                })
+                                if isinstance(_cr, dict) and "orderId" in _cr:
+                                    log.info("  %s: remainder closed → margin freed ✅", sym)
+                                else:
+                                    log.warning("  %s: close order failed: %s", sym, _cr)
+                            protected.append(sym)
+                            continue   # done with this position
 
                 if sig and sig.tp1 > 0 and sig.sl > 0:
                     tp1_p = self._fp(sig.tp1, info)
