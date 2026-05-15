@@ -15,12 +15,11 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from django.utils import timezone
-from collections import defaultdict
 
 import django
-import requests
 import pandas as pd
+import requests
+from django.utils import timezone
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "btc_project.settings")
 try:
@@ -36,7 +35,7 @@ from src.analysis.signal_engine import Signal, SignalEngine
 from src.analysis.spot_signal_engine import SpotSignalEngine
 from src.trading.binance_trader import BinanceTrader
 from src.data.binance_client import BinanceClient
-from src.utils.formatter import  fmt_digest
+from src.utils.formatter import fmt_digest
 from src.utils.logger import get_logger
 from src.analysis.tradfi_signal_engine import TradFiSignalEngine
 from src.trading.risk_manager import RiskManager
@@ -313,7 +312,7 @@ class Scanner:
         # TradFi engine — runs in parallel with crypto engine, completely isolated
         # FIX
         self._risk_filter = RiskFilter()
-        self._tradfi = TradFiSignalEngine(binance,cfg.signal,cfg.risk)
+        self._tradfi = TradFiSignalEngine(binance, cfg.signal, cfg.risk)
         self._risk_manager = RiskManager(self._trader)
 
         # Spot notional fail counters — tracks symbols that keep failing -1013
@@ -422,7 +421,6 @@ class Scanner:
             # Signals merge into `collected` and flow through the same DB save,
             # digest send, and auto-trade pipeline as crypto signals.
         tradfi_seen = set()
-        tradfi_signal_syms: set[str] = set()   # symbols that actually generated a TradFi signal
         try:
             tradfi_tickers = self._bin.get_tradfi_pairs()
             log.info("TradFi pairs available: %d", len(tradfi_tickers))
@@ -439,7 +437,6 @@ class Scanner:
                 tf_signal = self._tradfi.analyze(tf_ticker, btc)
                 if tf_signal:
                     collected.append(tf_signal)
-                    tradfi_signal_syms.add(tf_sym)   # mark as futures-only
                     tradfi_signals_count += 1
                     log.info(
                         "TradFi queued: %s %s — %s (%d%%) confluence=%.1f",
@@ -496,10 +493,6 @@ class Scanner:
             # Save to DB
             for s in collected:
                 try:
-                    # TradFi signals (XAUUSDT, Mag-7 perps etc.) exist only as
-                    # USD-M futures — they do not trade on Binance Spot.
-                    # Tag them so pending_spot query can exclude them permanently.
-                    _sig_notes = "FUTURES_ONLY" if s.symbol in tradfi_signal_syms else ""
                     SignalRecord.objects.create(
                         symbol=s.symbol, signal=s.signal,
                         grade=s.grade.split()[0], confidence=s.confidence,
@@ -509,7 +502,6 @@ class Scanner:
                         btc_score=s.btc_score, btc_trend=s.btc_trend,
                         factors=json.dumps(s.factors),
                         score_breakdown=json.dumps(getattr(s, 'score_breakdown', {})),
-                        notes=_sig_notes,
                     )
                 except Exception as e:
                     log.warning("DB save failed %s: %s", s.symbol, e)
@@ -612,13 +604,12 @@ class Scanner:
         except Exception as _pe:
             log.warning("protect_positions error: %s", _pe)
 
-        # ── Protect unprotected SPOT positions (every cycle) ─────────────────
-        # Finds spot balances with missing TP/SL orders and places them.
-        # Also cancels orphan SELL orders for assets whose balance is now 0.
+            # ── Protect unprotected SPOT positions (every cycle) ────────────────
         try:
             from dashboard.models import AutoTradeState, SignalRecord
             _spot_state = AutoTradeState.get()
             if _spot_state.spot_enabled:
+                from datetime import timedelta
                 _spot_week_ago = now - timedelta(days=7)
                 _spot_sig_lookup = {}
                 for _rec in SignalRecord.objects.filter(
@@ -630,12 +621,13 @@ class Scanner:
                         class _SpotSig:
                             pass
                         _s = _SpotSig()
-                        _s.tp1   = float(_rec.tp1         or 0)
-                        _s.tp2   = float(_rec.tp2         or 0)
-                        _s.tp3   = float(_rec.tp3         or 0)
-                        _s.sl    = float(_rec.sl          or 0)
-                        _s.price = float(_rec.entry_price or 0)
+                        _s.tp1        = float(_rec.tp1         or 0)
+                        _s.tp2        = float(_rec.tp2         or 0)
+                        _s.tp3        = float(_rec.tp3         or 0)
+                        _s.sl         = float(_rec.sl          or 0)
+                        _s.price      = float(_rec.entry_price or 0)
                         _spot_sig_lookup[_rec.symbol] = _s
+
                 _spot_t = self._get_trader_for_mode(_spot_state, "spot")
                 if _spot_t and _spot_sig_lookup:
                     _protected_spot = _spot_t.protect_spot_positions(_spot_sig_lookup)
@@ -679,6 +671,7 @@ class Scanner:
                 log.warning("Binance PnL sync error (non-fatal): %s", e)
 
         log.info("Cycle complete")
+
         self._daily_scan_count += 1
         # Reset auto-trade daily count at midnight EAT
         try:
@@ -781,7 +774,6 @@ class Scanner:
                 fut_on = False
                 fut_trader = None
 
-
             # Reset daily trade counters at midnight EAT
             from zoneinfo import ZoneInfo as _ZI
             _eat = now.astimezone(_ZI("Africa/Dar_es_Salaam"))
@@ -815,31 +807,11 @@ class Scanner:
                 created_at__gte=today_start, outcome="PENDING"
             ).exclude(notes__icontains="AUTO_FUT:YES"))
 
-            # Pending DB spot signals — BUY signals not yet spot-traded,
-            # excluding TradFi / futures-only pairs.
-            #
-            # Two-layer exclusion:
-            #   1. notes__icontains="FUTURES_ONLY"  — new signals tagged at save time
-            #   2. Python filter vs get_tradfi_pairs() — catches OLD signals already
-            #      in DB before this tag existed (e.g. XAUUSDT from yesterday)
-            try:
-                _tradfi_spot_excl = {
-                    t.get("symbol", "") for t in (self._bin.get_tradfi_pairs() or [])
-                }
-            except Exception:
-                _tradfi_spot_excl = set()
-
-            pending_spot = [
-                r for r in SignalRecord.objects.filter(
-                    created_at__gte=today_start, outcome="PENDING",
-                    signal="BUY",
-                ).exclude(
-                    notes__icontains="AUTO_SPOT:YES"
-                ).exclude(
-                    notes__icontains="FUTURES_ONLY"
-                )
-                if r.symbol not in _tradfi_spot_excl
-            ]
+            # Pending DB spot signals — only those explicitly marked as SPOT
+            pending_spot = list(SignalRecord.objects.filter(
+                created_at__gte=today_start, outcome="PENDING",
+                signal="BUY", notes__icontains="SPOT"
+            ).exclude(notes__icontains="AUTO_SPOT:YES"))
 
             def _sig_from_rec(rec):
                 class _S:
@@ -874,7 +846,7 @@ class Scanner:
                     pass
                 return s
 
-            # --- Execute SPOT trades ---
+                # --- Execute SPOT trades ---
             if spot_on and spot_trader:
                 seen_spot = set()
                 all_spot = list(spot_candidates_new) + [_sig_from_rec(r) for r in pending_spot]
@@ -882,7 +854,7 @@ class Scanner:
                 # ── Auto-suspend spot signals that repeatedly fail notional ──────
                 # If balance is too tight to meet a symbol's min_notional for 3+
                 # consecutive cycles, mark the pending signal FAILED so it stops
-                # retrying every minute (e.g. CFGUSDT at $17 balance).
+
                 _SPOT_NOTIONAL_FAIL_THRESHOLD = 3
                 _filtered_spot = []
                 for _sig in all_spot:
@@ -976,6 +948,8 @@ class Scanner:
                     else:
                         log.warning("SPOT TRADE ❌ %s %s — %s",
                                     sig.signal, sig.symbol, result.error)
+
+
 
             # --- Execute FUTURES trades ---
             if fut_on and fut_trader:
